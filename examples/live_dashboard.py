@@ -14,7 +14,7 @@ Data path ("not in laptop memory -> fetch from internet"):
   selected [start, end) range are downloaded from Binance public klines.
   No internet / bad range -> deterministic synthetic fallback (status line says).
 
-  coin:       BTC/USDT, ETH/USDT, XRP/USDT, SOL/USDT
+  coin:       any BASE/QUOTE text input (e.g. DOGE/USDT), validated server-side
   timeframe:  1m / 5m / 15m / 1h  (simulator step = 1 bar)
   dates:      start/end (UTC); ranges > 200k bars are refused with a message
   speed:      simulator steps per tick (1 tick = 1 second wall time)
@@ -279,7 +279,6 @@ def paper_overlay():
 def build_app():
     import dash
     from dash import dcc, html, Input, Output, State, dash_table
-    from dash.exceptions import PreventUpdate
     import plotly.graph_objects as go
 
     today = dt.datetime.now(dt.timezone.utc).date()
@@ -605,6 +604,8 @@ def build_app():
     @app.callback(Output("tick", "disabled", allow_duplicate=True),
                   Input("pause", "n_clicks"), prevent_initial_call=True)
     def on_pause(_):
+        if STATE is None:  # reset pressed, session not rebuilt yet
+            return False
         STATE["running"] = not STATE["running"]
         return False  # keep ticking; callback no-ops while paused
 
@@ -703,11 +704,11 @@ def build_app():
                 fig.add_hrect(y0=min(e, s), y1=max(e, s),
                               fillcolor="red", opacity=0.07, line_width=0)
                 if ov.get("tp"):
-                    t = ov["tp"]
-                    fig.add_hline(y=t, line_color="green", line_width=2,
+                    tp_px = ov["tp"]
+                    fig.add_hline(y=tp_px, line_color="green", line_width=2,
                                   line_dash="dot",
                                   annotation_text="тейк", annotation_position="right")
-                    fig.add_hrect(y0=min(e, t), y1=max(e, t),
+                    fig.add_hrect(y0=min(e, tp_px), y1=max(e, tp_px),
                                   fillcolor="green", opacity=0.07, line_width=0)
             xs, ys = [], []
             for lv in st["det"].levels:

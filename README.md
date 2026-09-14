@@ -39,7 +39,6 @@ seeds — every replay is reproducible.
 | Concurrency  | Deterministic single-threaded engine     |
 | Serialization| serde, serde_json                        |
 | Web (Dash)   | Dash 4.x + Plotly                        |
-| Web (Taipy)  | taipy-gui 4.x + Plotly (NOT full taipy)  |
 
 No Pandas inside the engine (analysis only, on the Python side).
 
@@ -76,7 +75,7 @@ examples/realtime_simulator.py step-by-step live feed demo
 examples/levels_demo.py        online levels inside the live feed
 examples/levels_web.py         static Plotly dashboard (offline HTML)
 examples/live_dashboard.py     Dash site: live feed + levels + paper trading
-examples/live_dashboard_taipy.py  Taipy site: same, no Dash
+examples/levels_finder.py      earliest level-finder prototype (via simccxt)
 examples/levels_cluster.py     price-time clustering levels (XRP, no swings)
 examples/ccxt_compatibility.py runnable CCXT-style strategy example
 data/ohlcv/                    local market-data cache (machine-local, gitignored)
@@ -97,18 +96,12 @@ cargo build --release --workspace
 ```bash
 uv venv --python 3.12                                  # create .venv (once)
 uv pip install --python .venv/bin/python \
-    numpy pandas matplotlib plotly dash taipy-gui playwright  # libs (once)
-uv pip install --python .venv/bin/python \
-    --no-deps "flask-socketio==5.6.1"                  # see subtlety #7 below
+    numpy pandas matplotlib plotly dash playwright     # libs (once)
 uv pip install --python .venv/bin/python -e .          # build + install simccxt
 ```
 
 `import simccxt` inside `.venv` resolves to the installed package — no
 `PYTHONPATH` needed. Re-run `uv pip install -e .` after any Rust change.
-
-Why Python 3.12 and not newer: PyO3 0.29 targets it, and the full `taipy`
-metapackage cannot build on 3.14 (`pyarrow==18.1.0` has no cp314 wheel and
-fails from source). We use `taipy-gui` only — enough for the website.
 
 ## Quick Start (Python)
 
@@ -281,22 +274,12 @@ fallback, shown in the status line). OHLC **bars** (not candles), level lines,
 pivot diamonds + confirming-window shading, touch dots, paper-trade
 entry/exit markers. Levels table with pivot/confirm timestamps.
 
-### Taipy: `examples/live_dashboard_taipy.py` (no Dash)
-
-```bash
-.venv/bin/python examples/live_dashboard_taipy.py --port 8050
-```
-
-Same features through Taipy + Plotly: data-driven chart (10 traces), tables,
-paper panel. Requires `taipy-gui` (NOT the full `taipy` metapackage) plus the
-`flask-socketio==5.6.1` override from the install section.
-
 ### Static Plotly: `examples/levels_web.py`
 
 Builds one self-contained `dashboard.html` (plotly.js inlined, works offline)
 with a level-selector dropdown. No server needed.
 
-## Paper trading (both dashboards)
+## Paper trading (live dashboard)
 
 Deposit + risk-per-trade are set **once**; everything else is computed:
 
@@ -323,47 +306,30 @@ notional    = size × entry  (leverage-equiv = notional / equity)
    single-threaded** (`threaded=False` for Dash/Flask dev server), and all
    sim calls must happen in one thread — background button callbacks may only
    exchange plain data (intents/snapshots), never the `Exchange` object.
-2. **Taipy specifics.**
-   - `Gui(page)` must be constructed at **module level**; inside `main()` all
-     page variables resolve as "not available".
-   - A `go.Figure` object pushed to the frontend arrives as **null** (no Data
-     Accessor for Figure) — charts must be **data-driven** (`chart_df` +
-     indexed traces `x[1]/y[1]/...`), which uses the tested table machinery.
-   - User input does **not** update module globals (proven by test) — mirror
-     controls into a plain dict via `on_change`; the tick thread reads only it.
-   - Live updates go to the tab that owns the state: compute once per tick,
-     fan out with `gui.broadcast_changes(**snapshot)` (not per-tab invoke).
-   - Page syntax: columns are `<|part|>` blocks inside `<|layout|>` —
-     `<|part.start|>` is invalid and breaks parsing (with cascading
-     "variable not available" warnings for everything after it).
-   - With several callbacks writing one output, **every** one needs
-     `allow_duplicate=True`, and manual HTTP tests must use the exact
-     `output@hash` callback keys from `/_dash-dependencies` (Dash) — same
-     class of trap in both frameworks.
-3. **Dash specifics.** A 1-second full-figure replace interrupts zoom gestures
+2. **Dash specifics.** A 1-second full-figure replace interrupts zoom gestures
    and can snap the view back: the app therefore has *follow mode* (explicit
    user zoom freezes figure updates until double-click autosize) plus a manual
    freeze button. `relayoutData` must be read as State and re-applied.
-4. **pandas 2 vs 3 datetimes.** pandas 3 uses microsecond `datetime64[us]`;
+3. **pandas 2 vs 3 datetimes.** pandas 3 uses microsecond `datetime64[us]`;
    code converting to epoch ms must force nanoseconds first
    (`astype("datetime64[ns]")`), otherwise timestamps land in 1970. Also
-   `DatetimeIndex[-1]`-style access and `NaT` in datetime columns break
-   Taipy's data layer — use float millisecond columns with NaN instead.
-5. **CSV timestamps.** `load_candles_from_csv` accepts epoch seconds,
+   avoid `NaT` in datetime columns sent to web charts — use float
+   millisecond columns with NaN instead.
+4. **CSV timestamps.** `load_candles_from_csv` accepts epoch seconds,
    milliseconds (auto-detected) and ISO-8601 (`2026-03-01 00:00:00+00:00`).
    Pandas writes datetimes as strings — the Rust parser handles them.
-6. **Volume-profile windowing.** Forward-looking aggregates must clamp to
+5. **Volume-profile windowing.** Forward-looking aggregates must clamp to
    available bars (`bar covers target` check), otherwise touches near the end
    of data silently reuse the last bar and bias the curve.
-7. **Determinism.** Same data + config + seed ⇒ byte-identical outputs
+6. **Determinism.** Same data + config + seed ⇒ byte-identical outputs
    (verified by checksum across runs). Synthetic generators are seeded;
    download caches make reruns offline-instant.
-8. **Level detection choices.** Swing pivots need a prominence threshold
+7. **Level detection choices.** Swing pivots need a prominence threshold
    (`min_swing`) and dedup tolerance, otherwise 1-second noise yields
    thousands of micro-levels; the touch detector must check the first bar of
    every batch against the *previous* batch's last close, or entries on batch
    boundaries (and everything at speed=1) are silently missed.
-9. **Environment.** `uv.lock` is committed for reproducibility. Never commit
+8. **Environment.** `uv.lock` is committed for reproducibility. Never commit
    `.venv/`, `target/`, `data/`, or generated `*_out/` dirs (gitignored).
    After any Rust change: `uv pip install --python .venv/bin/python -e .`.
    Never run two dashboard servers on one port; kill by exact PID (pattern
@@ -374,7 +340,6 @@ notional    = size × entry  (leverage-equiv = notional / equity)
 | Symptom | Likely cause |
 |---|---|
 | `Address already in use` | stale server alive — find exact PID via `/proc` scan, `kill` it (avoid `pkill -f`, it matched our own shell once) |
-| Taipy page loads but stays on defaults, chart empty | `Gui(page)` constructed inside a function, or `<\|part.start\|>` syntax, or pushing `go.Figure` instead of data-driven `chart_df` |
 | Dash `500` on button callbacks | missing `allow_duplicate=True` on one of the writers, or touching `Exchange` from a worker thread (check single-threaded server) |
 | Touches look random / missing | batch-boundary bars skipped (pass global prev close), or duplicate levels (dedup tolerance), or breakout threshold too small vs volatility |
 | `fetch_ohlcv_live` returns nothing after `reset` | clock starts paused — call `resume()` before `step()` |
