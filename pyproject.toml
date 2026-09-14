@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "simccxt"
+version = "0.1.0"
+description = "Virtual Cryptocurrency Exchange - CCXT-compatible exchange simulator"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "simccxt team" }]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = [
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+]
+
+[tool.maturin]
+manifest-path = "src/python-api/Cargo.toml"
+module-name = "simccxt"
+features = ["pyo3/extension-module"]

@@ -1,0 +1,16 @@
+[package]
+name = "simccxt-storage"
+version = "0.1.0"
+edition = "2021"
+authors = ["simccxt team"]
+description = "Storage layer for simccxt exchange simulator"
+license = "MIT"
+
+[dependencies]
+simccxt-core = { path = "../core" }
+simccxt-clock = { path = "../clock" }
+simccxt-market = { path = "../market" }
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1.3"
+anyhow = "1.0"

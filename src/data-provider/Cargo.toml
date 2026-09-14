@@ -1,0 +1,15 @@
+[package]
+name = "simccxt-data-provider"
+version = "0.1.0"
+edition = "2021"
+authors = ["simccxt team"]
+description = "Data provider module for simccxt exchange simulator"
+license = "MIT"
+
+[dependencies]
+simccxt-core = { path = "../core" }
+simccxt-storage = { path = "../storage" }
+simccxt-downloader = { path = "../downloader" }
+
+[dev-dependencies]
+chrono = "0.4"

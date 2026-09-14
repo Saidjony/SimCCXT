@@ -1,0 +1,13 @@
+[package]
+name = "simccxt-indicators"
+version = "0.1.0"
+edition = "2021"
+authors = ["simccxt team"]
+description = "Indicators module for simccxt exchange simulator"
+license = "MIT"
+
+[dependencies]
+simccxt-core = { path = "../core" }
+
+[dev-dependencies]
+chrono = "0.4"

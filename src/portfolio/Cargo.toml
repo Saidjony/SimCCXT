@@ -1,0 +1,11 @@
+[package]
+name = "simccxt-portfolio"
+version = "0.1.0"
+edition = "2021"
+authors = ["simccxt team"]
+description = "Portfolio module for simccxt exchange simulator"
+license = "MIT"
+
+[dependencies]
+simccxt-core = { path = "../core" }
+serde = { version = "1.0", features = ["derive"] }

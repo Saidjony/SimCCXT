@@ -1,0 +1,16 @@
+[package]
+name = "simccxt-broker"
+version = "0.1.0"
+edition = "2021"
+authors = ["simccxt team"]
+description = "Broker module for simccxt exchange simulator"
+license = "MIT"
+
+[dependencies]
+simccxt-core = { path = "../core" }
+simccxt-market = { path = "../market" }
+simccxt-order-engine = { path = "../order-engine" }
+simccxt-portfolio = { path = "../portfolio" }
+simccxt-wallet = { path = "../wallet" }
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }

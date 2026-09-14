@@ -1,0 +1,15 @@
+/target
+/output/
+# local market-data disk cache (downloaded from the internet, machine-local)
+/data/
+# local build artifact of the Python extension (installed into .venv instead)
+/simccxt.so
+*.so
+__pycache__/
+# python env (rebuild via: uv venv && uv pip install -e . + analysis libs)
+/.venv/
+# generated research/demo outputs
+/research/output/
+/examples/*_out/
+*.pyc
+.pytest_cache/

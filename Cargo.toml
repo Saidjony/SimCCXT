@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "src/core",
+    "src/clock",
+    "src/market",
+    "src/storage",
+    "src/replay-engine",
+    "src/event-bus",
+    "src/exchange",
+    "src/broker",
+    "src/order-engine",
+    "src/portfolio",
+    "src/wallet",
+    "src/indicators",
+    "src/feature-engine",
+    "src/data-provider",
+    "src/downloader",
+    "src/python-api"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["simccxt team"]
+description = "Virtual Cryptocurrency Exchange - CCXT-compatible exchange simulator"
+license = "MIT"
