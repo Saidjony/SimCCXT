@@ -2,83 +2,48 @@
 """
 zones.py
 ========
-Accumulation zones + strong levels from detected swing levels.
+Accumulation zones + strong levels.
 
-Idea (heuristic, all raw numbers are exported so you can test it yourself):
-  * sort levels by price, merge neighbours whose gap <= ``max_gap_pct``
-    (single linkage) into a cluster; split wide clusters at the largest
-    internal gap so one sideways market gives compact bands;
-  * a cluster is an *accumulation zone* when it holds >= ``min_levels``
-    levels AND >= ``min_touches`` touches AND spans <= ``max_width_pct``;
-  * STRICT containment: every bar of the zone's [t0, t1] sits fully
-    inside [y0, y1]. The first bar that leaves the band CLOSES the zone;
-    the scan continues, so one cluster can yield several zones over time;
-  * quality = bars inside (``dwell_bars``): zones sort by it desc;
-  * a level far from any neighbour (gap >= ``strong_gap_pct`` on the
-    nearer side) with >= ``strong_min_touches`` touches is a *strong
-    level* (lonely + respected).
+Strict rules (your three, literally):
+1. EVERY bar of a zone sits fully inside its band [y0, y1].
+2. The first bar that leaves the band CLOSES the zone; the scan
+   continues, so one area can yield several zones over time.
+3. Quality = bars inside (``dwell_bars``): zones sort by it desc.
 
-What you asked for, plus the bits that make it usable:
-  * time bounds: ``t0`` = first touch, ``t1`` = last touch of the cluster
-    (a rectangle needs time, not just price);
-  * ``dwell_bars`` — every bar inside (by construction); more is better;
-  * ``vol_ratio`` — per-bar volume inside the zone vs the baseline
-    (accumulation backed by volume is a different animal);
-  * ``status`` — "активна" (never left the band through the last bar),
-    otherwise which side broke it ("пробой вверх/вниз/в обе стороны");
-  * overlapping clusters are merged through single linkage, then split
-    wide ones, so one sideways market gives compact non-overlapping zones.
+How a zone is born (bar-first, so wicks can't silently kill it before
+it exists — the band is the seed window's own extremes, hence the first
+``seed_bars`` bars always fit):
+  * slide a ``seed_bars`` window; where its span <= ``max_width_pct``,
+    fix the band [min low, max high] and extend forward while bars stay
+    inside; the first outside bar closes the zone (its side = breakout);
+  * then confirm with levels: the band must hold >= ``min_levels``
+    (known by the zone end) AND >= ``min_touches`` touches inside
+    [t0, t1] — your "many close levels + many touches" condition.
 
-Pure numpy/pandas-free python (numpy only); no simccxt/dash imports,
-so research scripts can reuse it too.
+Plus, for usability:
+  * ``vol_ratio`` — per-bar volume inside vs the baseline;
+  * ``status`` — "активна" (reached the last bar) or breakout side;
+  * strong levels (separate function): isolated (>= ``strong_gap_pct``
+    to the nearer neighbour) AND touched >= ``strong_min_touches``.
+
+Pure numpy; no simccxt/dash imports, reusable from research scripts.
 """
+
+import bisect
 
 import numpy as np
 
 DEFAULTS = dict(
-    max_gap_pct=0.003,       # neighbours merge into one cluster
-    min_levels=3,            # at least this many levels in a zone
-    min_touches=5,           # at least this many touches in a zone segment
-    max_width_pct=0.02,      # zone wider than this is not accumulation
-    min_dwell_bars=30,       # at least this many bars inside the zone
+    seed_bars=30,            # seed window length (zone dwell is always >= this)
+    max_width_pct=0.02,      # seed span wider than this is not accumulation
+    min_levels=2,            # levels (known by zone end) inside the band
+    min_touches=3,           # touches inside [t0, t1]
     pad_pct=0.0,             # band tolerance (0 = a wick out closes the zone)
+    merge_gap_bars=10,       # merge zones this close in time (if bands overlap)
+    merge_iou=0.5,           # min band overlap to merge adjacent zones
     strong_gap_pct=0.005,    # isolation radius for a strong level
     strong_min_touches=5,    # touches needed for a strong level
 )
-
-
-def _split_wide(cluster: list, max_width_pct: float) -> list:
-    """Recursively split a cluster at its largest internal gap until every
-    piece spans <= max_width_pct (cures single-linkage chaining across a
-    whole sideways market)."""
-    if len(cluster) < 2:
-        return [cluster]
-    ordered = sorted(cluster, key=lambda l: l["price"])
-    span = (ordered[-1]["price"] - ordered[0]["price"]) / ordered[0]["price"]
-    if span <= max_width_pct:
-        return [ordered]
-    gaps = [(ordered[i + 1]["price"] - ordered[i]["price"], i)
-            for i in range(len(ordered) - 1)]
-    _, at = max(gaps)
-    return (_split_wide(ordered[:at + 1], max_width_pct)
-            + _split_wide(ordered[at + 1:], max_width_pct))
-
-
-def cluster_levels(levels: list, max_gap_pct: float) -> list:
-    """Single-linkage clusters of level dicts (each has ``price``)."""
-    if not levels:
-        return []
-    ordered = sorted(levels, key=lambda l: l["price"])
-    clusters, cur = [], [ordered[0]]
-    for lv in ordered[1:]:
-        gap = (lv["price"] - cur[-1]["price"]) / cur[-1]["price"]
-        if gap <= max_gap_pct:
-            cur.append(lv)
-        else:
-            clusters.append(cur)
-            cur = [lv]
-    clusters.append(cur)
-    return clusters
 
 
 def _as_array(bars) -> np.ndarray:
@@ -90,95 +55,153 @@ def _as_array(bars) -> np.ndarray:
 
 def find_zones(levels: list, bars, step_ms: int,
                cfg: dict | None = None) -> list:
-    """Accumulation zones from levels + full bar history.
-
-    Strict rules:
-    1. EVERY bar of the zone's [t0, t1] sits fully inside [y0, y1]
-       (low >= y0 and high <= y1) — the band comes from a cluster of
-       close levels, the time span from its touches.
-    2. The first bar that leaves the band CLOSES the zone (t1 = the last
-       bar still inside); the scan then continues, so one cluster can
-       produce several zones over time.
-    3. Quality = bars inside: zones sort by ``dwell_bars`` desc.
+    """Accumulation zones, sorted by ``dwell_bars`` desc.
 
     ``levels``: detector levels (``price``, ``touches`` with ``ts``,
-    ``confirmed_ts``).
-    ``bars``: [ts,o,h,l,c,v] rows (list or np array), ascending ts.
-    Returns zone dicts sorted by dwell_bars desc. Each has:
-    y0, y1, mid, width_pct, t0, t1, n_levels, n_touches, dwell_bars,
-    vol_ratio, status ("активна" | "пробой вверх" | "пробой вниз" |
-    "пробой в обе стороны").
+    ``confirmed_ts``). ``bars``: [ts,o,h,l,c,v] rows, ascending ts.
+    ``step_ms`` kept for API compatibility (unused).
+    Zone dict: y0, y1, mid, width_pct, t0, t1, n_levels, n_touches,
+    dwell_bars, vol_ratio, status.
     """
     c = dict(DEFAULTS)
     if cfg:
         c.update(cfg)
-    if not levels:
-        return []
     arr = _as_array(bars)
-    if not len(arr):
+    n = len(arr)
+    W = int(c["seed_bars"])
+    if n < W or W < 2:
         return []
-    import bisect
     ts = arr[:, 0].astype(np.int64)
     highs, lows, vols = arr[:, 2], arr[:, 3], arr[:, 5]
     base_vol = float(vols.mean()) if float(vols.mean()) > 0 else 1.0
+
+    # rolling seed extremes (vectorised, no per-bar python loop)
+    shape, strides = (n - W + 1, W), (lows.strides[0], lows.strides[0])
+    wl = np.lib.stride_tricks.as_strided(lows, shape, strides)
+    wh = np.lib.stride_tricks.as_strided(highs, shape, strides)
+    seed_lo, seed_hi = wl.min(axis=1), wh.max(axis=1)
+    mid = (seed_lo + seed_hi) / 2.0
+    ok = ((seed_hi - seed_lo) / np.where(mid != 0, mid, 1.0)
+          <= c["max_width_pct"])
+    starts = np.where(ok)[0]
+    if not len(starts):
+        return []
+
+    # level / touch indexes for the confirmation filters
+    lp = np.array([float(lv["price"]) for lv in levels]) if levels else np.array([])
+    lc = np.array([float("-inf") if lv.get("confirmed_ts") is None
+                   else int(lv["confirmed_ts"]) for lv in levels]) \
+        if levels else np.array([])
+    touch_ts = sorted(t["ts"] for lv in (levels or [])
+                      for t in lv.get("touches", []))
+
+    pad = c.get("pad_pct", 0.0)
     zones = []
-    clusters = []
-    for cl in cluster_levels(levels, c["max_gap_pct"]):
-        clusters.extend(_split_wide(cl, c["max_width_pct"]))
-    for cl in clusters:
-        if len(cl) < c["min_levels"]:
-            continue
-        y0 = min(lv["price"] for lv in cl)
-        y1 = max(lv["price"] for lv in cl)
-        mid = (y0 + y1) / 2.0
-        width_pct = (y1 - y0) / mid if mid else 0.0
-        if width_pct > c["max_width_pct"]:
-            continue
-        pad = c.get("pad_pct", 0.0)
-        lo, hi = y0 * (1 - pad), y1 * (1 + pad)
-        touch_ts = sorted(t["ts"] for lv in cl for t in lv.get("touches", []))
-        if not touch_ts:
-            continue
-        ti = 0
-        while ti < len(touch_ts):
-            i0 = int(np.searchsorted(ts, touch_ts[ti]))
-            if i0 >= len(ts):
+    starts_list = starts.tolist()
+    p, cursor = 0, 0
+    while True:
+        p = bisect.bisect_left(starts_list, cursor, lo=p)
+        if p >= len(starts_list):
+            break
+        i = int(starts_list[p])
+        lo, hi = float(seed_lo[i]) * (1 - pad), float(seed_hi[i]) * (1 + pad)
+        # first bar outside, scanned in chunks so sequential zones cost
+        # O(span) each instead of O(suffix) (matters at 100k+ bars)
+        CH, k, bi = 4096, i, None
+        while k < n:
+            e = min(k + CH, n)
+            bad = (lows[k:e] < lo) | (highs[k:e] > hi)
+            if bad.any():
+                bi = k + int(np.argmax(bad))
                 break
-            j = i0
-            while j < len(ts) and lows[j] >= lo and highs[j] <= hi:
-                j += 1
-            i1 = j - 1  # last bar still inside (touch bar itself may wick out)
-            if i1 < i0:
-                ti += 1
-                continue
-            t0, t1 = int(ts[i0]), int(ts[i1])
-            dwell = i1 - i0 + 1
-            seg_touches = [t for t in touch_ts if t0 <= t <= t1]
-            ti = bisect.bisect_right(touch_ts, t1, lo=ti)
-            if dwell < c["min_dwell_bars"] \
-                    or len(seg_touches) < c["min_touches"]:
-                continue
-            known = [lv for lv in cl
-                     if lv.get("confirmed_ts") is None
-                     or int(lv["confirmed_ts"]) <= t1]
-            if len(known) < c["min_levels"]:
-                continue
-            vol_ratio = float(vols[i0:i1 + 1].mean()) / base_vol
-            if j >= len(ts):
-                status = "активна"  # never left the band through `now`
-            else:
-                up = bool(highs[j] > hi)
-                dn = bool(lows[j] < lo)
-                status = ("пробой в обе стороны" if (up and dn)
-                          else "пробой вверх" if up else "пробой вниз")
-            zones.append({
-                "y0": y0, "y1": y1, "mid": mid, "width_pct": width_pct,
-                "t0": t0, "t1": t1, "n_levels": len(known),
-                "n_touches": len(seg_touches), "dwell_bars": dwell,
-                "vol_ratio": vol_ratio, "status": status,
-            })
+            k = e
+        if bi is None:
+            j = n - 1
+            status = "активна"
+        else:
+            j = bi - 1                    # last bar inside
+            up = bool(highs[bi] > hi)
+            dn = bool(lows[bi] < lo)
+            status = ("пробой в обе стороны" if (up and dn)
+                      else "пробой вверх" if up else "пробой вниз")
+        t0, t1 = int(ts[i]), int(ts[j])
+        dwell = j - i + 1
+        cursor = j + 1
+        if dwell < W:  # cannot happen (seed fits by construction); guard
+            continue
+        n_lv = int((((lp >= lo) & (lp <= hi) & (lc <= t1)).sum())
+                   if len(lp) else 0)
+        a = bisect.bisect_left(touch_ts, t0)
+        b = bisect.bisect_right(touch_ts, t1, lo=a)
+        n_tch = b - a
+        if n_lv < c["min_levels"] or n_tch < c["min_touches"]:
+            continue
+        zones.append({
+            "y0": float(seed_lo[i]), "y1": float(seed_hi[i]),
+            "mid": float((seed_lo[i] + seed_hi[i]) / 2.0),
+            "width_pct": float((seed_hi[i] - seed_lo[i]) / mid[i])
+            if mid[i] else 0.0,
+            "t0": t0, "t1": t1, "n_levels": n_lv,
+            "n_touches": n_tch, "dwell_bars": int(dwell),
+            "vol_ratio": float(vols[i:j + 1].mean()) / base_vol,
+            "status": status,
+        })
+    zones = _merge_chains(zones, ts, lows, highs, vols, base_vol, touch_ts,
+                          lp, lc, c, step_ms)
     zones.sort(key=lambda z: z["dwell_bars"], reverse=True)
     return zones
+
+
+def _merge_chains(zones: list, ts, lows, highs, vols, base_vol, touch_ts,
+                  lp, lc, c: dict, step_ms: int) -> list:
+    """Glue a chain of adjacent zones with near-identical bands into one
+    sustained zone (wick-breakouts fragment sideways into tiles otherwise).
+
+    Merged only when: the time gap is small, the price bands overlap a lot,
+    the merged band still respects ``max_width_pct``, and EVERY bar of the
+    merged span fits inside (strict containment re-verified, never assumed).
+    """
+    if len(zones) < 2:
+        return zones
+    step = int(step_ms) if step_ms else 60_000
+    max_gap_ms = int(c.get("merge_gap_bars", 10)) * step
+    min_iou = float(c.get("merge_iou", 0.5))
+    zones = sorted(zones, key=lambda z: z["t0"])
+    out = [zones[0]]
+    for z in zones[1:]:
+        a = out[-1]
+        inter = min(a["y1"], z["y1"]) - max(a["y0"], z["y0"])
+        union = max(a["y1"], z["y1"]) - min(a["y0"], z["y0"])
+        iou = (inter / union) if union > 0 else 0.0
+        if z["t0"] - a["t1"] <= max_gap_ms and iou >= min_iou:
+            y0, y1 = min(a["y0"], z["y0"]), max(a["y1"], z["y1"])
+            mid = (y0 + y1) / 2.0
+            if mid and (y1 - y0) / mid <= c["max_width_pct"]:
+                m = (ts >= a["t0"]) & (ts <= z["t1"])
+                seg_lows, seg_highs = lows[m], highs[m]
+                if len(seg_lows) and (seg_lows >= y0).all() \
+                        and (seg_highs <= y1).all():
+                    i0 = int(np.searchsorted(ts, a["t0"]))
+                    i1 = int(np.searchsorted(ts, z["t1"], side="right")) - 1
+                    ta = bisect.bisect_left(touch_ts, a["t0"])
+                    tb = bisect.bisect_right(touch_ts, z["t1"], lo=ta)
+                    a.update({
+                        "y0": y0, "y1": y1, "mid": mid,
+                        "width_pct": (y1 - y0) / mid,
+                        "t1": z["t1"],
+                        "n_levels": int((((lp >= y0) & (lp <= y1)
+                                          & (lc <= z["t1"])).sum())
+                                        if len(lp) else 0),
+                        "n_touches": tb - ta,
+                        "dwell_bars": i1 - i0 + 1,
+                        "vol_ratio": float(vols[i0:i1 + 1].mean()) / base_vol,
+                        "status": z["status"],
+                    })
+                    continue
+        out.append(z)
+    # merged zones can chain further (a+b merged, then +c): one more pass
+    # suffices in practice since bands only widen slightly per merge
+    return out
 
 
 def find_strong_levels(levels: list, cfg: dict | None = None) -> set:
@@ -189,19 +212,17 @@ def find_strong_levels(levels: list, cfg: dict | None = None) -> set:
         c.update(cfg)
     if not levels:
         return set()
-    prices = sorted(lv["price"] for lv in levels)
+    order = sorted(range(len(levels)), key=lambda k: levels[k]["price"])
     strong = set()
-    for lv in levels:
-        p = lv["price"]
+    for pos, k in enumerate(order):
+        p = levels[k]["price"]
         gaps = []
-        if p > prices[0]:
-            below = max(q for q in prices if q < p)
-            gaps.append((p - below) / p)
-        if p < prices[-1]:
-            above = min(q for q in prices if q > p)
-            gaps.append((above - p) / p)
+        if pos > 0:
+            gaps.append((p - levels[order[pos - 1]]["price"]) / p)
+        if pos < len(order) - 1:
+            gaps.append((levels[order[pos + 1]]["price"] - p) / p)
         near = min(gaps) if gaps else float("inf")
         if near >= c["strong_gap_pct"] \
-                and len(lv.get("touches", [])) >= c["strong_min_touches"]:
+                and len(levels[k].get("touches", [])) >= c["strong_min_touches"]:
             strong.add(p)
     return strong
