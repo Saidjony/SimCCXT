@@ -38,6 +38,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import levels_demo as LD
 import market_data as MD
+import zones as ZN
 
 import simccxt
 
@@ -50,6 +51,8 @@ ZONE = 0.001
 MAX_DRAW_LEVELS = 30
 MAX_DRAW_TOUCHES = 500
 MAX_TABLE_ROWS = 50
+# Accumulation zones: draw the top few by touches (rectangles).
+MAX_DRAW_ZONES = 5
 
 
 # Display scale for the offline synthetic fallback ONLY (real data always
@@ -139,7 +142,8 @@ def new_session(symbol: str, tf: str, df: pd.DataFrame, source: str,
                                   merge_tol=ZONE * 0.5),
             "seen": 0, "running": True, "done": False,
             "speed": 2, "window": 300,
-            "follow": True, "last_zoom": None}
+            "follow": True, "last_zoom": None,
+            "zones": [], "strong": set()}
 
 
 STATUS_MSG = "старт: синтетика, выбери даты — данные догрузятся с Binance в кэш data/ohlcv/"
@@ -527,12 +531,28 @@ def build_app():
                         "fontFamily": "monospace"},
             page_size=15, sort_action="native",
             style_table={"overflowX": "auto"}),
+        html.H3("Зоны накопления: кластеры близких уровней с массой касаний",
+                style={"fontSize": "15px", "marginTop": "14px"}),
+        dash_table.DataTable(
+            id="zones_table",
+            columns=[{"name": "зона", "id": "zone"},
+                     {"name": "уровней", "id": "levels"},
+                     {"name": "касаний", "id": "touches"},
+                     {"name": "ширина %", "id": "width"},
+                     {"name": "период", "id": "period"},
+                     {"name": "объём x", "id": "vol"},
+                     {"name": "статус", "id": "status"}],
+            style_cell={"fontSize": "12px", "padding": "2px 8px",
+                        "fontFamily": "monospace"},
+            page_size=10, sort_action="native",
+            style_table={"overflowX": "auto"}),
         dcc.Interval(id="tick", interval=1000, n_intervals=0),
     ], style={"padding": "12px"})
 
     @app.callback(Output("chart", "figure"), Output("stats", "children"),
-                  Output("levels_table", "data"),
-                  Output("open_panel", "children"),
+                   Output("levels_table", "data"),
+                   Output("zones_table", "data"),
+                   Output("open_panel", "children"),
                   Output("closed_table", "data"),
                   Input("tick", "n_intervals"),
                   State("coin", "value"), State("tf", "value"),
@@ -571,6 +591,8 @@ def build_app():
                 log_touches(det, new, prev_close)
                 settle_paper(new)
                 st["seen"] = len(bars)
+                st["zones"] = ZN.find_zones(det.levels, bars, TFS[st["tf"]])
+                st["strong"] = ZN.find_strong_levels(det.levels)
             st["done"] = ex.replay_done(symbol, tf)
         panel, table = make_paper(st)
         if frozen or (not st["follow"] and not rebuilt):
@@ -578,9 +600,10 @@ def build_app():
             # stable); the sim keeps running and stats/tables keep updating
             mode = "FROZEN" if frozen else "CUSTOM"
             return dash.no_update, make_stats(st, frozen=mode), \
-                make_table_rows(st), panel, table
+                make_table_rows(st), make_zones_rows(st), panel, table
         fig = make_fig(st, window)
-        return fig, make_stats(st), make_table_rows(st), panel, table
+        return fig, make_stats(st), make_table_rows(st), make_zones_rows(st), \
+            panel, table
 
     def fmt_ts(ms):
         return ms_local(ms).strftime("%m-%d %H:%M")
@@ -814,6 +837,8 @@ def build_app():
         ex = st["ex"]
         n_lv = len(st["det"].levels)
         n_t = sum(len(lv["touches"]) for lv in st["det"].levels)
+        n_z = len(st.get("zones") or [])
+        n_s = len(st.get("strong") or [])
         now = ms_local(ex.now_ms()).strftime("%m-%d %H:%M")
         flag = "FINISHED" if st["done"] else ("RUNNING" if st["running"] else "PAUSED")
         if frozen and frozen is not True:
@@ -827,7 +852,22 @@ def build_app():
                ms_local(r1).strftime("%m-%d"))
         return (f"{st['symbol']} {st['tf']} [{st['source']} {rng}] | sim-time {now} "
                 f"(местн.) | "
-                f"bars {st['seen']} | levels {n_lv} | touches {n_t} | {flag} || {STATUS_MSG}")
+                f"bars {st['seen']} | levels {n_lv} | touches {n_t} | "
+                f"zones {n_z} | strong {n_s} | {flag} || {STATUS_MSG}")
+
+    def make_zones_rows(st):
+        rows = []
+        for z in (st.get("zones") or [])[:MAX_TABLE_ROWS]:
+            rows.append({
+                "zone": f"{z['y0']:,.4f}–{z['y1']:,.4f}",
+                "levels": z["n_levels"],
+                "touches": z["n_touches"],
+                "width": f"{z['width_pct'] * 100:.2f}%",
+                "period": f"{fmt_ts(z['t0'])}..{fmt_ts(z['t1'])}",
+                "vol": f"{z['vol_ratio']:.2f}x",
+                "status": z["status"],
+            })
+        return rows
 
     def make_table_rows(st):
         rows = []
@@ -866,10 +906,27 @@ def build_app():
                                   name=f"{st['symbol']} (бары)",
                                   increasing_line_color="black",
                                   decreasing_line_color="black"))
+            # accumulation zones (rectangles): price band + first..last touch.
+            # Active zones stretch to the latest bar; strong (lonely +
+            # respected) levels below get a thicker line.
+            t_end = int(seg[-1, 0])
+            for z in (st.get("zones") or [])[:MAX_DRAW_ZONES]:
+                if z["t1"] < int(seg[0, 0]) or z["t0"] > t_end:
+                    continue
+                x1 = max(z["t1"], t_end) if z["status"] == "активна" else z["t1"]
+                fig.add_shape(type="rect",
+                              x0=ms_local(z["t0"]), x1=ms_local(x1),
+                              y0=z["y0"], y1=z["y1"],
+                              fillcolor="gold", opacity=0.12,
+                              line=dict(color="gold", width=1,
+                                        dash="dash"))
+            strong = st.get("strong") or set()
             for lv in draw_levels:
                 fig.add_hline(y=lv["price"],
                               line_color="green" if lv["direction"] == "support" else "red",
-                              line_dash="dash", line_width=1, opacity=0.8)
+                              line_dash="dash",
+                              line_width=2 if lv["price"] in strong else 1,
+                              opacity=0.8)
             # pivot bars (diamonds) + confirming windows (shading):
             # dots show exactly which bars produced each level
             px, py, ptext = [], [], []
