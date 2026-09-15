@@ -29,6 +29,7 @@ import argparse
 import datetime as dt
 import os
 import sys
+import threading
 import time as _time
 
 import numpy as np
@@ -43,20 +44,42 @@ import simccxt
 TFS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 N_BARS = 1200
 ZONE = 0.001
+# Per-tick render budget (the server is single-threaded, tick = 1 s):
+# draw only the most-touched levels / latest touch markers, list more rows
+# in the table than on the chart.
+MAX_DRAW_LEVELS = 30
+MAX_DRAW_TOUCHES = 500
+MAX_TABLE_ROWS = 50
 
 
-def synthetic(symbol: str, tf: str, n: int = N_BARS) -> pd.DataFrame:
+# Display scale for the offline synthetic fallback ONLY (real data always
+# wins when reachable). Approximate 2026 spot prices so e.g. BTC doesn't
+# render at ~1.3 when Binance is unreachable.
+REF_PRICE = {
+    "BTC": 100000.0, "ETH": 3500.0, "SOL": 200.0, "BNB": 650.0,
+    "XRP": 2.2, "DOGE": 0.20, "ADA": 0.80, "TRX": 0.27, "TON": 5.0,
+    "AVAX": 30.0, "LINK": 18.0, "LTC": 100.0, "NEAR": 5.0, "DOT": 6.0,
+}
+
+
+def synthetic(symbol: str, tf: str, n: int = N_BARS,
+              start_ms: int | None = None) -> pd.DataFrame:
     """Deterministic OHLC bars for ANY coin/timeframe (offline fallback).
 
-    Price scale and seed derive from the symbol, so every coin gets its own
-    stable synthetic series.
+    Price scale comes from REF_PRICE for known coins (hash-based otherwise);
+    timestamps anchor at `start_ms` when given so the axis matches the
+    requested range even without network.
     """
     import hashlib
+    base = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
     h = int(hashlib.md5(symbol.encode()).hexdigest()[:8], 16)
-    mag = 10 ** (h % 5)                      # 1 .. 10000 price magnitude
-    s0 = float(mag) * (1.0 + (h % 100) / 100.0)
+    s0 = REF_PRICE.get(base)
+    if s0 is None:
+        mag = 10 ** (h % 5)                      # 1 .. 10000 price magnitude
+        s0 = float(mag) * (1.0 + (h % 100) / 100.0)
     seed = h % 10_000
-    step_s = TFS[tf] // 1000
+    step_ms = TFS[tf]
+    step_s = step_ms // 1000
     rng = np.random.default_rng(seed)
     t = np.arange(n) / (n / 4.0)                       # ~4 waves per load
     logp = (np.log(s0) + 0.02 * t
@@ -68,7 +91,12 @@ def synthetic(symbol: str, tf: str, n: int = N_BARS) -> pd.DataFrame:
     half = 0.0003 + 0.0012 * np.abs(rng2.normal(0.0, 1.0, n))
     open_ = np.concatenate(([close[0]], close[:-1]))
     freq = {"1m": "min", "5m": "5min", "15m": "15min", "1h": "h"}[tf]
-    ts = pd.date_range("2026-05-01", periods=n, freq=freq, tz="UTC")
+    if start_ms is not None:
+        anchor = pd.to_datetime((int(start_ms) // step_ms) * step_ms,
+                                unit="ms", utc=True)
+    else:
+        anchor = pd.Timestamp("2026-05-01", tz="UTC")
+    ts = pd.date_range(anchor, periods=n, freq=freq, tz="UTC")
     return pd.DataFrame({
         "timestamp": ts, "open": open_,
         "high": np.maximum(open_, close) * (1.0 + half),
@@ -80,6 +108,16 @@ def synthetic(symbol: str, tf: str, n: int = N_BARS) -> pd.DataFrame:
 def to_ms(ts: pd.Series) -> np.ndarray:
     naive = ts.dt.tz_convert("UTC").dt.tz_localize(None)
     return (naive.astype("datetime64[ns]").astype("int64") // 10**6).to_numpy()
+
+
+def _local_tz():
+    """OS local timezone (whatever the machine is configured with)."""
+    return dt.datetime.now().astimezone().tzinfo
+
+
+def ms_local(ms):
+    """Epoch ms -> datetimes in OS local time (axis, tables, stats)."""
+    return pd.to_datetime(ms, unit="ms", utc=True).tz_convert(_local_tz())
 
 
 # ------------------------------------------------------------------ session
@@ -107,6 +145,66 @@ def new_session(symbol: str, tf: str, df: pd.DataFrame, source: str,
 STATUS_MSG = "старт: синтетика, выбери даты — данные догрузятся с Binance в кэш data/ohlcv/"
 MAX_BARS = 200_000
 
+# Background Binance downloads.
+# The web server is single-threaded (the Rust engine requires it), so a
+# synchronous download inside a tick callback would freeze the whole page.
+# The worker thread below only moves plain data (urllib + pandas + cache
+# file) and never touches the `Exchange` object — the session itself is
+# always (re)built on the server thread via new_session().
+DL = {"key": None, "thread": None, "stats": None, "error": None}
+DL_TIMEOUT = 20  # seconds per Binance page when downloading for the dashboard
+
+
+def _download_worker(symbol, tf, s, e, key):
+    """Thread body: download missing bars into the disk cache (no Exchange)."""
+    try:
+        _, stats = MD.load_or_download(symbol, tf, s, e, timeout=DL_TIMEOUT)
+        DL["stats"] = stats
+    except Exception as exc:  # noqa: BLE001 — reported via status line
+        DL["error"] = str(exc)
+
+
+def _start_download(symbol, tf, s, e, key) -> bool:
+    """Spawn a background download for key; False if a worker is busy."""
+    t = DL["thread"]
+    if t is not None and t.is_alive():
+        return False
+    DL.update(key=key, thread=threading.Thread(
+        target=_download_worker, args=(symbol, tf, s, e, key), daemon=True),
+        stats=None, error=None)
+    DL["thread"].start()
+    return True
+
+
+def _poll_download():
+    """Adopt a finished background download (runs on the server thread)."""
+    global STATE, STATUS_MSG
+    t = DL["thread"]
+    if t is None or t.is_alive() or DL["key"] is None:
+        return
+    t.join()
+    key, stats, error = DL["key"], DL["stats"], DL["error"]
+    DL.update(key=None, thread=None, stats=None, error=None)
+    if STATE is None or key != STATE.get("key"):
+        return  # user already moved to other dates/coin; cache still useful
+    symbol, tf, s, e = key
+    if error is not None:
+        STATUS_MSG = f"Binance недоступен ({error}); показана синтетика"
+        return
+    try:
+        window, covered = MD.read_window(symbol, tf, s, e)
+    except Exception as exc:  # noqa: BLE001 — corrupt cache etc.
+        STATUS_MSG = f"кэш не читается ({exc}); показана синтетика"
+        return
+    if len(window) == 0:
+        STATUS_MSG = "Binance вернул пустой диапазон; показана синтетика"
+        return
+    STATE = new_session(symbol, tf, window,
+                        source="binance(cache)+dl", key=key)
+    n_dl = stats.get("downloaded", 0) if stats else 0
+    STATUS_MSG = (f"Binance: докачано {n_dl}, всего {len(window)} баров"
+                  + ("" if covered else " (покрытие частичное)"))
+
 
 def desired_key(symbol, tf, start_date, end_date):
     """(symbol, tf, start_ms, end_exclusive_ms) from picker values."""
@@ -128,10 +226,13 @@ def valid_symbol(symbol) -> bool:
 def ensure_session(symbol, tf, start_date, end_date):
     """Rebuild the session if the desired (coin, tf, dates) key changed.
 
-    Data path: disk cache first, Binance download for missing bars only,
-    synthetic fallback when offline/unsupported.
+    Never blocks on the network (the server thread must stay responsive):
+      * disk cache covers the whole range -> session from cache, instantly;
+      * otherwise -> synthetic session instantly + missing bars download
+        in a background thread; the next ticks adopt it via _poll_download().
     """
     global STATE, STATUS_MSG
+    _poll_download()
     if not valid_symbol(symbol):
         # don't consume the key: user may still be typing
         STATUS_MSG = "введи монету как BASE/QUOTE, например DOGE/USDT (Enter)"
@@ -148,18 +249,22 @@ def ensure_session(symbol, tf, start_date, end_date):
             STATE["key"] = key  # consume: don't retry every tick
         return False
     try:
-        t0 = _time.time()
-        df, st = MD.load_or_download(symbol, tf, s, e)
-        if len(df) == 0:
-            raise RuntimeError("пустой диапазон (нет баров)")
-        STATE = new_session(symbol, tf, df, source=f"binance(cache)+dl", key=key)
-        STATUS_MSG = (f"Binance: из кэша {st['cached']}, докачано {st['downloaded']} "
-                      f"за {_time.time() - t0:.1f}с")
-    except Exception as exc:  # offline / bad symbol / bad range -> synthetic
-        df = synthetic(symbol, tf)
-        df["ts_ms"] = to_ms(df["timestamp"])
-        STATE = new_session(symbol, tf, df, source="synthetic-fallback", key=key)
-        STATUS_MSG = f"загрузка не удалась ({exc}); показан синтетический ряд"
+        window, covered = MD.read_window(symbol, tf, s, e)
+    except Exception as exc:  # noqa: BLE001 — corrupt cache etc.
+        window, covered = None, False
+        STATUS_MSG = f"кэш не читается ({exc}); показана синтетика"
+    if covered and len(window):
+        STATE = new_session(symbol, tf, window, source="cache", key=key)
+        STATUS_MSG = f"кэш: {len(window)} баров за диапазон, без сети"
+        return True
+    df = synthetic(symbol, tf, start_ms=s)
+    df["ts_ms"] = to_ms(df["timestamp"])
+    STATE = new_session(symbol, tf, df, source="synthetic", key=key)
+    if _start_download(symbol, tf, s, e, key):
+        STATUS_MSG = ("показываю синтетику; недостающие бары качаются "
+                      "с Binance в фоне…")
+    else:
+        STATUS_MSG = "показываю синтетику; докачка уже идёт, жду её конца…"
     return True
 
 
@@ -196,7 +301,8 @@ def log_touches(det, new_bars, prev_close, zone=ZONE):
 # Virtual trading: deposit + risk-per-trade are set once; everything else
 # (risk $, stop distance, position size, live P&L) is computed automatically.
 PAPER = {"deposit": 10000.0, "risk_pct": 1.0, "equity": 10000.0,
-         "open": None, "closed": [], "draft": {}, "last_msg": ""}
+         "open": None, "pending": None, "closed": [], "draft": {},
+         "last_msg": ""}
 
 
 def calc_trade(equity, risk_pct, side, entry, sl, tp=None):
@@ -246,7 +352,23 @@ def close_paper(px, ts, reason):
 
 
 def settle_paper(new_bars):
-    """Auto-close the open paper trade on SL/TP touch (SL has priority)."""
+    """Fill pending limit orders, then auto-close the open trade on SL/TP.
+
+    Limit fill: LONG fills when a bar's low touches the entry (buy below
+    market), SHORT when a bar's high touches it. SL has priority on closes.
+    """
+    p = PAPER.get("pending")
+    if p is not None:
+        for b in new_bars:
+            ts, hi, lo = int(b[0]), b[2], b[3]
+            filled = (lo <= p["entry"]) if p["side"] > 0 else (hi >= p["entry"])
+            if filled:
+                PAPER["open"] = dict(p, open_ts=ts)
+                PAPER["pending"] = None
+                PAPER["last_msg"] = (
+                    f"лимитная {'LONG' if p['side'] > 0 else 'SHORT'} "
+                    f"сработала по {p['entry']:,.4f}")
+                break
     t = PAPER["open"]
     if not t:
         return
@@ -265,13 +387,19 @@ def settle_paper(new_bars):
 
 
 def paper_overlay():
-    """Draft/open trade levels for chart drawing (or None)."""
+    """Draft/open/pending trade levels for chart drawing (or None)."""
     t = PAPER["open"]
     if t:
-        return {"entry": t["entry"], "sl": t["sl"], "tp": t["tp"]}
+        return {"kind": "open", "entry": t["entry"], "sl": t["sl"],
+                "tp": t["tp"]}
     d = PAPER.get("draft") or {}
     if d.get("entry") and d.get("sl"):
-        return {"entry": d["entry"], "sl": d["sl"], "tp": d.get("tp")}
+        return {"kind": "draft", "entry": d["entry"], "sl": d["sl"],
+                "tp": d.get("tp")}
+    p = PAPER.get("pending")
+    if p:
+        return {"kind": "pending", "entry": p["entry"], "sl": p["sl"],
+                "tp": p.get("tp")}
     return None
 
 
@@ -349,10 +477,13 @@ def build_app():
                 dcc.Input(id="tp_price", type="number", debounce=True,
                           placeholder="тейк-профит", style={"width": "100%"}),
                 html.Div([
-                    html.Button("Открыть сделку", id="open_btn", n_clicks=0),
+                    html.Button("Открыть по рынку", id="open_btn", n_clicks=0),
+                    html.Button("Лимитная", id="limit_btn", n_clicks=0),
                     html.Button("Закрыть по рынку", id="close_btn", n_clicks=0),
+                    html.Button("Снять лимитную", id="cancel_limit_btn",
+                                n_clicks=0),
                 ], style={"display": "flex", "gap": "6px", "flexWrap": "wrap",
-                          "marginTop": "8px"}),
+                           "marginTop": "8px"}),
                 html.Div(id="calc_preview",
                          style={"marginTop": "6px", "fontFamily": "monospace",
                                 "fontSize": "12px", "whiteSpace": "pre-wrap"}),
@@ -415,9 +546,10 @@ def build_app():
         if STATE is None:
             # e.g. invalid coin text while typing: show the hint, draw nothing
             return {}, STATUS_MSG, [], "—", []
-        if rebuilt and PAPER["open"]:
+        if rebuilt and (PAPER["open"] or PAPER.get("pending")):
             PAPER["open"] = None
-            PAPER["last_msg"] = "открытая сделка отменена (смена инструмента/дат)"
+            PAPER["pending"] = None
+            PAPER["last_msg"] = "сделки отменены (смена инструмента/дат)"
         frozen = ((freeze_clicks or 0) % 2 == 1) and not rebuilt
         st, ex, det = STATE, STATE["ex"], STATE["det"]
         # follow mode: fresh data → follow live; user zoom → hold the view
@@ -451,7 +583,7 @@ def build_app():
         return fig, make_stats(st), make_table_rows(st), panel, table
 
     def fmt_ts(ms):
-        return pd.to_datetime(ms, unit="ms", utc=True).strftime("%m-%d %H:%M")
+        return ms_local(ms).strftime("%m-%d %H:%M")
 
     def make_paper(st):
         """Open-position panel (live P&L) + closed-trades table rows."""
@@ -460,6 +592,12 @@ def build_app():
             panel = (f"счёт {PAPER['equity']:.2f} USDT "
                      f"(депозит {PAPER['deposit']:.2f}, риск {PAPER['risk_pct']}%) — "
                      f"нет открытой сделки")
+            p = PAPER.get("pending")
+            if p:
+                panel += (f" | лимитная "
+                          f"{'LONG' if p['side'] > 0 else 'SHORT'} "
+                          f"{p['size']:.6f} ждёт {p['entry']:,.4f} "
+                          f"(стоп {p['sl']:,.4f})")
         else:
             bars = np.array(st["ex"].fetch_ohlcv_live(st["symbol"], st["tf"]))
             last = float(bars[-1, 4]) if len(bars) else t["entry"]
@@ -568,8 +706,61 @@ def build_app():
                 f"по {c['entry']}, стоп {c['sl']}, риск {c['risk_usd']:.2f} USDT")
 
     @app.callback(Output("trade_status", "children", allow_duplicate=True),
-                  Input("close_btn", "n_clicks"),
-                  prevent_initial_call=True)
+                   Input("limit_btn", "n_clicks"),
+                   State("deposit", "value"), State("risk_pct", "value"),
+                   State("direction", "value"), State("entry_price", "value"),
+                   State("stop_price", "value"), State("tp_price", "value"),
+                   prevent_initial_call=True)
+    def on_limit(_, deposit, risk_pct, direction, entry, stop, tp):
+        """Place a pending limit order (fills when price touches entry)."""
+        if STATE is None:
+            return "сначала дождись загрузки данных"
+        if PAPER["open"]:
+            return "сделка уже открыта — сначала закрой её"
+        if PAPER.get("pending"):
+            return "лимитная уже стоит — сначала сними её"
+        try:
+            PAPER["deposit"] = float(deposit or PAPER["deposit"])
+            PAPER["risk_pct"] = float(risk_pct if risk_pct not in (None, "") else 1.0)
+        except (TypeError, ValueError):
+            return "⚠ депозит и риск должны быть числами"
+        draft = read_draft(direction, entry, stop, tp)
+        if not draft:
+            return "⚠ заполни вход и стоп"
+        try:
+            c = calc_trade(PAPER["equity"], PAPER["risk_pct"], draft["side"],
+                           draft["entry"], draft["sl"], draft["tp"])
+        except ValueError as exc:
+            return f"⚠ {exc}"
+        bars = STATE["ex"].fetch_ohlcv_live(STATE["symbol"], STATE["tf"])
+        last = float(bars[-1][4]) if bars else draft["entry"]
+        if c["side"] > 0 and c["entry"] >= last:
+            return (f"⚠ лимитная покупка ставится НИЖЕ текущей цены "
+                    f"(сейчас {last:,.4f}); для входа сразу жми "
+                    f"«Открыть по рынку»")
+        if c["side"] < 0 and c["entry"] <= last:
+            return (f"⚠ лимитная продажа ставится ВЫШЕ текущей цены "
+                    f"(сейчас {last:,.4f}); для входа сразу жми "
+                    f"«Открыть по рынку»")
+        PAPER["pending"] = dict(c, created_ts=STATE["ex"].now_ms())
+        PAPER["draft"] = {}
+        return (f"лимитная {'LONG' if c['side'] > 0 else 'SHORT'} "
+                f"{c['size']:.6f} ждёт {c['entry']}, стоп {c['sl']}, "
+                f"риск {c['risk_usd']:.2f} USDT")
+
+    @app.callback(Output("trade_status", "children", allow_duplicate=True),
+                   Input("cancel_limit_btn", "n_clicks"),
+                   prevent_initial_call=True)
+    def on_cancel_limit(_):
+        if not PAPER.get("pending"):
+            return "нет лимитной заявки"
+        PAPER["pending"] = None
+        PAPER["last_msg"] = "лимитная заявка снята"
+        return PAPER["last_msg"]
+
+    @app.callback(Output("trade_status", "children", allow_duplicate=True),
+                   Input("close_btn", "n_clicks"),
+                   prevent_initial_call=True)
     def on_close(_):
         t = PAPER["open"]
         if not t or STATE is None:
@@ -591,6 +782,7 @@ def build_app():
             return "⚠ депозит и риск должны быть числами"
         PAPER["equity"] = PAPER["deposit"]
         PAPER["open"] = None
+        PAPER["pending"] = None
         PAPER["closed"] = []
         PAPER["last_msg"] = (f"счёт сброшен: {PAPER['equity']:.2f} USDT, "
                              f"риск {PAPER['risk_pct']}%")
@@ -622,7 +814,7 @@ def build_app():
         ex = st["ex"]
         n_lv = len(st["det"].levels)
         n_t = sum(len(lv["touches"]) for lv in st["det"].levels)
-        now = pd.to_datetime(ex.now_ms(), unit="ms", utc=True).strftime("%m-%d %H:%M")
+        now = ms_local(ex.now_ms()).strftime("%m-%d %H:%M")
         flag = "FINISHED" if st["done"] else ("RUNNING" if st["running"] else "PAUSED")
         if frozen and frozen is not True:
             flag += f" + {frozen}"
@@ -631,22 +823,24 @@ def build_app():
         elif not st.get("follow", True):
             flag += " + VIEW: свой (дабл-клик — снова live)"
         r0, r1 = st["range"]
-        rng = (pd.to_datetime(r0, unit="ms", utc=True).strftime("%m-%d") + ".." +
-               pd.to_datetime(r1, unit="ms", utc=True).strftime("%m-%d"))
-        return (f"{st['symbol']} {st['tf']} [{st['source']} {rng}] | sim-time {now} | "
+        rng = (ms_local(r0).strftime("%m-%d") + ".." +
+               ms_local(r1).strftime("%m-%d"))
+        return (f"{st['symbol']} {st['tf']} [{st['source']} {rng}] | sim-time {now} "
+                f"(местн.) | "
                 f"bars {st['seen']} | levels {n_lv} | touches {n_t} | {flag} || {STATUS_MSG}")
 
     def make_table_rows(st):
         rows = []
-        for lv in sorted(st["det"].levels,
-                         key=lambda l: len(l["touches"]), reverse=True):
+        levels = sorted(st["det"].levels,
+                        key=lambda l: len(l["touches"]), reverse=True)
+        if len(levels) > MAX_TABLE_ROWS:
+            levels = levels[:MAX_TABLE_ROWS]
+        for lv in levels:
             rows.append({
                 "level": f"{lv['price']:,.4f}",
                 "dir": "поддержка" if lv["direction"] == "support" else "сопротивление",
-                "pivot": pd.to_datetime(lv["pivot_ts"], unit="ms",
-                                        utc=True).strftime("%m-%d %H:%M"),
-                "confirmed": pd.to_datetime(lv["confirmed_ts"], unit="ms",
-                                            utc=True).strftime("%m-%d %H:%M"),
+                "pivot": fmt_ts(lv["pivot_ts"]),
+                "confirmed": fmt_ts(lv["confirmed_ts"]),
                 "window": len(lv.get("confirming_bars") or []),
                 "touches": len(lv["touches"]),
             })
@@ -656,35 +850,42 @@ def build_app():
         import plotly.graph_objects as go
         ex = st["ex"]
         bars = np.array(ex.fetch_ohlcv_live(st["symbol"], st["tf"]))
+        # Render budget: the tick runs every second on a single-threaded
+        # server, so the figure must stay small. Only the most-touched
+        # levels are drawn (the table below lists more); touches markers
+        # are capped to the latest few hundred.
+        draw_levels = sorted(st["det"].levels,
+                             key=lambda l: len(l["touches"]),
+                             reverse=True)[:MAX_DRAW_LEVELS]
         fig = go.Figure()
         if len(bars):
             seg = bars[max(0, len(bars) - window):]
-            t = pd.to_datetime(seg[:, 0], unit="ms")
+            t = ms_local(seg[:, 0])
             fig.add_trace(go.Ohlc(x=t, open=seg[:, 1], high=seg[:, 2],
                                   low=seg[:, 3], close=seg[:, 4],
                                   name=f"{st['symbol']} (бары)",
                                   increasing_line_color="black",
                                   decreasing_line_color="black"))
-            for lv in st["det"].levels:
+            for lv in draw_levels:
                 fig.add_hline(y=lv["price"],
                               line_color="green" if lv["direction"] == "support" else "red",
                               line_dash="dash", line_width=1, opacity=0.8)
             # pivot bars (diamonds) + confirming windows (shading):
             # dots show exactly which bars produced each level
             px, py, ptext = [], [], []
-            for lv in st["det"].levels:
+            for lv in draw_levels:
                 cb = lv.get("confirming_bars") or []
                 if cb and cb[-1] >= int(seg[0, 0]):
-                    fig.add_vrect(x0=pd.to_datetime(cb[0], unit="ms"),
-                                  x1=pd.to_datetime(cb[-1], unit="ms"),
+                    fig.add_vrect(x0=ms_local(cb[0]),
+                                  x1=ms_local(cb[-1]),
                                   fillcolor="blue", opacity=0.07, line_width=0)
                 if lv["pivot_ts"] >= int(seg[0, 0]):
-                    px.append(pd.to_datetime(lv["pivot_ts"], unit="ms"))
+                    px.append(ms_local(lv["pivot_ts"]))
                     py.append(lv["price"])
                     ptext.append(
                         f"уровень {lv['price']:,.4f} ({lv['direction']})<br>"
-                        f"пивот-бар {pd.to_datetime(lv['pivot_ts'], unit='ms')}<br>"
-                        f"подтверждён {pd.to_datetime(lv['confirmed_ts'], unit='ms')}<br>"
+                        f"пивот-бар {ms_local(lv['pivot_ts'])}<br>"
+                        f"подтверждён {ms_local(lv['confirmed_ts'])}<br>"
                         f"окно подтверждения: {len(cb)} баров<br>"
                         f"касаний: {len(lv['touches'])}")
             if px:
@@ -697,25 +898,46 @@ def build_app():
             ov = paper_overlay()
             if ov:
                 e, s = ov["entry"], ov["sl"]
-                fig.add_hline(y=e, line_color="blue", line_width=2,
-                              annotation_text="вход", annotation_position="right")
-                fig.add_hline(y=s, line_color="red", line_width=2, line_dash="dot",
-                              annotation_text="стоп", annotation_position="right")
-                fig.add_hrect(y0=min(e, s), y1=max(e, s),
-                              fillcolor="red", opacity=0.07, line_width=0)
-                if ov.get("tp"):
-                    tp_px = ov["tp"]
-                    fig.add_hline(y=tp_px, line_color="green", line_width=2,
+                if ov["kind"] == "pending":
+                    fig.add_hline(y=e, line_color="purple", line_width=2,
+                                  line_dash="dash",
+                                  annotation_text="лимит",
+                                  annotation_position="right")
+                    fig.add_hline(y=s, line_color="red", line_width=1,
                                   line_dash="dot",
-                                  annotation_text="тейк", annotation_position="right")
-                    fig.add_hrect(y0=min(e, tp_px), y1=max(e, tp_px),
-                                  fillcolor="green", opacity=0.07, line_width=0)
+                                  annotation_text="стоп",
+                                  annotation_position="right")
+                    fig.add_hrect(y0=min(e, s), y1=max(e, s),
+                                  fillcolor="purple", opacity=0.06,
+                                  line_width=0)
+                    if ov.get("tp"):
+                        tp_px = ov["tp"]
+                        fig.add_hline(y=tp_px, line_color="green",
+                                      line_width=1, line_dash="dot",
+                                      annotation_text="тейк",
+                                      annotation_position="right")
+                else:
+                    fig.add_hline(y=e, line_color="blue", line_width=2,
+                                  annotation_text="вход", annotation_position="right")
+                    fig.add_hline(y=s, line_color="red", line_width=2, line_dash="dot",
+                                  annotation_text="стоп", annotation_position="right")
+                    fig.add_hrect(y0=min(e, s), y1=max(e, s),
+                                  fillcolor="red", opacity=0.07, line_width=0)
+                    if ov.get("tp"):
+                        tp_px = ov["tp"]
+                        fig.add_hline(y=tp_px, line_color="green", line_width=2,
+                                      line_dash="dot",
+                                      annotation_text="тейк", annotation_position="right")
+                        fig.add_hrect(y0=min(e, tp_px), y1=max(e, tp_px),
+                                      fillcolor="green", opacity=0.07, line_width=0)
             xs, ys = [], []
-            for lv in st["det"].levels:
+            for lv in draw_levels:
                 for tc in lv["touches"]:
                     if tc["ts"] >= int(seg[0, 0]):
-                        xs.append(pd.to_datetime(tc["ts"], unit="ms"))
+                        xs.append(ms_local(tc["ts"]))
                         ys.append(tc["price"])
+            if len(xs) > MAX_DRAW_TOUCHES:  # keep only the latest markers
+                xs, ys = xs[-MAX_DRAW_TOUCHES:], ys[-MAX_DRAW_TOUCHES:]
             if xs:
                 fig.add_trace(go.Scatter(x=xs, y=ys, mode="markers", name="касания",
                                          marker=dict(color="orange", size=6)))
@@ -726,7 +948,7 @@ def build_app():
                 tr = PAPER["open"]
                 if tr["open_ts"] >= t0seg:
                     fig.add_trace(go.Scatter(
-                        x=[pd.to_datetime(tr["open_ts"], unit="ms")], y=[tr["entry"]],
+                        x=[ms_local(tr["open_ts"])], y=[tr["entry"]],
                         mode="markers", name="вход (открыта)",
                         marker=dict(
                             symbol="triangle-up" if tr["side"] > 0 else "triangle-down",
@@ -741,8 +963,8 @@ def build_app():
                     continue
                 col = "green" if c["pnl"] >= 0 else "red"
                 fig.add_trace(go.Scatter(
-                    x=[pd.to_datetime(c["open_ts"], unit="ms"),
-                       pd.to_datetime(c["close_ts"], unit="ms")],
+                    x=[ms_local(c["open_ts"]),
+                       ms_local(c["close_ts"])],
                     y=[c["entry"], c["exit"]], mode="lines+markers",
                     name="сделки" if first_seg else None,
                     showlegend=first_seg,
@@ -750,10 +972,10 @@ def build_app():
                     marker=dict(size=9, color=col),
                     hoverinfo="text",
                     text=[f"ВХОД {c['dir']}<br>{c['entry']:,.4f}<br>"
-                          f"{pd.to_datetime(c['open_ts'], unit='ms')}",
+                          f"{ms_local(c['open_ts'])}",
                           f"ВЫХОД {c['exit']:,.4f}<br>"
                           f"P&L {c['pnl']:+.2f} USDT ({c['reason']})<br>"
-                          f"{pd.to_datetime(c['close_ts'], unit='ms')}"]))
+                          f"{ms_local(c['close_ts'])}"]))
                 first_seg = False
             last = seg[-1]
             fig.add_annotation(x=t[-1], y=last[4], text=f"{last[4]:,.1f}",
@@ -761,6 +983,9 @@ def build_app():
         fig.update_layout(xaxis_rangeslider_visible=False, height=800,
                           hovermode="x unified", showlegend=True,
                           uirevision="live",
+                          legend=dict(x=0.01, y=0.99, xanchor="left",
+                                      yanchor="top",
+                                      bgcolor="rgba(255,255,255,0.75)"),
                           margin=dict(l=50, r=10, t=10, b=30))
         return fig
 
@@ -770,7 +995,7 @@ def build_app():
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8050)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args(argv)
     app = build_app()
     print(f"open http://{args.host}:{args.port}/  (Ctrl+C to stop)")
