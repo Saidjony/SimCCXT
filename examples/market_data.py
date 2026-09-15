@@ -16,7 +16,9 @@ No API key needed (public klines endpoint). stdlib only (urllib) + pandas.
 
 import json
 import os
+import socket
 import time
+import urllib.error
 import urllib.request
 
 import pandas as pd
@@ -25,7 +27,10 @@ TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "..", "data", "ohlcv")
 
-BINANCE = "https://api.binance.com/api/v3/klines"
+# Public klines endpoints, tried in order. api.binance.com is geo-restricted
+# in some regions (HTTP 451) — data-api.binance.vision serves the same
+# public market data without those restrictions.
+BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
 
 
 def to_binance_symbol(symbol: str) -> str:
@@ -40,20 +45,46 @@ def cache_path(symbol: str, tf: str, cache_dir: str = CACHE_DIR) -> str:
     return os.path.join(cache_dir, f"{to_binance_symbol(symbol)}_{tf}.csv")
 
 
+def _fetch_page(url: str, timeout: float) -> list:
+    """One klines page; raises the last error to the caller."""
+    req = urllib.request.Request(url, headers={"User-Agent": "simccxt/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
 def fetch_klines(symbol: str, tf: str, start_ms: int, end_ms: int,
-                 limit: int = 1000, pause: float = 0.15) -> list:
-    """Download klines [start_ms, end_ms] from Binance (paginated)."""
+                 limit: int = 1000, pause: float = 0.15,
+                 timeout: float = 30) -> list:
+    """Download klines [start_ms, end_ms] from Binance (paginated).
+
+    Tries BINANCE_HOSTS in order: a host answering 403/451 (geo-restriction)
+    or unreachable is skipped in favour of the next one.
+    """
     if tf not in TF_MS:
         raise ValueError(f"unsupported timeframe {tf!r} (need one of {sorted(TF_MS)})")
     sym = to_binance_symbol(symbol)
     step = TF_MS[tf]
     out, cursor = [], int(start_ms)
+    last_err: Exception | None = None
     while cursor <= int(end_ms):
-        url = (f"{BINANCE}?symbol={sym}&interval={tf}"
-               f"&startTime={cursor}&endTime={int(end_ms)}&limit={limit}")
-        req = urllib.request.Request(url, headers={"User-Agent": "simccxt/0.1"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            rows = json.loads(r.read().decode())
+        rows = None
+        for host in BINANCE_HOSTS:
+            url = (f"{host}/api/v3/klines?symbol={sym}&interval={tf}"
+                   f"&startTime={cursor}&endTime={int(end_ms)}&limit={limit}")
+            try:
+                rows = _fetch_page(url, timeout)
+                last_err = None
+                break
+            except urllib.error.HTTPError as exc:
+                last_err = exc
+                if exc.code in (403, 451) and host != BINANCE_HOSTS[-1]:
+                    continue  # restricted here — try the mirror
+                raise
+            except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+                last_err = exc
+                if host != BINANCE_HOSTS[-1]:
+                    continue  # unreachable — try the mirror
+                raise
         if not rows:
             break
         for k in rows:
@@ -64,6 +95,8 @@ def fetch_klines(symbol: str, tf: str, start_ms: int, end_ms: int,
             break
         cursor = last_open + step
         time.sleep(pause)
+    if last_err is not None and not out:
+        raise last_err
     return out
 
 
@@ -83,8 +116,26 @@ def write_cache(df: pd.DataFrame, symbol: str, tf: str,
     return path
 
 
+def read_window(symbol: str, tf: str, start_ms: int, end_ms: int,
+                cache_dir: str = CACHE_DIR) -> tuple[pd.DataFrame, bool]:
+    """Cached bars for [start_ms, end_ms) without any network.
+
+    Returns (window_df, covered) where covered=True means the disk cache
+    already holds every bar of the requested range — the caller can build
+    a session instantly without downloading.
+    """
+    cached = read_cache(symbol, tf, cache_dir)
+    window = cached[(cached["ts_ms"] >= start_ms)
+                    & (cached["ts_ms"] < end_ms)].reset_index(drop=True)
+    step = TF_MS[tf]
+    want = set(range(int(start_ms), int(end_ms), step))
+    have = set(window["ts_ms"].astype("int64").tolist()) if len(window) else set()
+    return window, (bool(want) and want <= have)
+
+
 def load_or_download(symbol: str, tf: str, start_ms: int, end_ms: int,
-                     cache_dir: str = CACHE_DIR) -> tuple[pd.DataFrame, dict]:
+                     cache_dir: str = CACHE_DIR,
+                     timeout: float = 30) -> tuple[pd.DataFrame, dict]:
     """Return bars for [start_ms, end_ms); download only what's missing.
 
     Returns (window_df, stats) with stats = {cached, downloaded, source}.
@@ -108,7 +159,7 @@ def load_or_download(symbol: str, tf: str, start_ms: int, end_ms: int,
                 s, prev = t, t
         segs.append((s, prev))
         for a, b in segs:
-            downloaded.extend(fetch_klines(symbol, tf, a, b))
+            downloaded.extend(fetch_klines(symbol, tf, a, b, timeout=timeout))
 
     if downloaded:
         new = pd.DataFrame(downloaded,
