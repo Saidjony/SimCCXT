@@ -2,7 +2,7 @@
 """
 market_data.py
 ==============
-Disk cache + internet download for simccxt research (Binance public klines).
+Disk cache + internet download for the simccxt exchange simulator (Binance public klines).
 
 Logic ("if the coin is not in the laptop's memory, fetch it from internet"):
   cache:  data/ohlcv/{SYMBOL}_{tf}.csv   (timestamp ms, open, high, low, close, volume)

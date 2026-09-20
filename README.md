@@ -68,16 +68,12 @@ src/python-api      PyO3 bindings (import simccxt)
 Python side:
 
 ```
-research/research_levels.py    swing-level market microstructure research
-research/README.md             how to run the research, options, outputs
-examples/market_data.py        disk cache + Binance download (cache-first)
-examples/realtime_simulator.py step-by-step live feed demo
-examples/levels_demo.py        online levels inside the live feed
-examples/levels_web.py         static Plotly dashboard (offline HTML)
-examples/live_dashboard.py     Dash site: live feed + levels + paper trading
-examples/levels_finder.py      earliest level-finder prototype (via simccxt)
-examples/levels_cluster.py     price-time clustering levels (XRP, no swings)
-examples/ccxt_compatibility.py runnable CCXT-style strategy example
+examples/ccxt_compatibility.py  runnable CCXT-style strategy example
+examples/market_data.py         disk cache + Binance download (cache-first)
+examples/realtime_simulator.py  step-by-step live feed demo
+```
+
+```
 data/ohlcv/                    local market-data cache (machine-local, gitignored)
 ```
 
@@ -202,102 +198,6 @@ New Python API for the simulator:
 
 `data/` is gitignored — cache is machine-local.
 
-## Research: market-level hypotheses (`research/`)
-
-`research/research_levels.py` — one runnable file (see `research/README.md`):
-
-1. **data loading** — OHLCV pushed *through* `simccxt.Exchange`
-   (`load_candles` → bulk `fetch_ohlcv`); `--csv` for real data or
-   deterministic synthetic demo (`--seed`).
-2. **level detection** — causal swing-high / swing-low pivots: a pivot at bar
-   `i` becomes known only at bar `i+pivot` (no look-ahead).
-3. **interaction detection** — a *touch* = close entering the `±zone`
-   (default 0.1%) from the approach side (from above for support, from below
-   for resistance); re-entry after exit counts as a new touch.
-4. **feature extraction** — 10 s context (volume, volume z-score vs rolling
-   baseline, price change); trade count / OI stay NaN (see below).
-5. **forward outcomes** — returns at 1/5/10/30/60 s, max penetration /
-   rejection, MFE/MAE, breakout/reject flags, measured strictly **after**
-   the touch bar.
-6. **results** — per-level table + `touches.csv` (every raw measurement) +
-   `levels_summary.csv`.
-7. **visualization** — matplotlib figures (price+levels, volume around touch,
-   forward-return distributions; trade-count/OI figures are honest placeholders).
-
-`examples/levels_cluster.py` — alternative detection without swings and without
-any fixed percent rule (XRP/USDT): all closes → sort by price → adaptive
-density clustering (`bin_width = 0.5 × median bar range`) → time structure per
-cluster (repetitions, lifespan, distinct visits, Δtime/Δprice gaps) → levels as
-data-derived `[lo, hi]` zones. Breakout threshold = half zone width (also from
-data). Detection is retrospective by construction; outcomes stay causal.
-
-`examples/levels_demo.py` — the same swing research but driven by the **live**
-stepped feed (`fetch_ohlcv_live` + causal incremental detector).
-
-### Data availability (honest limits of the Python API)
-
-| Field              | Status                                             |
-| ------------------ | -------------------------------------------------- |
-| OHLCV              | available (`load_candles` / `fetch_ohlcv`)          |
-| trade count        | **unavailable** — no column/method → NaN           |
-| Open Interest      | **unavailable as a series** (`fetch_open_interest` returns only the current value; no `set_open_interest`/`load_oi` in Python) → NaN |
-| buy/sell volume    | **unavailable** (volume is aggregate) → NaN        |
-
-Nothing is fabricated: unavailable metrics are NaN in CSVs and annotated
-placeholders in plots. To support them, the Python API would need an extended
-candle schema (or `load_trades_agg`) and `set_open_interest`/`load_oi`.
-
-### Level-strength philosophy
-
-No single "strength score" is produced. The framework exports raw observable
-behavior per touch — rejection/breakout flags, penetration depth, forward
-returns, volume response, MFE/MAE — and per-level aggregates
-(`rejection_rate`, `breakout_rate`, mean returns). Whether that constitutes a
-"strong level" is the researcher's decision, testable from `touches.csv`
-(e.g. group by volume z-score and compare rejection probability).
-
-## Web dashboards
-
-Both share the engine (live feed + online levels + paper trading) and differ
-only in the web layer.
-
-### Dash: `examples/live_dashboard.py`
-
-```bash
-.venv/bin/python examples/live_dashboard.py --port 8050
-# open http://127.0.0.1:8050/
-```
-
-Coin (free text, e.g. `DOGE/USDT`) + timeframe + date range (UTC) + speed +
-window; data auto-loads via `market_data` (cache → Binance → synthetic
-fallback, shown in the status line). OHLC **bars** (not candles), level lines,
-pivot diamonds + confirming-window shading, touch dots, paper-trade
-entry/exit markers. Levels table with pivot/confirm timestamps.
-
-### Static Plotly: `examples/levels_web.py`
-
-Builds one self-contained `dashboard.html` (plotly.js inlined, works offline)
-with a level-selector dropdown. No server needed.
-
-## Paper trading (live dashboard)
-
-Deposit + risk-per-trade are set **once**; everything else is computed:
-
-```
-risk $      = equity × risk%
-stop distance = |entry − stop|
-size (base) = risk $ / stop distance
-notional    = size × entry  (leverage-equiv = notional / equity)
-```
-
-- Entry / stop (+ optional take-profit) are drawn on the chart (blue/red/green
-  lines + risk-zone shading); typing them shows a live sizing preview.
-- Live P&L, MFE/MAE while open; auto-close on stop touch (stop has priority)
-  or take-profit touch; manual close at market.
-- Closed trades table: open/close time, direction, entry/exit/stop, size,
-  P&L $/%, reason (STOP/TP/MANUAL), running equity. Next trade risks a % of
-  the **current** equity. Changing coin/dates cancels an open trade with a note.
-
 ## Subtleties and gotchas (hard-won, read before debugging)
 
 1. **The Rust engine is single-threaded by design** (`Rc<RefCell>` event bus).
@@ -306,30 +206,21 @@ notional    = size × entry  (leverage-equiv = notional / equity)
    single-threaded** (`threaded=False` for Dash/Flask dev server), and all
    sim calls must happen in one thread — background button callbacks may only
    exchange plain data (intents/snapshots), never the `Exchange` object.
-2. **Dash specifics.** A 1-second full-figure replace interrupts zoom gestures
-   and can snap the view back: the app therefore has *follow mode* (explicit
-   user zoom freezes figure updates until double-click autosize) plus a manual
-   freeze button. `relayoutData` must be read as State and re-applied.
-3. **pandas 2 vs 3 datetimes.** pandas 3 uses microsecond `datetime64[us]`;
+2. **pandas 2 vs 3 datetimes.** pandas 3 uses microsecond `datetime64[us]`;
    code converting to epoch ms must force nanoseconds first
    (`astype("datetime64[ns]")`), otherwise timestamps land in 1970. Also
    avoid `NaT` in datetime columns sent to web charts — use float
    millisecond columns with NaN instead.
-4. **CSV timestamps.** `load_candles_from_csv` accepts epoch seconds,
+3. **CSV timestamps.** `load_candles_from_csv` accepts epoch seconds,
    milliseconds (auto-detected) and ISO-8601 (`2026-03-01 00:00:00+00:00`).
    Pandas writes datetimes as strings — the Rust parser handles them.
-5. **Volume-profile windowing.** Forward-looking aggregates must clamp to
-   available bars (`bar covers target` check), otherwise touches near the end
+4. **Volume-profile windowing.** Forward-looking aggregates must clamp to
+   available bars (`bar covers target` check), otherwise values near the end
    of data silently reuse the last bar and bias the curve.
-6. **Determinism.** Same data + config + seed ⇒ byte-identical outputs
+5. **Determinism.** Same data + config + seed ⇒ byte-identical outputs
    (verified by checksum across runs). Synthetic generators are seeded;
    download caches make reruns offline-instant.
-7. **Level detection choices.** Swing pivots need a prominence threshold
-   (`min_swing`) and dedup tolerance, otherwise 1-second noise yields
-   thousands of micro-levels; the touch detector must check the first bar of
-   every batch against the *previous* batch's last close, or entries on batch
-   boundaries (and everything at speed=1) are silently missed.
-8. **Environment.** `uv.lock` is committed for reproducibility. Never commit
+6. **Environment.** `uv.lock` is committed for reproducibility. Never commit
    `.venv/`, `target/`, `data/`, or generated `*_out/` dirs (gitignored).
    After any Rust change: `uv pip install --python .venv/bin/python -e .`.
    Never run two dashboard servers on one port; kill by exact PID (pattern
@@ -340,8 +231,6 @@ notional    = size × entry  (leverage-equiv = notional / equity)
 | Symptom | Likely cause |
 |---|---|
 | `Address already in use` | stale server alive — find exact PID via `/proc` scan, `kill` it (avoid `pkill -f`, it matched our own shell once) |
-| Dash `500` on button callbacks | missing `allow_duplicate=True` on one of the writers, or touching `Exchange` from a worker thread (check single-threaded server) |
-| Touches look random / missing | batch-boundary bars skipped (pass global prev close), or duplicate levels (dedup tolerance), or breakout threshold too small vs volatility |
 | `fetch_ohlcv_live` returns nothing after `reset` | clock starts paused — call `resume()` before `step()` |
 | Binance download slow/fails | normal for large ranges (paginated, ~0.15 s politeness delay); falls back to synthetic with a status note |
 | `import simccxt` resolves to a stray `simccxt.so` | delete repo-root copies; the venv-installed package is canonical |
