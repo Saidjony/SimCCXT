@@ -5,18 +5,14 @@ members = [
     "src/clock",
     "src/market",
     "src/storage",
-    "src/replay-engine",
     "src/event-bus",
     "src/exchange",
     "src/broker",
     "src/order-engine",
     "src/portfolio",
     "src/wallet",
-    "src/indicators",
-    "src/feature-engine",
-    "src/data-provider",
-    "src/downloader",
-    "src/python-api"
+    "src/python-api",
+    "src/server"
 ]
 
 [workspace.package]

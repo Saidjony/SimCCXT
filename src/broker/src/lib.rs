@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use simccxt_core::{OrderStatus, OrderType, Side, Symbol, TimeInForce};
-use simccxt_order_engine::{FeeSchedule, Order, OrderEngine, OrderRequest};
+use simccxt_order_engine::{ExecutionReport, FeeSchedule, Fill, Order, OrderEngine, OrderRequest};
 use simccxt_portfolio::{MarginMode, Portfolio};
 use simccxt_wallet::Wallet;
 
@@ -21,6 +21,34 @@ pub enum MarketKind {
     Spot,
     /// Linear futures: fills update portfolio positions; margin locked in quote.
     Linear,
+}
+
+/// A recorded fill (execution) against the account's own orders.
+///
+/// The broker is the source of truth for what the account actually traded. Every
+/// fill produced by market/limit execution (manual, rest-swept, or a triggered
+/// conditional order) is appended here so the UI can show a trades table without
+/// computing anything itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillLog {
+    /// Symbol traded.
+    pub symbol: Symbol,
+    /// The order id this fill belongs to.
+    pub order_id: String,
+    /// Buy or sell.
+    pub side: Side,
+    /// Order type that produced this fill (market, limit, stop, ...).
+    pub order_type: OrderType,
+    /// Execution price.
+    pub price: f64,
+    /// Executed amount in base asset.
+    pub amount: f64,
+    /// Fee paid for this fill.
+    pub fee: f64,
+    /// Whether this fill took the maker side (taker = false).
+    pub maker: bool,
+    /// Execution timestamp.
+    pub timestamp: DateTime<Utc>,
 }
 
 /// Errors produced by the broker.
@@ -148,6 +176,8 @@ pub struct Broker {
     fees: FeeSchedule,
     conditional: Vec<ConditionalOrder>,
     next_conditional_id: u64,
+    /// Chronological log of every fill against the account's own orders.
+    fill_log: Vec<FillLog>,
 }
 
 impl Default for Broker {
@@ -160,6 +190,7 @@ impl Default for Broker {
             fees: FeeSchedule::default(),
             conditional: Vec::new(),
             next_conditional_id: 1,
+            fill_log: Vec::new(),
         }
     }
 }
@@ -242,6 +273,15 @@ impl Broker {
         self.market_kinds.get(symbol).copied()
     }
 
+    /// Seed the order book with a synthetic single bid/ask level at `price`
+    /// (midpoint). Used during bar replay when there is no external book, so
+    /// market and triggered orders always have a reference price.
+    pub fn update_midpoint(&mut self, symbol: &str, price: f64, depth: f64) {
+        if let Some(engine) = self.engine_mut(symbol) {
+            engine.set_midpoint(price, depth);
+        }
+    }
+
     /// Submit an order for execution.
     pub fn submit_order(
         &mut self,
@@ -313,7 +353,9 @@ impl Broker {
 
         // Determine the reference price (limit price, or book price for market).
         let ref_price = match request.order_type {
-            OrderType::Limit => request.price.unwrap(),
+            OrderType::Limit => request.price.ok_or_else(|| {
+                BrokerError::InvalidOrderType("limit order requires a price".into())
+            })?,
             OrderType::Market => self.market_reference_price(&symbol, request.side).unwrap_or(0.0),
             _ => request.price.unwrap_or(0.0),
         };
@@ -355,7 +397,29 @@ impl Broker {
             }
         }
 
+        self.log_fills(&report, timestamp);
+
         Ok(report.order)
+    }
+
+    /// Append execution fills to the account fill log (source of truth for the
+    /// UI trades table).
+    fn log_fills(&mut self, report: &ExecutionReport, _timestamp: DateTime<Utc>) {
+        let symbol = report.order.symbol.clone();
+        let order_id = report.order.id.clone();
+        for f in &report.fills {
+            self.fill_log.push(FillLog {
+                symbol: symbol.clone(),
+                order_id: order_id.clone(),
+                side: report.order.side,
+                order_type: report.order.order_type,
+                price: f.price,
+                amount: f.amount,
+                fee: f.fee,
+                maker: f.maker,
+                timestamp: f.timestamp,
+            });
+        }
     }
 
     /// Reference price for a market order (best bid/ask from the book).
@@ -365,6 +429,61 @@ impl Broker {
             Side::Buy => engine.book().best_ask().map(|a| a.price),
             Side::Sell => engine.book().best_bid().map(|b| b.price),
         }
+    }
+
+    /// Execute a market order at an explicit reference price (used when there
+    /// is no booked liquidity, e.g. fills at the latest simulation bar close).
+    ///
+    /// The order is fully filled at `price` taker-side, applying fees and
+    /// settling into the wallet / portfolio exactly like a booked fill.
+    pub fn execute_market_at(
+        &mut self,
+        symbol: &Symbol,
+        side: Side,
+        amount: f64,
+        price: f64,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Order, BrokerError> {
+        if amount <= 0.0 {
+            return Err(BrokerError::InvalidAmount(amount));
+        }
+        if !self.engines.contains_key(&symbol.symbol) {
+            return Err(BrokerError::UnknownSymbol(symbol.symbol.clone()));
+        }
+        let kind = self.market_kinds.get(&symbol.symbol).copied().unwrap();
+
+        self.validate_market_funds(symbol, kind, side, price, amount)?;
+
+        let engine_request = OrderRequest {
+            side,
+            order_type: OrderType::Market,
+            price: Some(price),
+            amount,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            post_only: false,
+        };
+        let report = {
+            let engine = self.engine_mut(&symbol.symbol).unwrap();
+            engine.record_fill(engine_request, price, timestamp)
+        };
+
+        let filled_amount = report.order.filled;
+        let filled_notional = filled_amount * price;
+        let fee_total = report.fills.iter().map(|f| f.fee).sum();
+
+        match kind {
+            MarketKind::Spot => {
+                self.settle_spot(symbol, side, None, filled_amount, filled_notional, fee_total);
+            }
+            MarketKind::Linear => {
+                self.settle_linear(symbol, side, None, filled_amount, filled_notional, fee_total);
+            }
+        }
+
+        self.log_fills(&report, timestamp);
+
+        Ok(report.order)
     }
 
     /// Lock funds for a limit order, returning what was locked.
@@ -524,11 +643,150 @@ impl Broker {
         }
     }
 
+    /// Sweep resting limit orders crossed by a fresh `price` (call on every
+    /// price update, e.g. each replayed bar).
+    ///
+    /// A resting buy fills when the market trades at or below its limit; a
+    /// resting sell when at or above. Fills match against the current book as
+    /// maker and settle against the funds locked at placement (no double
+    /// locking). Returns each order that gained fills with the amount filled
+    /// by THIS sweep (for cost-basis tracking).
+    pub fn sweep_resting(
+        &mut self,
+        symbol: &Symbol,
+        price: f64,
+        timestamp: DateTime<Utc>,
+    ) -> Vec<(Order, f64)> {
+        let kind = self.market_kinds.get(&symbol.symbol).copied().unwrap_or(MarketKind::Spot);
+        // Collect crossed resting limits first (borrow-safe snapshot of ids).
+        let ids: Vec<(String, Side, f64, f64)> = self
+            .engines
+            .get(&symbol.symbol)
+            .map(|e| {
+                e.open_orders()
+                    .filter(|o| o.order_type == OrderType::Limit && o.is_open())
+                    .filter(|o| {
+                        o.price.map(|limit| match o.side {
+                            Side::Buy => price <= limit,
+                            Side::Sell => price >= limit,
+                        })
+                        .unwrap_or(false)
+                    })
+                    .map(|o| (o.id.clone(), o.side, o.price.unwrap_or(0.0), o.remaining))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut executed = Vec::new();
+        for (id, side, limit, remaining) in ids {
+            if remaining <= 0.0 {
+                continue;
+            }
+            // Rebuild the lock placed at order creation (same rules).
+            // Computed before any mutable borrow.
+            let lock = self.sweep_lock(symbol, kind, side, limit);
+            let (mut order, fills, leftover, fee_total, filled_amount, filled_notional) = {
+                let engine = match self.engine_mut(&symbol.symbol) {
+                    Some(e) => e,
+                    None => break,
+                };
+                let Some(order) = engine.take_open_order(&id) else {
+                    continue;
+                };
+                let (fills, leftover) = engine.consume_limit(side, limit, remaining);
+                if fills.is_empty() {
+                    engine.put_open_order(order);
+                    continue;
+                }
+                let mut filled_amount = 0.0;
+                let mut filled_notional = 0.0;
+                let mut fee_total = 0.0;
+                let mut recs = Vec::new();
+                for (fill_price, amount) in fills {
+                    let fee = engine.fee_for(amount, fill_price, true);
+                    filled_amount += amount;
+                    filled_notional += amount * fill_price;
+                    fee_total += fee;
+                    recs.push(Fill {
+                        order_id: order.id.clone(),
+                        price: fill_price,
+                        amount,
+                        fee,
+                        maker: true,
+                        timestamp,
+                    });
+                }
+                (order, recs, leftover, fee_total, filled_amount, filled_notional)
+            };
+            match kind {
+                MarketKind::Spot => {
+                    self.settle_spot(symbol, side, lock, filled_amount, filled_notional, fee_total);
+                }
+                MarketKind::Linear => {
+                    self.settle_linear(symbol, side, lock, filled_amount, filled_notional, fee_total);
+                }
+            }
+            for f in &fills {
+                self.fill_log.push(FillLog {
+                    symbol: symbol.clone(),
+                    order_id: order.id.clone(),
+                    side,
+                    order_type: order.order_type,
+                    price: f.price,
+                    amount: f.amount,
+                    fee: f.fee,
+                    maker: true,
+                    timestamp: f.timestamp,
+                });
+            }
+            // Weighted average across earlier partial fills.
+            let total_filled = order.filled + filled_amount;
+            order.average_price = if total_filled > 0.0 {
+                (order.average_price * order.filled + filled_notional) / total_filled
+            } else {
+                0.0
+            };
+            order.filled = total_filled;
+            order.remaining = leftover;
+            order.fee += fee_total;
+            if leftover <= 0.0 {
+                order.status = OrderStatus::Filled;
+            } else {
+                order.status = OrderStatus::PartialFilled;
+                if let Some(engine) = self.engine_mut(&symbol.symbol) {
+                    engine.put_open_order(order.clone());
+                }
+            }
+            executed.push((order, filled_amount));
+        }
+        executed
+    }
+
+    /// Rebuild the fund lock of a resting limit order for sweep settlement.
+    /// Mirrors `lock_funds` exactly (same asset, same per-unit release).
+    fn sweep_lock(
+        &self,
+        symbol: &Symbol,
+        kind: MarketKind,
+        side: Side,
+        limit: f64,
+    ) -> Option<LockInfo> {
+        match kind {
+            MarketKind::Spot => match side {
+                Side::Buy => Some(LockInfo { asset: symbol.quote.clone(), unit_release: limit }),
+                Side::Sell => Some(LockInfo { asset: symbol.base.clone(), unit_release: 1.0 }),
+            },
+            MarketKind::Linear => {
+                let leverage = self.portfolio.leverage(&symbol.symbol);
+                Some(LockInfo { asset: symbol.quote.clone(), unit_release: limit / leverage })
+            }
+        }
+    }
+
     /// Notify the broker of a price update, triggering any ready conditional orders.
     ///
     /// Returns the orders that were triggered and executed.
-    pub fn on_price_update(&mut self, symbol: &Symbol, price: f64, timestamp: DateTime<Utc>) -> Vec<Order> {
-        let mut executed = Vec::new();
+    pub fn on_price_update(&mut self, symbol: &Symbol, price: f64, timestamp: DateTime<Utc>) -> Vec<Order> {        let mut executed = Vec::new();
         let mut to_execute = Vec::new();
 
         // Update mark price for the portfolio.
@@ -572,6 +830,11 @@ impl Broker {
         executed
     }
 
+    /// Registered market symbols (have a matching engine).
+    pub fn symbols(&self) -> Vec<String> {
+        self.engines.keys().cloned().collect()
+    }
+
     /// Open orders for a symbol.
     pub fn open_orders(&self, symbol: &str) -> Vec<Order> {
         self.engines
@@ -579,13 +842,47 @@ impl Broker {
             .map(|e| e.open_orders().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// The account's fill log (chronological). Optionally filtered to one symbol.
+    pub fn fills(&self, symbol: Option<&str>) -> Vec<FillLog> {
+        self.fill_log
+            .iter()
+            .filter(|f| symbol.map(|s| f.symbol.symbol.as_str() == s).unwrap_or(true))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Whether a conditional order is triggered at the given price.
+///
+/// Direction depends on both the side and the order type:
+/// - Stop-type orders (stop / stop-limit / trailing-stop) trigger toward the
+///   trigger price from the prevailing price:
+///     * a BUY stop triggers when price rises to the stop  (`price >= trigger`),
+///     * a SELL stop triggers when price falls to the stop (`price <= trigger`).
+/// - Take-profit-type orders move the opposite way:
+///     * a BUY take-profit triggers when price falls   (`price <= trigger`),
+///     * a SELL take-profit triggers when price rises   (`price >= trigger`).
 fn is_triggered(c: &ConditionalOrder, price: f64) -> bool {
+    let is_take_profit = matches!(
+        c.order_type,
+        OrderType::TakeProfit | OrderType::TakeProfitLimit
+    );
     match c.side {
-        Side::Buy => price >= c.trigger_price,
-        Side::Sell => price <= c.trigger_price,
+        Side::Buy => {
+            if is_take_profit {
+                price <= c.trigger_price
+            } else {
+                price >= c.trigger_price
+            }
+        }
+        Side::Sell => {
+            if is_take_profit {
+                price >= c.trigger_price
+            } else {
+                price <= c.trigger_price
+            }
+        }
     }
 }
 
@@ -691,5 +988,110 @@ mod tests {
         let exec = b.on_price_update(&btc(), 111.0, ts());
         assert_eq!(exec.len(), 1);
         assert_eq!(exec[0].status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn test_conditional_take_profit_sell_triggers_on_rise() {
+        let mut b = spot_broker();
+        // Mirror replay: the bar close seeds a synthetic bid+ask midpoint.
+        b.update_midpoint("BTC/USDT", 100.0, 1e12);
+        let mut req = BrokerOrderRequest::market(btc(), Side::Sell, 0.5);
+        req.order_type = OrderType::TakeProfit;
+        req.stop_price = Some(110.0);
+        let order = b.submit_order(req, ts()).unwrap();
+        assert_eq!(order.status, OrderStatus::New);
+        // A sell take-profit triggers when price rises to the TP level.
+        assert!(b.on_price_update(&btc(), 109.0, ts()).is_empty());
+        let exec = b.on_price_update(&btc(), 111.0, ts());
+        assert_eq!(exec.len(), 1);
+        assert_eq!(exec[0].status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn test_fill_log_records_executions() {        let mut b = spot_broker();
+        // Market buy against the book -> a taker fill is logged.
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 1.0);
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Buy, 1.0), ts()).unwrap();
+        // Market sell at an explicit reference price (no booked liquidity path).
+        b.update_midpoint("BTC/USDT", 101.0, 1e12);
+        b.submit_order(
+            BrokerOrderRequest {
+                symbol: btc(),
+                side: Side::Sell,
+                order_type: OrderType::Market,
+                amount: 0.5,
+                price: None,
+                stop_price: None,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                post_only: false,
+            },
+            ts(),
+        )
+        .unwrap();
+        let fills = b.fills(None);
+        // The sell went through the book's synthetic midpoint, so it consumed
+        // book bid liquidity (a real fill). At least the first buy is recorded.
+        assert!(!fills.is_empty(), "expected at least one recorded fill");
+        assert_eq!(fills[0].side, Side::Buy);
+        assert_eq!(fills[0].price, 100.0);
+        // Filter by symbol.
+        let btc_fills = b.fills(Some("BTC/USDT"));
+        assert_eq!(btc_fills.len(), fills.len());
+    }
+
+    #[test]
+    fn test_sweep_fills_crossed_resting_limit() {
+        let mut b = spot_broker();
+        // Resting buy limit at 90 (no cross against empty book).
+        let order = b
+            .submit_order(BrokerOrderRequest::limit(btc(), Side::Buy, 90.0, 1.0), ts())
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::New);
+        // Price still above: no fill.
+        assert!(b.sweep_resting(&btc(), 100.0, ts()).is_empty());
+        // Price drops through the limit: fills as maker at the market price.
+        b.update_midpoint("BTC/USDT", 89.0, 1e12);
+        let swept = b.sweep_resting(&btc(), 89.0, ts());
+        assert_eq!(swept.len(), 1);
+        let (filled_order, new_filled) = &swept[0];
+        assert_eq!(filled_order.status, OrderStatus::Filled);
+        assert_eq!(*new_filled, 1.0);
+        assert_eq!(filled_order.average_price, 89.0);
+        assert!(b.open_orders("BTC/USDT").is_empty());
+        // Fill is logged and the base asset landed in the wallet.
+        assert_eq!(b.fills(None).len(), 1);
+        assert_eq!(b.wallet().balance("BTC").unwrap().total, 11.0);
+    }
+
+    #[test]
+    fn test_sweep_partial_fill_keeps_remainder_open() {
+        let mut b = spot_broker();
+        b.submit_order(BrokerOrderRequest::limit(btc(), Side::Buy, 90.0, 2.0), ts()).unwrap();
+        // Thin book: only 0.5 available at the touch.
+        b.engine_mut("BTC/USDT").unwrap().set_midpoint(89.0, 0.5);
+        let swept = b.sweep_resting(&btc(), 89.0, ts());
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].1, 0.5);
+        assert_eq!(swept[0].0.status, OrderStatus::PartialFilled);
+        assert_eq!(b.open_orders("BTC/USDT").len(), 1);
+        // Locked funds still cover the remainder: cancel releases them.
+        let id = b.open_orders("BTC/USDT")[0].id.clone();
+        b.cancel_order("BTC/USDT", &id).unwrap();
+        assert_eq!(b.wallet().balance("USDT").unwrap().locked, 0.0);
+    }
+
+    #[test]
+    fn test_sweep_resting_sell_fills_on_rise() {
+        let mut b = spot_broker();
+        let order = b
+            .submit_order(BrokerOrderRequest::limit(btc(), Side::Sell, 110.0, 1.0), ts())
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::New);
+        b.update_midpoint("BTC/USDT", 111.0, 1e12);
+        let swept = b.sweep_resting(&btc(), 111.0, ts());
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].0.status, OrderStatus::Filled);
+        assert_eq!(b.wallet().balance("BTC").unwrap().total, 9.0);
     }
 }

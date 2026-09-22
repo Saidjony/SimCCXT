@@ -197,6 +197,54 @@ impl OrderEngine {
         self.book.update_ask(price, amount);
     }
 
+    /// Replace the book liquidity with a single bid/ask level at `price`
+    /// (a synthetic midpoint). Used when replaying bars with no external book,
+    /// so market orders and triggered stop/TP orders have a reference price.
+    pub fn set_midpoint(&mut self, price: f64, depth: f64) {
+        self.book.set_midpoint(price, depth);
+    }
+
+    /// Record a synthetic fill at an explicit price (no liquidity consumed from
+    /// the book). Used for immediate market fills at the reference price, e.g.
+    /// when booked liquidity is absent. Returns an execution report with a fully
+    /// filled order and a single taker-side fill.
+    pub fn record_fill(
+        &mut self,
+        request: OrderRequest,
+        price: f64,
+        timestamp: DateTime<Utc>,
+    ) -> ExecutionReport {
+        let id = self.next_order_id.to_string();
+        self.next_order_id += 1;
+        let order = Order {
+            id: id.clone(),
+            symbol: self.symbol.clone(),
+            side: request.side,
+            order_type: request.order_type,
+            price: Some(price),
+            amount: request.amount,
+            remaining: 0.0,
+            filled: request.amount,
+            average_price: price,
+            status: OrderStatus::Filled,
+            time_in_force: request.time_in_force,
+            reduce_only: request.reduce_only,
+            post_only: request.post_only,
+            timestamp,
+            fee: 0.0,
+        };
+        let fee = self.fee_for(request.amount, price, false);
+        let fills = vec![Fill {
+            order_id: id,
+            price,
+            amount: request.amount,
+            fee,
+            maker: false,
+            timestamp,
+        }];
+        ExecutionReport { order, fills }
+    }
+
     /// Get an open order by id.
     pub fn get_order(&self, id: &str) -> Option<&Order> {
         self.open_orders.get(id)
@@ -335,13 +383,38 @@ impl OrderEngine {
         if leftover <= 0.0 {
             report.order.status = OrderStatus::Filled;
         } else {
-            report.order.status = OrderStatus::New;
-            self.rest(&report.order);
+            // Honour time-in-force on the unfilled remainder.
+            match report.order.time_in_force {
+                // IOC: the rest is cancelled (partial fills stand).
+                TimeInForce::IOC => {
+                    report.order.status = if report.order.filled > 0.0 {
+                        OrderStatus::PartialFilled
+                    } else {
+                        OrderStatus::Canceled
+                    };
+                }
+                // FOK: fill-or-kill — if not fully filled, cancel the WHOLE order
+                // (including any partial fills from this match).
+                TimeInForce::FOK => {
+                    report.fills.clear();
+                    report.order.filled = 0.0;
+                    report.order.remaining = report.order.amount;
+                    report.order.average_price = 0.0;
+                    report.order.fee = 0.0;
+                    report.order.status = OrderStatus::Canceled;
+                }
+                _ => {
+                    report.order.status = OrderStatus::New;
+                    self.rest(&report.order);
+                }
+            }
         }
     }
 
     /// Consume liquidity for a limit order, respecting the limit price.
-    fn consume_limit(
+    /// Public so the broker can sweep resting orders against fresh prices
+    /// without re-locking funds (placement already locked them).
+    pub fn consume_limit(
         &mut self,
         side: Side,
         limit_price: f64,
@@ -394,7 +467,6 @@ impl OrderEngine {
         }
         self.open_orders.insert(order.id.clone(), order.clone());
     }
-
     /// Cancel an open order, returning the cancelled order if found.
     pub fn cancel_order(&mut self, id: &str) -> Option<Order> {
         let order = self.open_orders.remove(id)?;
@@ -411,6 +483,17 @@ impl OrderEngine {
         Some(cancelled)
     }
 
+    /// Take an open order out of the set without touching book liquidity.
+    /// The caller owns the book (e.g. synthetic midpoint replay wipes it).
+    pub fn take_open_order(&mut self, id: &str) -> Option<Order> {
+        self.open_orders.remove(id)
+    }
+
+    /// (Re)insert an open order, e.g. a partially filled one after a sweep.
+    pub fn put_open_order(&mut self, order: Order) {
+        self.open_orders.insert(order.id.clone(), order);
+    }
+
     fn remove_bid(&mut self, price: f64, amount: f64) {
         if let Some(level) = self.book.bids.iter_mut().find(|l| l.price == price) {
             level.amount -= amount;
@@ -425,7 +508,8 @@ impl OrderEngine {
         self.book.asks.retain(|l| l.amount > 0.0);
     }
 
-    fn fee_for(&self, amount: f64, price: f64, maker: bool) -> f64 {
+    /// Fee for a fill (maker or taker rate). Public for broker-side sweeps.
+    pub fn fee_for(&self, amount: f64, price: f64, maker: bool) -> f64 {
         let rate = if maker { self.fees.maker } else { self.fees.taker };
         amount * price * rate
     }
@@ -451,6 +535,46 @@ mod tests {
         assert_eq!(report.fills.len(), 0);
         assert_eq!(engine.open_order_count(), 1);
         assert_eq!(engine.book().best_bid().unwrap().price, 100.0);
+    }
+
+    #[test]
+    fn test_ioc_limit_partial_then_rest_cancels() {
+        let mut engine = OrderEngine::new(btc(), ts());
+        // Ask liquidity at 100 (0.5) — an IOC buy of 1.0 fills 0.5 then cancels.
+        engine.update_ask(100.0, 0.5);
+        let mut req = OrderRequest::limit(Side::Buy, 100.0, 1.0);
+        req.time_in_force = TimeInForce::IOC;
+        let report = engine.place(req, ts());
+        assert_eq!(report.order.filled, 0.5);
+        assert_eq!(report.order.remaining, 0.5);
+        assert_eq!(report.order.status, OrderStatus::PartialFilled);
+        // The IOC remainder must NOT have been rested.
+        assert_eq!(engine.open_order_count(), 0);
+    }
+
+    #[test]
+    fn test_fok_limit_cancels_whole_when_unfillable() {
+        let mut engine = OrderEngine::new(btc(), ts());
+        // Only 0.3 of ask available — FOK buy of 1.0 must fully cancel (no fill).
+        engine.update_ask(100.0, 0.3);
+        let mut req = OrderRequest::limit(Side::Buy, 100.0, 1.0);
+        req.time_in_force = TimeInForce::FOK;
+        let report = engine.place(req, ts());
+        assert_eq!(report.order.status, OrderStatus::Canceled);
+        assert_eq!(report.order.filled, 0.0);
+        assert_eq!(report.fills.len(), 0);
+        assert_eq!(engine.open_order_count(), 0);
+    }
+
+    #[test]
+    fn test_fok_limit_fills_when_fully_matched() {
+        let mut engine = OrderEngine::new(btc(), ts());
+        engine.update_ask(100.0, 1.0);
+        let mut req = OrderRequest::limit(Side::Buy, 100.0, 1.0);
+        req.time_in_force = TimeInForce::FOK;
+        let report = engine.place(req, ts());
+        assert_eq!(report.order.status, OrderStatus::Filled);
+        assert_eq!(report.order.filled, 1.0);
     }
 
     #[test]

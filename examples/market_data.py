@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 market_data.py
-==============
+=============
 Disk cache + internet download for the simccxt exchange simulator (Binance public klines).
+
+Legacy research helper (optional Python bindings only). The main app
+(Rust server + TypeScript terminal) loads CSV caches directly and needs
+no Python at all.
 
 Logic ("if the coin is not in the laptop's memory, fetch it from internet"):
   cache:  data/ohlcv/{SYMBOL}_{tf}.csv   (timestamp ms, open, high, low, close, volume)
@@ -11,9 +15,11 @@ Logic ("if the coin is not in the laptop's memory, fetch it from internet"):
   3. download ONLY the missing segments from Binance REST klines (paginated);
   4. merge + dedupe + sort, write the cache back, return the window.
 
-No API key needed (public klines endpoint). stdlib only (urllib) + pandas.
+No API key needed (public klines endpoint). Stdlib only (urllib + csv).
+Rows are plain lists: [ts_ms, open, high, low, close, volume].
 """
 
+import csv
 import json
 import os
 import socket
@@ -21,9 +27,8 @@ import time
 import urllib.error
 import urllib.request
 
-import pandas as pd
-
 TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
+COLUMNS = ["ts_ms", "open", "high", "low", "close", "volume"]
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "..", "data", "ohlcv")
 
@@ -100,50 +105,63 @@ def fetch_klines(symbol: str, tf: str, start_ms: int, end_ms: int,
     return out
 
 
-def read_cache(symbol: str, tf: str, cache_dir: str = CACHE_DIR) -> pd.DataFrame:
+def read_cache(symbol: str, tf: str, cache_dir: str = CACHE_DIR) -> list:
+    """Cached bars as [[ts_ms, o, h, l, c, v], ...], sorted by ts (may be empty)."""
     path = cache_path(symbol, tf, cache_dir)
     if not os.path.exists(path):
-        return pd.DataFrame(columns=["ts_ms", "open", "high", "low", "close", "volume"])
-    df = pd.read_csv(path)
-    return df.sort_values("ts_ms").reset_index(drop=True)
+        return []
+    with open(path, newline="") as f:
+        rdr = csv.DictReader(f)
+        rows = []
+        for rec in rdr:
+            try:
+                rows.append([int(float(rec["ts_ms"])), float(rec["open"]),
+                             float(rec["high"]), float(rec["low"]),
+                             float(rec["close"]), float(rec["volume"])])
+            except (KeyError, TypeError, ValueError):
+                continue
+    rows.sort(key=lambda r: r[0])
+    return rows
 
 
-def write_cache(df: pd.DataFrame, symbol: str, tf: str,
+def write_cache(rows: list, symbol: str, tf: str,
                 cache_dir: str = CACHE_DIR) -> str:
     os.makedirs(cache_dir, exist_ok=True)
     path = cache_path(symbol, tf, cache_dir)
-    df.sort_values("ts_ms").to_csv(path, index=False)
+    rows = sorted(rows, key=lambda r: r[0])
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(COLUMNS)
+        w.writerows(rows)
     return path
 
 
 def read_window(symbol: str, tf: str, start_ms: int, end_ms: int,
-                cache_dir: str = CACHE_DIR) -> tuple[pd.DataFrame, bool]:
+                cache_dir: str = CACHE_DIR) -> tuple:
     """Cached bars for [start_ms, end_ms) without any network.
 
-    Returns (window_df, covered) where covered=True means the disk cache
-    already holds every bar of the requested range — the caller can build
-    a session instantly without downloading.
+    Returns (window_rows, covered) where covered=True means the disk cache
+    already holds every bar of the requested range.
     """
     cached = read_cache(symbol, tf, cache_dir)
-    window = cached[(cached["ts_ms"] >= start_ms)
-                    & (cached["ts_ms"] < end_ms)].reset_index(drop=True)
+    window = [r for r in cached if start_ms <= r[0] < end_ms]
     step = TF_MS[tf]
     want = set(range(int(start_ms), int(end_ms), step))
-    have = set(window["ts_ms"].astype("int64").tolist()) if len(window) else set()
+    have = {r[0] for r in window}
     return window, (bool(want) and want <= have)
 
 
 def load_or_download(symbol: str, tf: str, start_ms: int, end_ms: int,
                      cache_dir: str = CACHE_DIR,
-                     timeout: float = 30) -> tuple[pd.DataFrame, dict]:
+                     timeout: float = 30) -> tuple:
     """Return bars for [start_ms, end_ms); download only what's missing.
 
-    Returns (window_df, stats) with stats = {cached, downloaded, source}.
+    Returns (window_rows, stats) with stats = {cached, downloaded, source}.
     """
     step = TF_MS[tf]
-    want = np_arange(start_ms, end_ms, step)
+    want = list(range(int(start_ms), int(end_ms), int(step)))
     cached = read_cache(symbol, tf, cache_dir)
-    have = set(cached["ts_ms"].astype("int64").tolist()) if len(cached) else set()
+    have = {r[0] for r in cached}
     missing = [t for t in want if t not in have]
 
     downloaded: list = []
@@ -162,20 +180,15 @@ def load_or_download(symbol: str, tf: str, start_ms: int, end_ms: int,
             downloaded.extend(fetch_klines(symbol, tf, a, b, timeout=timeout))
 
     if downloaded:
-        new = pd.DataFrame(downloaded,
-                           columns=["ts_ms", "open", "high", "low", "close", "volume"])
-        full = pd.concat([cached, new], ignore_index=True)
-        full = full.drop_duplicates("ts_ms").sort_values("ts_ms").reset_index(drop=True)
+        merged = {r[0]: r for r in cached}
+        for r in downloaded:
+            merged[r[0]] = r
+        full = sorted(merged.values(), key=lambda r: r[0])
         write_cache(full, symbol, tf, cache_dir)
     else:
         full = cached
 
-    window = full[(full["ts_ms"] >= start_ms) & (full["ts_ms"] < end_ms)]
-    window = window.reset_index(drop=True)
+    window = [r for r in full if start_ms <= r[0] < end_ms]
     stats = {"cached": len(cached), "downloaded": len(downloaded),
              "source": "binance" if (len(cached) or len(downloaded)) else "empty"}
     return window, stats
-
-
-def np_arange(start: int, end: int, step: int) -> list:
-    return list(range(int(start), int(end), int(step)))

@@ -104,6 +104,19 @@ impl OrderBook {
         Self::update_level(&mut self.asks, price, amount, false);
     }
 
+    /// Clear the book and seed a single bid/ask level at `price` (a synthetic
+    /// midpoint). Used when replaying bars without external liquidity.
+    pub fn set_midpoint(&mut self, price: f64, depth: f64) {
+        self.bids.clear();
+        self.asks.clear();
+        if depth > 0.0 {
+            let ask_price = price;
+            let bid_price = price;
+            self.bids.push(PriceLevel { price: bid_price, amount: depth });
+            self.asks.push(PriceLevel { price: ask_price, amount: depth });
+        }
+    }
+
     fn update_level(levels: &mut Vec<PriceLevel>, price: f64, amount: f64, is_bid: bool) {
         if let Some(pos) = levels.iter().position(|l| l.price == price) {
             if amount == 0.0 {

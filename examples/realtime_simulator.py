@@ -24,45 +24,41 @@ Run:
     python3 examples/realtime_simulator.py
 """
 
+import csv
+import datetime as dt
 import os
 import sys
 import time
-
-import numpy as np
-import pandas as pd
 
 import simccxt
 
 
 def make_demo_csv(path: str, n: int = 20) -> str:
-    """Write a small deterministic BTC/USDT 1s CSV to disk."""
-    ts = pd.date_range("2026-03-01", periods=n, freq="s", tz="UTC")
-    close = 100_000.0 + np.arange(n) * 10.0
-    pd.DataFrame(
-        {
-            "timestamp": ts,
-            "open": close - 2,
-            "high": np.maximum(close - 2, close + 5),
-            "low": close - 5,
-            "close": close,
-            "volume": 1.0,
-        }
-    ).to_csv(path, index=False)
+    """Write a small deterministic BTC/USDT 1s CSV to disk (stdlib only)."""
+    start = dt.datetime(2026, 3, 1, tzinfo=dt.timezone.utc)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp", "open", "high", "low", "close", "volume"])
+        for i in range(n):
+            close = 100_000.0 + i * 10.0
+            ts = (start + dt.timedelta(seconds=i)).isoformat()
+            w.writerow([ts, close - 2, close + 5, close - 5, close, 1.0])
     return path
 
 
 def main() -> None:
     csv_path = make_demo_csv("/tmp/simccxt_demo_btc.csv")
-    df = pd.read_csv(csv_path)
 
     ex = simccxt.binance()
     ex.add_market("BTC/USDT", "spot")
 
     # 1) data comes FROM DISK, not the internet
     ex.load_candles_from_csv("BTC/USDT", "1s", csv_path)
-    ts_utc = pd.to_datetime(df["timestamp"], utc=True)
-    first_ms = int(ts_utc.iloc[0].timestamp() * 1000)
-    print(f"[sim] loaded {len(df)} bars from disk ({csv_path})")
+    with open(csv_path, newline="") as f:
+        n_bars = sum(1 for _ in f) - 1  # minus the header
+    start = dt.datetime(2026, 3, 1, tzinfo=dt.timezone.utc)
+    first_ms = int(start.timestamp() * 1000)
+    print(f"[sim] loaded {n_bars} bars from disk ({csv_path})")
 
     # 2) simulator clock
     ex.reset(first_ms)

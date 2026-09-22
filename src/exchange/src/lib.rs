@@ -71,6 +71,10 @@ pub struct Exchange {
     funding_rates: HashMap<String, FundingRate>,
     open_interest: HashMap<String, OpenInterest>,
     last_price: HashMap<String, f64>,
+    /// Closed candles already fed into the broker (symbol, timeframe) at some ts.
+    replayed: HashMap<(String, String), Option<DateTime<Utc>>>,
+    /// Spot cost basis per symbol: (qty held, average entry price).
+    spot_cost: HashMap<String, (f64, f64)>,
 }
 
 impl Default for Exchange {
@@ -92,6 +96,8 @@ impl Exchange {
             funding_rates: HashMap::new(),
             open_interest: HashMap::new(),
             last_price: HashMap::new(),
+            replayed: HashMap::new(),
+            spot_cost: HashMap::new(),
         }
     }
 
@@ -151,24 +157,50 @@ impl Exchange {
         self.clock.now_ms()
     }
 
-    /// Advance the clock by one step.
+    /// Advance the clock by one step and feed any bars that became due.
     pub fn step(&mut self) -> bool {
-        self.clock.step()
+        self.clock.step();
+        self.feed_due(self.clock.now());
+        true
     }
 
-    /// Advance the clock by `n` steps.
+    /// Advance the clock by `n` steps, feeding due bars along the way.
+    /// Returns the number of steps actually taken (0 if the clock is paused).
     pub fn step_n(&mut self, n: u64) -> u64 {
-        self.clock.step_n(n)
+        let mut taken = 0;
+        for _ in 0..n {
+            if !self.clock.step() {
+                break;
+            }
+            taken += 1;
+        }
+        self.feed_due(self.clock.now());
+        taken
     }
 
     /// Seek the clock to a timestamp.
     pub fn seek(&mut self, timestamp: DateTime<Utc>) -> bool {
-        self.clock.seek(timestamp)
+        self.clock.seek(timestamp);
+        self.feed_due(self.clock.now());
+        true
     }
 
-    /// Run the clock.
+    /// Run the clock to its end, feeding due bars along the way.
     pub fn run(&mut self) -> bool {
-        self.clock.run()
+        // Advance straight to the newest loaded candle so every bar gets fed
+        // into the broker (the exchange is the source of truth for the replay).
+        let end = self
+            .candles
+            .values()
+            .flatten()
+            .map(|c| c.timestamp)
+            .max();
+        if let Some(end) = end {
+            self.clock.seek(end);
+        }
+        self.clock.resume();
+        self.feed_due(self.clock.now());
+        true
     }
 
     /// Pause the clock.
@@ -181,9 +213,15 @@ impl Exchange {
         self.clock.resume()
     }
 
-    /// Reset the clock.
+    /// Whether the simulation clock is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.clock.is_paused()
+    }
+
+    /// Reset the clock (and the replay feed cursor).
     pub fn reset(&mut self, timestamp: DateTime<Utc>) {
-        self.clock.reset(timestamp)
+        self.clock.reset(timestamp);
+        self.replayed.clear();
     }
 
     /// The event bus (for subscribing to simulator events).
@@ -199,6 +237,266 @@ impl Exchange {
     /// The broker (mutable access).
     pub fn broker_mut(&mut self) -> &mut Broker {
         &mut self.broker
+    }
+
+    // ------------------------------------------------------------------
+    // Simulation engine: driving market events into the broker
+    // ------------------------------------------------------------------
+
+    /// The last known price for a symbol (from the most recent bar / live feed).
+    pub fn last_price_for(&self, symbol: &str) -> Option<f64> {
+        self.last_price.get(symbol).copied()
+    }
+
+    /// Feed one closed candle into the broker: mark-to-market positions,
+    /// trigger stop/take-profit orders, sweep crossed resting limit orders,
+    /// and record the reference price for immediate market-order fills.
+    pub fn apply_price(&mut self, symbol: &Symbol, price: f64, timestamp: DateTime<Utc>) {
+        self.last_price.insert(symbol.symbol.clone(), price);
+        // Seed synthetic one-level liquidity so market and triggered orders
+        // always have a reference price during a bar replay (no external book).
+        self.broker.update_midpoint(&symbol.symbol, price, 1e12);
+        // mark-to-market + stop / take-profit triggers + resting limit sweeps
+        let executed = self.broker.on_price_update(symbol, price, timestamp);
+        // Track spot cost basis for orders triggered inside the broker (e.g. a
+        // stop that filled on this bar), so spot positions show up in snapshots.
+        for order in executed {
+            if order.filled > 0.0 {
+                self.track_spot_cost(symbol, order.side, order.filled, order.average_price);
+            }
+        }
+        // Resting limit orders crossed by this bar fill as maker. Without this
+        // sweep they would hang open forever: nothing else re-matches them.
+        let swept = self.broker.sweep_resting(symbol, price, timestamp);
+        for (order, new_filled) in swept {
+            if new_filled > 0.0 {
+                let avg = if order.filled > 0.0 { order.average_price } else { price };
+                self.track_spot_cost(symbol, order.side, new_filled, avg);
+            }
+            self.publish_order_events(&order);
+        }
+    }
+
+    /// Whether a candle for (symbol, timeframe) has not yet been fed into the
+    /// broker. Used to avoid re-processing bars on repeated step() calls.
+    fn needs_feed(&self, symbol: &str, timeframe: &str, ts: DateTime<Utc>) -> bool {
+        let key = (symbol.to_string(), timeframe.to_string());
+        let last = self.replayed.get(&key);
+        last.map(|l| l.map(|replay_ts| replay_ts < ts).unwrap_or(true)).unwrap_or(true)
+    }
+
+    /// Process every candle at or before `now` that hasn't been fed yet, for
+    /// all symbols. Returns the number of bars processed.
+    pub fn feed_due(&mut self, now: DateTime<Utc>) -> usize {
+        let mut fed = 0;
+        for ((symbol, timeframe), candles) in self.candles.clone() {
+            for c in candles {
+                if c.timestamp > now {
+                    break;
+                }
+                let marked = self.needs_feed(&symbol, &timeframe, c.timestamp);
+                if !marked {
+                    continue;
+                }
+                let sym = Symbol::parse(&symbol).unwrap();
+                self.apply_price(&sym, c.close, c.timestamp);
+                self.replayed.insert((symbol.clone(), timeframe.clone()), Some(c.timestamp));
+                fed += 1;
+            }
+        }
+        fed
+    }
+
+    /// Whether the order book has meet-side liquidity for a market order.
+    fn market_has_liquidity(&self, symbol: &Symbol, side: Side) -> bool {
+        self.broker
+            .engine(&symbol.symbol)
+            .map(|e| match side {
+                Side::Buy => e.book().best_ask().is_some(),
+                Side::Sell => e.book().best_bid().is_some(),
+            })
+            .unwrap_or(false)
+    }
+
+    /// Update the spot cost basis used for UI spot positions (BUY/SELL of the
+    /// base asset against the quote). A reduction on SELL realizes PnL.
+    fn track_spot_cost(&mut self, symbol: &Symbol, side: Side, amount: f64, price: f64) {
+        if amount <= 0.0 {
+            return;
+        }
+        let (qty, avg) = self.spot_cost.get(&symbol.symbol).copied().unwrap_or((0.0, 0.0));
+        match side {
+            Side::Buy => {
+                let new_qty = qty + amount;
+                let new_avg = if new_qty > 0.0 { (qty * avg + amount * price) / new_qty } else { price };
+                self.spot_cost.insert(symbol.symbol.clone(), (new_qty, new_avg));
+            }
+            Side::Sell => {
+                let new_qty = (qty - amount).max(0.0);
+                self.spot_cost.insert(symbol.symbol.clone(), (new_qty, avg));
+            }
+        }
+    }
+
+    /// The spot cost basis (qty, average entry price) for a symbol.
+    pub fn spot_basis(&self, symbol: &str) -> (f64, f64) {
+        self.spot_cost.get(symbol).copied().unwrap_or((0.0, 0.0))
+    }
+
+    // ------------------------------------------------------------------
+    // UI snapshots (compact, one-call account / market state)
+    // ------------------------------------------------------------------
+
+    /// A compact account snapshot for the UI: balances, equity, PnL, positions,
+    /// open orders. Returns a serde_json value (no heavy candle transfers).
+    pub fn account_snapshot(&self) -> Value {
+        // Balances.
+        let mut balances = json!({});
+        for (asset, b) in self.broker.wallet().balances() {
+            balances[asset] = json!({ "free": b.available, "locked": b.locked, "total": b.total });
+        }
+
+        // Positions: linear (from portfolio) + spot cost basis.
+        let mut positions = Vec::new();
+        for (sym, pos) in self.broker.portfolio().positions().iter() {
+            let mark = pos.mark_price;
+            let pnl = if pos.side == simccxt_core::PositionSide::Long {
+                (mark - pos.entry_price) * pos.qty
+            } else {
+                (pos.entry_price - mark) * pos.qty
+            };
+            positions.push(json!({
+                "symbol": sym,
+                "side": if pos.side == simccxt_core::PositionSide::Long { "long" } else { "short" },
+                "qty": pos.qty,
+                "entryPrice": pos.entry_price,
+                "markPrice": mark,
+                "unrealizedPnl": pnl + pos.realized_pnl,
+                "realizedPnl": pos.realized_pnl,
+            }));
+        }
+        for (sym, (qty, avg)) in self.spot_cost.clone() {
+            if qty <= 0.0 {
+                continue;
+            }
+            let mark = self.last_price_for(&sym).unwrap_or(avg);
+            let unrealized = (mark - avg) * qty;
+            positions.push(json!({
+                "symbol": sym,
+                "side": "long",
+                "qty": qty,
+                "entryPrice": avg,
+                "markPrice": mark,
+                "unrealizedPnl": unrealized,
+                "realizedPnl": 0.0,
+            }));
+        }
+
+        // Open orders (across all symbols).
+        let mut orders = Vec::new();
+        for order in self.all_open_orders() {
+            orders.push(order_json(&order));
+        }
+
+        let total_pnl = self.broker.portfolio().unrealized_pnl()
+            + self.broker.portfolio().realized_pnl()
+            + self.spot_unrealized();
+
+        json!({
+            "time": self.now_ms(),
+            "equity": self.equity(),
+            "balances": balances,
+            "positions": positions,
+            "open": orders,
+            "pnl": json!({
+                "realized": self.broker.portfolio().realized_pnl() + self.spot_realized(),
+                "unrealized": total_pnl,
+                "fees": self.broker.wallet().total_fees(),
+            }),
+        })
+    }
+
+    /// A compact market snapshot: last price / tick for a symbol.
+    pub fn market_snapshot(&self, symbol: &str) -> Value {
+        let last = self.last_price_for(symbol).unwrap_or(0.0);
+        let ticker = self.fetch_ticker(symbol);
+        json!({
+            "symbol": symbol,
+            "last": last,
+            "timestamp": self.now_ms(),
+            "ticker": ticker,
+        })
+    }
+
+    /// The account's executed fills as CCXT-style trade dicts (newest first).
+    /// This is the account's own execution history — not the incoming public
+    /// trade feed. Optional symbol filter and limit.
+    pub fn fetch_fills(&self, symbol: Option<&str>, limit: Option<usize>) -> Vec<Value> {
+        let mut fills = self.broker.fills(symbol);
+        fills.reverse(); // newest first, like a live exchange feed
+        if let Some(limit) = limit {
+            fills.truncate(limit);
+        }
+        fills
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                json!({
+                    "id": format!("{}_{}", f.order_id, i),
+                    "symbol": f.symbol.symbol,
+                    "side": if f.side == Side::Buy { "buy" } else { "sell" },
+                    "type": order_type_str(f.order_type),
+                    "price": f.price,
+                    "amount": f.amount,
+                    "cost": f.price * f.amount,
+                    "fee": f.fee,
+                    "maker": f.maker,
+                    "orderId": f.order_id,
+                    "timestamp": f.timestamp.timestamp_millis(),
+                    "datetime": f.timestamp.to_rfc3339(),
+                })
+            })
+            .collect()
+    }
+
+    /// Total account equity: quote free + marked-to-market positions + spot value.
+    pub fn equity(&self) -> f64 {
+        let mut eq = 0.0;
+        // Free quote (USDT) plus the mark value of held base assets.
+        for (asset, b) in self.broker.wallet().balances() {
+            if asset.eq("USDT") || asset.eq("USDC") || asset.eq("Quote") {
+                eq += b.total;
+            }
+        }
+        // Mark value of spot base holdings at last price, in quote.
+        for (sym, (qty, _)) in self.spot_cost.clone() {
+            let mark = self.last_price_for(&sym).unwrap_or(0.0);
+            eq += qty * mark;
+        }
+        // Unrealized PnL of linear positions.
+        eq += self.broker.portfolio().unrealized_pnl();
+        eq
+    }
+
+    /// Sum of unrealized spot PnL (from cost basis vs current mark).
+    fn spot_unrealized(&self) -> f64 {
+        let mut total = 0.0;
+        for (sym, (qty, avg)) in self.spot_cost.clone() {
+            if qty <= 0.0 {
+                continue;
+            }
+            let mark = self.last_price_for(&sym).unwrap_or(avg);
+            total += (mark - avg) * qty;
+        }
+        total
+    }
+
+    /// Sum of realized spot PnL (tracked at SELL).
+    fn spot_realized(&self) -> f64 {
+        // Realized is folded into the wallet's quote balance on spot sells;
+        // the wallet already reflects it. Keep a stable 0 here to avoid double
+        // counting — spot PnL is realised directly into the quote balance.
+        0.0
     }
 
     // ------------------------------------------------------------------
@@ -463,16 +761,9 @@ impl Exchange {
     }
 
     fn all_open_orders(&self) -> Vec<simccxt_order_engine::Order> {
-        // Iterate all registered symbols' engines.
-        let symbols: Vec<String> = self
-            .broker
-            .portfolio()
-            .positions()
-            .keys()
-            .cloned()
-            .collect();
+        // Iterate all registered markets (positions may not exist yet for spot).
         let mut out = Vec::new();
-        for symbol in symbols {
+        for symbol in self.broker.symbols() {
             out.extend(self.broker.open_orders(&symbol));
         }
         out
@@ -516,6 +807,35 @@ impl Exchange {
         })
     }
 
+    /// Place the order through the broker, falling back to an immediate
+    /// marked-to-market fill when a market order has no booked liquidity.
+    fn place_order(
+        &mut self,
+        request: BrokerOrderRequest,
+        symbol: &Symbol,
+        side: Side,
+        order_type: OrderType,
+        amount: f64,
+    ) -> Result<simccxt_order_engine::Order, BrokerError> {
+        if order_type == OrderType::Market && !self.market_has_liquidity(symbol, side) {
+            let sym_key = &symbol.symbol;
+            let maybe_price = self.last_price_for(sym_key);
+            if let Some(price) = maybe_price {
+                if price <= 0.0 {
+                    return Err(BrokerError::InvalidOrderType(format!(
+                        "no reference price for {sym_key} yet (replay not started)"
+                    )));
+                }
+                let ts = self.clock.now();
+                return self.broker.execute_market_at(symbol, side, amount, price, ts);
+            }
+            return Err(BrokerError::InvalidOrderType(format!(
+                "no reference price for {sym_key} yet (advance the clock / replay first)"
+            )));
+        }
+        self.broker.submit_order(request, self.clock.now())
+    }
+
     /// `create_order` — place an order and return a CCXT-style order dict.
     pub fn create_order(
         &mut self,
@@ -544,7 +864,15 @@ impl Exchange {
             post_only: params.post_only,
         };
 
-        let order = self.broker.submit_order(request, self.clock.now())?;
+        let order = self.place_order(request, &symbol, side, order_type, amount)?;
+
+        // Track spot cost basis for every immediate fill (market AND
+        // marketable limit orders) so the UI can show a spot position + PnL.
+        // Later sweep fills are tracked separately with their own delta.
+        if order.filled > 0.0 {
+            let avg = if order.average_price > 0.0 { order.average_price } else { price.unwrap_or(0.0) };
+            self.track_spot_cost(&symbol, side, order.filled, avg);
+        }
 
         // Emit events for fills.
         self.publish_order_events(&order);
@@ -844,6 +1172,39 @@ mod tests {
     }
 
     #[test]
+    fn test_run_feeds_all_candles_and_triggers_stop() {
+        let mut ex = Exchange::default();
+        ex.add_market(&Symbol::parse("BTC/USDT").unwrap(), MarketKind::Spot);
+        ex.deposit("USDT", 100_000.0);
+        // Price rises strongly: 100 -> ~110.
+        ex.load_candles(
+            "BTC/USDT",
+            "1s",
+            vec![candle(1_000, 100.0), candle(2_000, 102.0), candle(3_000, 105.0), candle(4_000, 110.0)],
+        );
+        ex.set_step_ms(1000);
+        ex.reset(ts(1_000));
+        ex.resume();
+        ex.step(); // feed bar @1000
+        // Market buy at ~100, then a take-profit SELL at 108 (price reaches 110).
+        ex.create_order("BTC/USDT", "market", "buy", 1.0, None, CreateOrderParams::new()).unwrap();
+        ex.create_order(
+            "BTC/USDT",
+            "take_profit",
+            "sell",
+            1.0,
+            None,
+            CreateOrderParams::new().stop_price(108.0),
+        )
+        .unwrap();
+        ex.run();
+        assert!(ex.replay_done("BTC/USDT", "1s"));
+        // The buy + the triggered TP sell should both be in the fill log.
+        let fills = ex.fetch_fills(None, None);
+        assert_eq!(fills.len(), 2, "expected buy + triggered TP sell fills, got {fills:?}");
+    }
+
+    #[test]
     fn test_fetch_funding_rate_default_zero() {
         let ex = Exchange::default();
         let rate = ex.fetch_funding_rate("BTC/USDT");
@@ -862,5 +1223,59 @@ mod tests {
         let mut ex = exchange_with_data();
         let result = ex.create_order("BTC/USDT", "market", "up", 1.0, None, CreateOrderParams::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resting_limit_fills_when_replay_trades_through() {
+        let mut ex = Exchange::default();
+        ex.add_market(&Symbol::parse("BTC/USDT").unwrap(), MarketKind::Spot);
+        ex.deposit("USDT", 100_000.0);
+        // Falling market: 100 -> 95 -> 90.
+        ex.load_candles(
+            "BTC/USDT",
+            "1s",
+            vec![candle(1_000, 100.0), candle(2_000, 95.0), candle(3_000, 90.0)],
+        );
+        ex.set_step_ms(1000);
+        ex.reset(ts(0)); // before the first bar: each step feeds exactly one bar
+        ex.resume();
+        ex.step(); // feed 100
+        // Resting buy limit below the market: must NOT fill immediately.
+        let order = ex
+            .create_order("BTC/USDT", "limit", "buy", 1.0, Some(93.0), CreateOrderParams::new())
+            .unwrap();
+        assert_eq!(order["status"], "open");
+        assert!(ex.fetch_fills(None, None).is_empty());
+        ex.step(); // feed 95: still above the limit.
+        assert!(ex.fetch_fills(None, None).is_empty());
+        ex.step(); // feed 90: trades through 93 -> fills.
+        let fills = ex.fetch_fills(None, None);
+        assert_eq!(fills.len(), 1, "resting limit should fill, got {fills:?}");
+        assert_eq!(fills[0]["side"], "buy");
+        assert!(ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
+        // Spot position shows up (cost basis tracked for sweep fills too).
+        let shot = ex.account_snapshot();
+        let positions = shot["positions"].as_array().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0]["qty"], 1.0);
+    }
+
+    #[test]
+    fn test_marketable_limit_fills_immediately_with_position() {
+        let mut ex = Exchange::default();
+        ex.add_market(&Symbol::parse("BTC/USDT").unwrap(), MarketKind::Spot);
+        ex.deposit("USDT", 100_000.0);
+        ex.load_candles("BTC/USDT", "1s", vec![candle(1_000, 100.0)]);
+        ex.set_step_ms(1000);
+        ex.reset(ts(1_000));
+        ex.resume();
+        ex.step(); // feed 100, midpoint liquidity seeded
+        // Buy limit ABOVE the market: fills at once, position appears.
+        let order = ex
+            .create_order("BTC/USDT", "limit", "buy", 1.0, Some(101.0), CreateOrderParams::new())
+            .unwrap();
+        assert_eq!(order["status"], "closed");
+        let shot = ex.account_snapshot();
+        assert_eq!(shot["positions"].as_array().unwrap().len(), 1);
     }
 }

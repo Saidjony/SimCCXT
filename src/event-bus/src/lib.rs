@@ -29,13 +29,11 @@ pub enum EventType {
     FundingApplied,
     /// A position was liquidated
     Liquidation,
-    /// An indicator produced a new value
-    IndicatorUpdated,
 }
 
 impl EventType {
     /// All event types.
-    pub fn all() -> [EventType; 8] {
+    pub fn all() -> [EventType; 7] {
         [
             EventType::NewCandle,
             EventType::Trade,
@@ -44,7 +42,6 @@ impl EventType {
             EventType::BalanceUpdated,
             EventType::FundingApplied,
             EventType::Liquidation,
-            EventType::IndicatorUpdated,
         ]
     }
 }
@@ -73,8 +70,6 @@ pub enum Event {
     FundingApplied { symbol: Symbol, funding_rate: f64, timestamp: DateTime<Utc> },
     /// A position was liquidated.
     Liquidation { position: Position, timestamp: DateTime<Utc> },
-    /// An indicator produced a new value.
-    IndicatorUpdated { name: String, value: f64, timestamp: DateTime<Utc> },
 }
 
 impl Event {
@@ -88,7 +83,6 @@ impl Event {
             Event::BalanceUpdated { .. } => EventType::BalanceUpdated,
             Event::FundingApplied { .. } => EventType::FundingApplied,
             Event::Liquidation { .. } => EventType::Liquidation,
-            Event::IndicatorUpdated { .. } => EventType::IndicatorUpdated,
         }
     }
 }

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "simccxt"
 version = "0.1.0"
-description = "Virtual Cryptocurrency Exchange - CCXT-compatible exchange simulator"
+description = "Virtual Cryptocurrency Exchange - CCXT-compatible exchange simulator (optional Python bindings; the main app is Rust + TypeScript and needs no Python)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -14,10 +14,9 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
-dependencies = [
-    "numpy>=2.5.3",
-    "pandas>=3.0.5",
-]
+# No runtime dependencies: the engine is pure Rust, the terminal is
+# TypeScript. The remaining examples/ scripts use only the standard library.
+dependencies = []
 
 [tool.maturin]
 manifest-path = "src/python-api/Cargo.toml"

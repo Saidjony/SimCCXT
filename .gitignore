@@ -6,10 +6,13 @@
 /simccxt.so
 *.so
 __pycache__/
-# python env (rebuild via: uv venv && uv pip install -e . + analysis libs)
+# python env (optional research bindings only; the main app needs no Python)
 /.venv/
 # generated research/demo outputs
 /research/output/
 /examples/*_out/
 *.pyc
 .pytest_cache/
+# frontend deps and build output (bun install / npm install recreates these)
+/frontend/node_modules/
+/frontend/dist/

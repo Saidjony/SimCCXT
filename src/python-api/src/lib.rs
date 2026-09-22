@@ -8,6 +8,7 @@ use pyo3::types::{PyAny, PyDict, PyList, PyModule};
 use pyo3::IntoPyObjectExt;
 use serde_json::Value;
 
+use simccxt_core::TimeInForce;
 use simccxt_exchange::{CreateOrderParams, Exchange};
 
 /// Recursively convert a `serde_json::Value` into a Python object.
@@ -146,6 +147,11 @@ impl PyExchange {
         self.inner.pause();
     }
 
+    /// Whether the simulator clock is currently paused.
+    fn is_paused(&self) -> bool {
+        self.inner.is_paused()
+    }
+
     /// Set the simulator clock step size in milliseconds.
     fn set_step_ms(&mut self, ms: u64) {
         self.inner.set_step_ms(ms);
@@ -229,6 +235,18 @@ impl PyExchange {
         list.into_any().unbind()
     }
 
+    /// `fetch_fills(symbol, limit=None)` — the account's own executed trades
+    /// (fills produced by Rust execution), newest first.
+    #[pyo3(signature = (symbol=None, limit=None))]
+    fn fetch_fills(&self, py: Python<'_>, symbol: Option<&str>, limit: Option<usize>) -> Py<PyAny> {
+        let fills = self.inner.fetch_fills(symbol, limit);
+        let list = PyList::empty(py);
+        for f in fills {
+            let _ = list.append(value_to_py(py, &f).unwrap());
+        }
+        list.into_any().unbind()
+    }
+
     /// `fetch_balance()`.
     fn fetch_balance(&self, py: Python<'_>) -> Py<PyAny> {
         to_py_json(py, self.inner.fetch_balance())
@@ -293,6 +311,10 @@ impl PyExchange {
             if let Some(v) = params.get_item("postOnly")? {
                 p.post_only = v.extract()?;
             }
+            if let Some(v) = params.get_item("timeInForce")? {
+                let tif: String = v.extract()?;
+                p.time_in_force = parse_tif(&tif)?;
+            }
         }
         match self.inner.create_order(symbol, order_type, side, amount, price, p) {
             Ok(order) => Ok(to_py_json(py, order)),
@@ -303,6 +325,32 @@ impl PyExchange {
     /// `cancel_order(id, symbol)`.
     fn cancel_order(&mut self, py: Python<'_>, id: &str, symbol: &str) -> PyResult<Py<PyAny>> {
         match self.inner.cancel_order(id, symbol) {
+            Ok(order) => Ok(to_py_json(py, order)),
+            Err(e) => Err(PyValueError::new_err(e.to_string())),
+        }
+    }
+
+    /// `account_snapshot()` — one compact call with balances, equity, PnL,
+    /// positions and open orders. Lightweight for UI timer snapshots.
+    fn account_snapshot(&self, py: Python<'_>) -> Py<PyAny> {
+        to_py_json(py, self.inner.account_snapshot())
+    }
+
+    /// `market_snapshot(symbol)` — last price / ticker for one symbol.
+    fn market_snapshot(&self, py: Python<'_>, symbol: &str) -> Py<PyAny> {
+        to_py_json(py, self.inner.market_snapshot(symbol))
+    }
+
+    /// `close_position(symbol, qty=None)` — market-counter a position to flat.
+    /// For spot, sells `qty` of the base asset at the last price (defaults to
+    /// the full held quantity). For linear, flattens the portfolio position.
+    fn close_position(&mut self, py: Python<'_>, symbol: &str, qty: Option<f64>) -> PyResult<Py<PyAny>> {
+        let (held, _) = self.inner.spot_basis(symbol);
+        let q = qty.unwrap_or(held);
+        if q <= 0.0 {
+            return Err(PyValueError::new_err("nothing to close"));
+        }
+        match self.inner.create_order(symbol, "market", "sell", q, None, CreateOrderParams::new()) {
             Ok(order) => Ok(to_py_json(py, order)),
             Err(e) => Err(PyValueError::new_err(e.to_string())),
         }
@@ -325,6 +373,18 @@ fn bybit() -> PyExchange {
 #[pyfunction]
 fn okx() -> PyExchange {
     PyExchange::new()
+}
+
+/// Parse a time-in-force string ("GTC", "IOC", "FOK", "GTX") into the core enum.
+fn parse_tif(s: &str) -> PyResult<TimeInForce> {
+    match s.trim().to_uppercase().as_str() {
+        "GTC" => Ok(TimeInForce::GTC),
+        "IOC" => Ok(TimeInForce::IOC),
+        "FOK" => Ok(TimeInForce::FOK),
+        "GTX" => Ok(TimeInForce::GTX),
+        "DAY" => Ok(TimeInForce::DAY),
+        other => Err(PyValueError::new_err(format!("unknown timeInForce: {other}"))),
+    }
 }
 
 /// Parse a timestamp column value (epoch seconds/ms or ISO-8601) to epoch ms.
