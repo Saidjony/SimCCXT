@@ -13,6 +13,12 @@ function route(m: ServerMessage): void {
     case "welcome":
       store.setClientId(m.client_id);
       sendSim({ type: "subscribe", symbol: getState().symbol, timeframe: getState().timeframe });
+      // Restore identity: login (stored nick or empty = server random nick),
+      // then rejoin the challenge when the user opted in before.
+      sendSim({ type: "login", name: getState().nick });
+      if (getState().inChallenge) {
+        sendSim({ type: "challenge", join: true, risk_usdt: getState().fixedRiskUsdt });
+      }
       break;
     case "snapshot":
       store.applySnapshot(m.symbol, m.timeframe, m.candles, m.account, m.replay);
@@ -41,6 +47,17 @@ function route(m: ServerMessage): void {
     case "resync":
       // We lagged and missed candles: full snapshot again, then deltas resume.
       sendSim({ type: "subscribe", symbol: getState().symbol, timeframe: getState().timeframe });
+      break;
+    case "login_ok":
+      store.applyLogin(m.nick);
+      break;
+    case "challenge_ok":
+      // Authoritative join state (server may reject a bad risk).
+      if (!m.joined && getState().inChallenge) store.setInChallenge(false);
+      break;
+    case "challenge_board":
+      // No `to`: shared by design, the route() filter above lets it through.
+      store.applyBoard(m.board);
       break;
     case "error":
       store.setError(m.message);

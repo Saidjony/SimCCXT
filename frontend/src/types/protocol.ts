@@ -70,6 +70,14 @@ export interface ReplayState {
   total: number;
 }
 
+export interface ChallengeEntry {
+  nick: string;
+  risk: number;
+  pnl: number;
+  r: number;
+  equity: number;
+}
+
 // --- frontend -> Rust ---
 
 export type ClientMessage =
@@ -98,9 +106,14 @@ export type ClientMessage =
       timestamp_ms?: number | null;
       request_id?: string;
     }
+  | { type: "login"; name: string; request_id?: string }
+  | { type: "challenge"; join: boolean; risk_usdt?: number; request_id?: string }
   | { type: "ping" };
 
 // --- Rust -> frontend ---
+//
+// Session events carry `to` = this tab's client_id; the connection drops
+// messages addressed to other clients (one isolated Rust session per tab).
 
 export type ServerMessage =
   | { type: "welcome"; client_id: number }
@@ -114,14 +127,18 @@ export type ServerMessage =
       replay: ReplayState;
       request_id?: string;
     }
-  | { type: "candle"; symbol: string; timeframe: string; candle: CandleRow; is_new: boolean }
-  | { type: "market_update"; symbol: string; last: number; timestamp: number }
-  | { type: "account_update"; account: AccountSnapshot }
+  | { type: "candle"; to?: number; symbol: string; timeframe: string; candle: CandleRow; is_new: boolean }
+  | { type: "market_update"; to?: number; symbol: string; last: number; timestamp: number }
+  | { type: "account_update"; to?: number; account: AccountSnapshot }
   | { type: "order_update"; to?: number; order: OrderLine; request_id?: string }
-  | { type: "trade"; fill: FillLine }
+  | { type: "trade"; to?: number; fill: FillLine }
   | (ReplayState & { to?: number; request_id?: string })
-  | { type: "heartbeat"; now_ms: number; paused: boolean }
+  | { type: "heartbeat"; to?: number; now_ms: number; paused: boolean }
   | { type: "resync"; to?: number }
+  | { type: "login_ok"; to?: number; nick: string; request_id?: string }
+  | { type: "challenge_ok"; to?: number; joined: boolean; nick?: string; request_id?: string }
+  // Challenge board has NO `to`: the server broadcasts it to every socket.
+  | { type: "challenge_board"; board: ChallengeEntry[] }
   | { type: "error"; to?: number; message: string; request_id?: string }
   | { type: "pong"; to?: number };
 
@@ -149,6 +166,9 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "replay_state":
     case "heartbeat":
     case "resync":
+    case "login_ok":
+    case "challenge_ok":
+    case "challenge_board":
     case "error":
     case "pong":
       return v as ServerMessage;

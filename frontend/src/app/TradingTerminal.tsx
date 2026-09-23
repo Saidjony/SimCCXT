@@ -3,9 +3,11 @@ import { useSimSocket } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
 import { Chart } from "../chart/Chart";
 import { OrderPanel } from "../components/OrderPanel";
-import { ReplayControls, Screener } from "../components/Screener";
+import { ReplayControls } from "../components/ReplayControls";
+import { CoinList } from "../components/CoinList";
+import { CriteriaCard } from "../components/CriteriaCard";
+import { ChallengeCard } from "../components/ChallengeCard";
 import { BottomTerminal } from "../components/Panels";
-import { DrawTools } from "../components/DrawTools";
 
 /** Connection + data-age badge: "connected · data 2s ago" vs "connecting…". */
 function ConnBadge(): JSX.Element {
@@ -34,12 +36,14 @@ function ConnBadge(): JSX.Element {
 export function TradingTerminal(): JSX.Element {
   useSimSocket();
   const error = useSim((s) => s.error);
+  const serverNick = useSim((s) => s.serverNick);
 
   return (
     <div className="app">
       <header className="topbar">
         <span className="logo">simccxt</span>
         <ConnBadge />
+        {serverNick && <span className="nick-badge">вы: {serverNick}</span>}
         {error && <span className="err">{error}</span>}
       </header>
       <div className="toprow">
@@ -47,10 +51,11 @@ export function TradingTerminal(): JSX.Element {
           <Chart />
         </main>
         <aside className="side">
-          <Screener />
+          <CoinList />
+          <CriteriaCard />
+          <ChallengeCard />
           <ReplayControls />
           <OrderPanel />
-          <DrawTools />
         </aside>
       </div>
       <div className="bottom">

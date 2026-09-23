@@ -21,9 +21,15 @@
 //!
 //! Incremental updates (never resend the whole dataset per tick):
 //! - `subscribe` answers with one `snapshot` (up to 10 000 historical candles).
-//! - afterwards the server only broadcasts `candle` (new/updated bar),
+//! - afterwards the server only sends `candle` (new/updated bar),
 //!   `market_update`, `account_update`, `trade` and `replay_state`.
+//!
+//! Sessions: one WebSocket connection = one isolated session with its own
+//! `Exchange` (own account, series, clock, replay speed). Every session event
+//! carries `to` (the session's client_id); each socket drops messages that
+//! address another client, so two users never see each other's state.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -52,22 +58,42 @@ use tokio::sync::broadcast;
 //   {"type":"close_position","symbol":"BTC/USDT","quantity":null}
 //   {"type":"replay","action":"play|pause|step|reset|set_speed|set_step",
 //    "steps":1,"speed":2.0,"step_ms":60000,"timestamp_ms":null}
+//   {"type":"login","name":"..","request_id":".."}   (empty name = keep current nick)
+//   {"type":"challenge","join":true,"risk_usdt":10,"request_id":".."}
+//    (join needs risk_usdt>0; resend join to update the risk)
 //   {"type":"ping"}
 //
 // Rust -> frontend:
 //   {"type":"welcome","client_id":7}
 //   {"type":"snapshot","to":7,"symbol":..,"timeframe":..,"candles":[[ts,o,h,l,c,v]..],
 //    "account":{..},"replay":{..}}
-//   {"type":"candle","symbol":..,"timeframe":..,"candle":[..],"is_new":true}
-//   {"type":"market_update","symbol":..,"last":..,"timestamp":..}
-//   {"type":"account_update","account":{..}}
-//   {"type":"order_update","order":{..}}
-//   {"type":"trade","fill":{..}}
-//   {"type":"replay_state",.. | "replay":{..}}
-//   {"type":"heartbeat","now_ms":..,"paused":..}   (every 10 s when quiet)
+//   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
+//   {"type":"market_update","to":7,"symbol":..,"last":..,"timestamp":..}
+//   {"type":"account_update","to":7,"account":{..}}
+//   {"type":"order_update","to":7,"order":{..}}
+//   {"type":"trade","to":7,"fill":{..}}
+//   {"type":"replay_state","to":7,..}
+//   {"type":"heartbeat","to":7,"now_ms":..,"paused":..}   (every 10 s when quiet)
 //   {"type":"resync","to":7}                       (you lagged: re-subscribe)
+//   {"type":"login_ok","to":7,"nick":"..","request_id":".."}
+//   {"type":"challenge_ok","to":7,"joined":true,"nick":"..","request_id":".."}
+//   {"type":"challenge_board","board":[..]}         (NO `to`: goes to EVERYONE)
 //   {"type":"error","to":7,"message":"..","request_id":".."}
-//   {"type":"pong"}
+//   {"type":"pong","to":7}
+//
+// SESSIONS (isolation): every connection owns a private session — its own
+// `Exchange` (1M USDT paper account, orders, positions), its own series and
+// replay clock/speed, its own push cursors. All session events carry `to`;
+// the per-socket writer forwards only messages addressed to that socket, and
+// disconnect destroys the session. Users never share or observe state.
+//
+// CHALLENGE (opt-in leaderboard): a session carries a nick (random at
+// creation, overridable via `login`), an `in_challenge` flag and `risk_usdt`
+// (sent by the frontend on join — the fixed risk per trade). Participants are
+// published as `{nick, risk, pnl, r, equity}` with R = (realized+unrealized) /
+// risk_usdt, sorted by R desc. The board broadcasts to ALL sockets (no `to`)
+// on login / join / leave / disconnect / new fills. In-memory only: a server
+// restart empties the board. No passwords — nicks are not authenticated.
 //
 // A candle row is always [ts_ms, open, high, low, close, volume].
 // `account` is exactly `Exchange::account_snapshot()` (balances, equity, pnl,
@@ -106,6 +132,13 @@ enum ClientCmd {
     },
     CancelOrder { order_id: String, symbol: String, request_id: Option<String> },
     ClosePosition { symbol: String, quantity: Option<f64>, request_id: Option<String> },
+    Login { #[serde(default)] name: String, request_id: Option<String> },
+    Challenge {
+        join: bool,
+        #[serde(default)]
+        risk_usdt: Option<f64>,
+        request_id: Option<String>,
+    },
     Replay {
         action: String,
         #[serde(default)]
@@ -121,10 +154,11 @@ enum ClientCmd {
     Ping,
 }
 
-/// One unit of work for the engine thread.
-struct EngineJob {
-    client_id: u64,
-    cmd: ClientCmd,
+/// One unit of work for the engine thread: a command from a client, or the
+/// teardown of that client's session.
+enum EngineJob {
+    Command { client_id: u64, cmd: ClientCmd },
+    Disconnect { client_id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -147,171 +181,398 @@ macro_rules! log {
     };
 }
 
-fn replay_state_json(ex: &Exchange, symbol: &str, tf: &str, speed: f64, step_ms: u64) -> Value {
-    json!({
-        "type": "replay_state",
-        "paused": ex.is_paused(),
-        "now_ms": ex.now_ms(),
-        "speed": speed,
-        "step_ms": step_ms,
-        "done": ex.replay_done(symbol, tf),
-        "fed": ex.fetch_ohlcv_live(symbol, tf).len(),
-        "total": ex.fetch_ohlcv(symbol, tf, None, None).len(),
-    })
-}
-
 /// Bars in `live` that the client has not seen yet (client has seen `fed`).
 /// Pure helper so it can be unit-tested: returns the slice of new rows.
 fn new_bars(live: &[Vec<f64>], fed: usize) -> &[Vec<f64>] {
     if fed >= live.len() { &[] } else { &live[fed..] }
 }
 
-struct Engine {
+/// One WebSocket connection = one isolated session: its own `Exchange` (own
+/// account/orders/positions), own series, own replay clock and speed, own
+/// push cursors. Nothing is shared between sessions — except the opt-in
+/// challenge board (nick + stats only, see CHALLENGE above).
+struct Session {
     ex: Exchange,
     symbol: String,
     timeframe: String,
     speed: f64,   // ticks per second while playing
     step_ms: u64, // mirrored from Exchange::set_step_ms (no getter there)
-    fed: usize,   // candles already pushed to clients
+    fed: usize,   // candles already pushed to this client
     fills_seen: usize,
-    last_beat: std::time::Instant, // last heartbeat broadcast
+    last_beat: std::time::Instant, // last heartbeat to this client
+    last_step: std::time::Instant, // last auto-tick (per-session speed)
+    nick: String,      // challenge display name (random at creation)
+    in_challenge: bool, // opt-in: publish nick+stats on the shared board
+    risk_usdt: f64,    // fixed risk per trade, sent by the frontend on join
+}
+
+// ---------------------------------------------------------------------------
+// Challenge: random nicks + shared leaderboard (in-memory, no passwords)
+// ---------------------------------------------------------------------------
+
+/// Max nick length in chars (not bytes — Cyrillic is 2 bytes/char).
+const MAX_NICK_LEN: usize = 24;
+
+const NICK_A: [&str; 20] = [
+    "Быстрый", "Тихий", "Стальной", "Хитрый", "Смелый", "Резкий", "Меткий",
+    "Дерзкий", "Умный", "Спокойный", "Ловкий", "Жадный", "Терпеливый", "Зоркий",
+    "Крепкий", "Шустрый", "Мудрый", "Дикий", "Холодный", "Цепкий",
+];
+const NICK_B: [&str; 20] = [
+    "Бык", "Медведь", "Волк", "Сокол", "Акула", "Тигр", "Ястреб", "Кит",
+    "Скорпион", "Ворон", "Барс", "Койот", "Филин", "Соболь", "Кречет",
+    "Тайфун", "Штиль", "Откат", "Пробой", "Флет",
+];
+
+/// Random `A-B-NN` nick, unique among active sessions. xorshift64 seeded from
+/// wall-clock nanos + a process counter (same PRNG style as `synthetic`).
+fn unique_nick(sessions: &HashMap<u64, Session>) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SALT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x1234_5678);
+    let mut state = nanos
+        .wrapping_add(SALT.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .max(1);
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..64 {
+        let nick = format!(
+            "{}-{}-{}",
+            NICK_A[(next() % NICK_A.len() as u64) as usize],
+            NICK_B[(next() % NICK_B.len() as u64) as usize],
+            1 + next() % 99,
+        );
+        if !sessions.values().any(|s| s.nick == nick) {
+            return nick;
+        }
+    }
+    // Practically unreachable (20*20*99 combos): fall back to a counter nick.
+    format!("Трейдер-{}", sessions.len() + 1)
+}
+
+/// Validate a user-supplied nick: 1–24 chars after trim, no control chars.
+fn clean_nick(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.chars().count() > MAX_NICK_LEN {
+        return None;
+    }
+    if t.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// One board row: R = (realized + unrealized) / risk. `None` when the risk
+/// is missing/non-positive (cannot happen for joined sessions — join gates).
+fn r_of(pnl: f64, risk: f64) -> Option<f64> {
+    if risk > 0.0 && risk.is_finite() && pnl.is_finite() {
+        Some(pnl / risk)
+    } else {
+        None
+    }
+}
+
+/// Leaderboard JSON over challenge participants, sorted by R desc.
+/// Deliberately NO `to`: the per-socket writer forwards it to everyone.
+fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
+    let mut rows: Vec<(f64, Value)> = Vec::new();
+    for s in sessions.values() {
+        if !s.in_challenge {
+            continue;
+        }
+        let snap = s.ex.account_snapshot();
+        let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
+        let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
+        let equity = snap["equity"].as_f64().unwrap_or(0.0);
+        let pnl = realized + unrealized;
+        let r = r_of(pnl, s.risk_usdt).unwrap_or(0.0);
+        rows.push((r, json!({
+            "nick": s.nick,
+            "risk": s.risk_usdt,
+            "pnl": pnl,
+            "r": (r * 100.0).round() / 100.0,
+            "equity": (equity * 100.0).round() / 100.0,
+        })));
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    json!({ "type": "challenge_board", "board": rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>() })
+}
+
+struct Engine {
+    sessions: HashMap<u64, Session>,
     out: broadcast::Sender<String>,
+    /// Missing series may be downloaded from Binance (false in unit tests,
+    /// and when the server is started with `--offline`).
+    allow_net: bool,
 }
 
 /// Heartbeat period: even a paused replay emits traffic so the frontend can
 /// tell "idle" apart from "disconnected".
 const HEARTBEAT_SECS: u64 = 10;
 
+/// Wall-clock interval between auto-steps at `speed` ticks/second.
+fn speed_interval(speed: f64) -> Duration {
+    let ms = (1000.0 / speed.max(0.05)).round() as u64;
+    Duration::from_millis(ms.clamp(10, 5000))
+}
+
+fn replay_json(s: &Session) -> Value {
+    json!({
+        "type": "replay_state",
+        "paused": s.ex.is_paused(),
+        "now_ms": s.ex.now_ms(),
+        "speed": s.speed,
+        "step_ms": s.step_ms,
+        "done": s.ex.replay_done(&s.symbol, &s.timeframe),
+        "fed": s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len(),
+        "total": s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None).len(),
+    })
+}
+
+fn ack_replay(s: &Session, request_id: Option<String>) -> Value {
+    let mut v = replay_json(s);
+    v["request_id"] = json!(request_id);
+    v
+}
+
+fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
+    // Only bars <= now: the chart reveals one new bar per tick instead of
+    // the whole future at once. Later steps arrive as `candle` deltas.
+    let mut rows = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe);
+    if rows.len() > SNAPSHOT_CAP {
+        rows = rows[rows.len() - SNAPSHOT_CAP..].to_vec();
+    }
+    json!({
+        "type": "snapshot",
+        "symbol": s.symbol,
+        "timeframe": s.timeframe,
+        "candles": rows,
+        "account": s.ex.account_snapshot(),
+        "replay": replay_json(s),
+        "request_id": request_id,
+    })
+}
+
+fn account_json(s: &Session) -> Value {
+    json!({ "type": "account_update", "account": s.ex.account_snapshot() })
+}
+
+fn error_json(message: String, request_id: Option<String>) -> Value {
+    json!({ "type": "error", "message": message, "request_id": request_id })
+}
+
+/// Deltas after one step: new candles + market/trades/account/replay.
+fn delta_events(s: &mut Session) -> Vec<Value> {
+    let mut ev = Vec::new();
+    let live = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe);
+    for bar in new_bars(&live, s.fed) {
+        ev.push(json!({
+            "type": "candle",
+            "symbol": s.symbol,
+            "timeframe": s.timeframe,
+            "candle": bar,
+            "is_new": true,
+        }));
+    }
+    s.fed = live.len();
+    let last = live.last().map(|r| r[4]).unwrap_or(0.0);
+    ev.push(json!({
+        "type": "market_update",
+        "symbol": s.symbol,
+        "last": last,
+        "timestamp": s.ex.now_ms(),
+    }));
+    // New fills produced by the step (e.g. triggered stop/TP).
+    let fills = s.ex.fetch_fills(None, None);
+    if fills.len() > s.fills_seen {
+        // fetch_fills is newest-first; take the unknown prefix and
+        // re-emit oldest-first so the UI appends in order.
+        let mut fresh: Vec<&Value> = fills.iter().take(fills.len() - s.fills_seen).collect();
+        fresh.reverse();
+        for f in fresh {
+            ev.push(json!({ "type": "trade", "fill": f }));
+        }
+        s.fills_seen = fills.len();
+    }
+    ev.push(account_json(s));
+    ev.push(replay_json(s));
+    ev
+}
+
+/// Fresh isolated session: 1M USDT paper account, empty series (the first
+/// `subscribe` loads it and resets the clock), random challenge nick.
+fn new_session(nick: String) -> Session {
+    let mut ex = Exchange::default();
+    ex.deposit("USDT", 1_000_000.0);
+    Session {
+        ex,
+        symbol: String::new(),
+        timeframe: String::new(),
+        speed: DEFAULT_SPEED,
+        step_ms: 60_000,
+        fed: 0,
+        fills_seen: 0,
+        last_beat: std::time::Instant::now(),
+        last_step: std::time::Instant::now(),
+        nick,
+        in_challenge: false,
+        risk_usdt: 0.0,
+    }
+}
+
+/// Switch the replay series of ONE session. Returns a human-readable note.
+fn use_series(
+    s: &mut Session,
+    symbol: String,
+    timeframe: String,
+    data_dir: &Path,
+    allow_net: bool,
+) -> String {
+    s.symbol = symbol;
+    s.timeframe = timeframe;
+    s.step_ms = tf_step_ms(&s.timeframe);
+    s.ex.set_step_ms(s.step_ms);
+    ensure_series(&mut s.ex, &s.symbol, &s.timeframe, data_dir, allow_net);
+    let rows = s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None);
+    if let Some(first) = rows.first() {
+        let ts = DateTime::from_timestamp_millis(first[0] as i64).unwrap_or_else(Utc::now);
+        s.ex.reset(ts);
+    }
+    s.ex.resume();
+    s.fed = 0;
+    s.fills_seen = s.ex.fetch_fills(None, None).len();
+    s.last_step = std::time::Instant::now();
+    format!("{} {} ({} bars)", s.symbol, s.timeframe, rows.len())
+}
+
 impl Engine {
-    fn broadcast(&self, v: Value) {
-        let _ = self.out.send(msg(v));
+    /// Unit-test constructor: never touches the network.
+    fn new(out: broadcast::Sender<String>) -> Self {
+        Engine { sessions: HashMap::new(), out, allow_net: false }
     }
 
-    fn directed(&self, to: u64, v: Value) {
-        // Directed messages carry `to`; clients ignore messages for others.
-        let mut v = v;
+    fn with_net(mut self, allow_net: bool) -> Self {
+        self.allow_net = allow_net;
+        self
+    }
+
+    /// Everything the engine says to a session carries `to`; the per-socket
+    /// writer drops messages addressed to other clients.
+    fn send_to(&self, to: u64, mut v: Value) {
         v["to"] = json!(to);
         let _ = self.out.send(msg(v));
     }
 
-    fn account_event(&self) -> Value {
-        json!({ "type": "account_update", "account": self.ex.account_snapshot() })
-    }
-
-    /// Emit a tiny heartbeat when the engine has been quiet: lets the
-    /// frontend distinguish a paused replay from a dead connection.
-    fn maybe_heartbeat(&mut self) {
-        if self.last_beat.elapsed() >= Duration::from_secs(HEARTBEAT_SECS) {
-            self.last_beat = std::time::Instant::now();
-            self.broadcast(json!({
-                "type": "heartbeat",
-                "now_ms": self.ex.now_ms(),
-                "paused": self.ex.is_paused(),
-            }));
+    fn send_all(&self, to: u64, evs: Vec<Value>) {
+        for v in evs {
+            self.send_to(to, v);
         }
     }
 
-    /// Push newly fed candles + market/account/replay updates after a step.
-    fn push_delta(&mut self) {
-        let live = self.ex.fetch_ohlcv_live(&self.symbol, &self.timeframe);
-        for bar in new_bars(&live, self.fed) {
-            let is_new = true;
-            self.broadcast(json!({
-                "type": "candle",
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
-                "candle": bar,
-                "is_new": is_new,
-            }));
+    /// Lazily create the session for a first-time client (random nick).
+    fn session(&mut self, id: u64) -> &mut Session {
+        if !self.sessions.contains_key(&id) {
+            let nick = unique_nick(&self.sessions);
+            log!("[engine] session #{id} created ({nick})");
+            self.sessions.insert(id, new_session(nick));
         }
-        self.fed = live.len();
-        let last = live.last().map(|r| r[4]).unwrap_or(0.0);
-        self.broadcast(json!({
-            "type": "market_update",
-            "symbol": self.symbol,
-            "last": last,
-            "timestamp": self.ex.now_ms(),
-        }));
-        // New fills produced by the step (e.g. triggered stop/TP).
-        let fills = self.ex.fetch_fills(None, None);
-        if fills.len() > self.fills_seen {
-            // fetch_fills is newest-first; take the unknown prefix and
-            // re-emit oldest-first so the UI appends in order.
-            let mut fresh: Vec<&Value> = fills.iter().take(fills.len() - self.fills_seen).collect();
-            fresh.reverse();
-            for f in fresh {
-                self.broadcast(json!({ "type": "trade", "fill": f }));
-            }
-            self.fills_seen = fills.len();
-        }
-        self.broadcast(self.account_event());
-        let replay = replay_state_json(&self.ex, &self.symbol, &self.timeframe, self.speed, self.step_ms);
-        self.broadcast(replay);
+        // expect: we just inserted when missing.
+        self.sessions.get_mut(&id).expect("session just inserted")
     }
 
-    fn send_snapshot(&self, to: u64, request_id: Option<String>) {
-        // Only bars <= now: the chart reveals one new bar per tick instead of
-        // the whole future at once. Later steps arrive as `candle` deltas.
-        let mut rows = self.ex.fetch_ohlcv_live(&self.symbol, &self.timeframe);
-        if rows.len() > SNAPSHOT_CAP {
-            rows = rows[rows.len() - SNAPSHOT_CAP..].to_vec();
-        }
-        self.directed(
-            to,
-            json!({
-                "type": "snapshot",
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
-                "candles": rows,
-                "account": self.ex.account_snapshot(),
-                "replay": replay_state_json(&self.ex, &self.symbol, &self.timeframe, self.speed, self.step_ms),
-                "request_id": request_id,
-            }),
-        );
+    /// Broadcast the challenge board to EVERYONE (no `to` — the writer
+    /// forwards such messages to all sockets). Cheap: only participants.
+    fn push_board(&self) {
+        let _ = self.out.send(msg(challenge_board_json(&self.sessions)));
     }
 
-    fn send_error(&self, to: u64, message: String, request_id: Option<String>) {
-        self.directed(to, json!({ "type": "error", "message": message, "request_id": request_id }));
-    }
-
-    /// Switch the replay series. Returns a human-readable source note.
-    fn use_series(&mut self, symbol: String, timeframe: String, data_dir: &Path) -> String {
-        self.symbol = symbol;
-        self.timeframe = timeframe;
-        self.step_ms = tf_step_ms(&self.timeframe);
-        self.ex.set_step_ms(self.step_ms);
-        ensure_series(&mut self.ex, &self.symbol, &self.timeframe, data_dir);
-        let rows = self.ex.fetch_ohlcv(&self.symbol, &self.timeframe, None, None);
-        if let Some(first) = rows.first() {
-            let ts = DateTime::from_timestamp_millis(first[0] as i64).unwrap_or_else(Utc::now);
-            self.ex.reset(ts);
-        }
-        self.ex.resume();
-        self.fed = 0;
-        self.fills_seen = self.ex.fetch_fills(None, None).len();
-        format!("{} {} ({} bars)", self.symbol, self.timeframe, rows.len())
-    }
-
-    fn handle(&mut self, job: EngineJob, data_dir: &Path) {
-        let to = job.client_id;
-        match job.cmd {
+    fn handle_command(&mut self, to: u64, cmd: ClientCmd, data_dir: &Path) {
+        // Every event is collected first and sent after the match: the
+        // session borrow must end before self.send_all.
+        let mut evs: Vec<Value> = Vec::new();
+        // Set when the shared challenge board changed and must be
+        // re-broadcast to everyone after the directed events go out.
+        let mut board_push = false;
+        match cmd {
             ClientCmd::Ping => {
-                self.directed(to, json!({ "type": "pong" }));
+                evs.push(json!({ "type": "pong" }));
+            }
+            ClientCmd::Login { name, request_id } => {
+                let s = self.session(to);
+                if name.trim().is_empty() {
+                    // Empty login = keep the assigned nick, just confirm it.
+                    evs.push(json!({
+                        "type": "login_ok", "nick": s.nick, "request_id": request_id }));
+                } else {
+                    match clean_nick(&name) {
+                        Some(n) => {
+                            s.nick = n.clone();
+                            log!("[engine] #{to} login as {n}");
+                            evs.push(json!({
+                                "type": "login_ok", "nick": n, "request_id": request_id }));
+                        }
+                        None => evs.push(error_json(
+                            "ник: 1–24 символа без управляющих символов".into(),
+                            request_id,
+                        )),
+                    }
+                }
+                board_push = true; // a newcomer should see the current board
+            }
+            ClientCmd::Challenge { join, risk_usdt, request_id } => {
+                let s = self.session(to);
+                if join {
+                    match risk_usdt {
+                        Some(r) if r > 0.0 && r.is_finite() => {
+                            s.risk_usdt = r;
+                            s.in_challenge = true;
+                            log!("[engine] #{to} ({}) joins the challenge, risk ${r}", s.nick);
+                            evs.push(json!({
+                                "type": "challenge_ok", "joined": true,
+                                "nick": s.nick, "request_id": request_id }));
+                            board_push = true;
+                        }
+                        _ => evs.push(error_json(
+                            "challenge: нужен риск > 0 (поле «Риск» в сделке)".into(),
+                            request_id,
+                        )),
+                    }
+                } else if s.in_challenge {
+                    s.in_challenge = false;
+                    log!("[engine] #{to} ({}) leaves the challenge", s.nick);
+                    evs.push(json!({
+                        "type": "challenge_ok", "joined": false, "request_id": request_id }));
+                    board_push = true;
+                } else {
+                    evs.push(json!({
+                        "type": "challenge_ok", "joined": false, "request_id": request_id }));
+                }
             }
             ClientCmd::Subscribe { symbol, timeframe, request_id } => {
-                if symbol != self.symbol || timeframe != self.timeframe {
-                    let note = self.use_series(symbol, timeframe, data_dir);
-                    log!("[engine] subscribe -> {note}");
+                let allow_net = self.allow_net;
+                let s = self.session(to);
+                if s.symbol.is_empty() || symbol != s.symbol || timeframe != s.timeframe {
+                    let note = use_series(s, symbol, timeframe, data_dir, allow_net);
+                    log!("[engine] #{to} subscribe -> {note}");
                 }
                 // (Re)sync the fed cursor to "everything live so far", then
                 // send the full snapshot; later steps only push deltas.
-                self.fed = self.ex.fetch_ohlcv_live(&self.symbol, &self.timeframe).len();
-                self.send_snapshot(to, request_id);
+                s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
+                evs.push(snapshot_json(s, request_id));
             }
             ClientCmd::PlaceOrder {
                 symbol, side, order_type, quantity, price, stop_price,
                 time_in_force, post_only, reduce_only, request_id,
             } => {
+                let s = self.session(to);
                 let mut p = CreateOrderParams::new();
                 p.stop_price = stop_price;
                 p.reduce_only = reduce_only;
@@ -321,148 +582,244 @@ impl Engine {
                         p.time_in_force = tif;
                     }
                 }
-                match self.ex.create_order(&symbol, &order_type, &side, quantity, price, p) {
+                match s.ex.create_order(&symbol, &order_type, &side, quantity, price, p) {
                     Ok(order) => {
-                        self.directed(to, json!({
+                        evs.push(json!({
                             "type": "order_update", "order": order, "request_id": request_id }));
-                        let fills = self.ex.fetch_fills(None, None);
-                        if fills.len() > self.fills_seen {
+                        let fills = s.ex.fetch_fills(None, None);
+                        if fills.len() > s.fills_seen {
                             let mut fresh: Vec<&Value> =
-                                fills.iter().take(fills.len() - self.fills_seen).collect();
+                                fills.iter().take(fills.len() - s.fills_seen).collect();
                             fresh.reverse();
                             for f in fresh {
-                                self.broadcast(json!({ "type": "trade", "fill": f }));
+                                evs.push(json!({ "type": "trade", "fill": f }));
                             }
-                            self.fills_seen = fills.len();
+                            s.fills_seen = fills.len();
+                            // A fill moves PnL: refresh the board for everyone.
+                            if s.in_challenge {
+                                board_push = true;
+                            }
                         }
-                        self.broadcast(self.account_event());
+                        evs.push(account_json(s));
                     }
-                    Err(e) => self.send_error(to, format!("place_order: {e}"), request_id),
+                    Err(e) => evs.push(error_json(format!("place_order: {e}"), request_id)),
                 }
             }
             ClientCmd::CancelOrder { order_id, symbol, request_id } => {
-                match self.ex.cancel_order(&order_id, &symbol) {
+                let s = self.session(to);
+                match s.ex.cancel_order(&order_id, &symbol) {
                     Ok(order) => {
-                        self.directed(to, json!({
+                        evs.push(json!({
                             "type": "order_update", "order": order, "request_id": request_id }));
-                        self.broadcast(self.account_event());
+                        evs.push(account_json(s));
                     }
-                    Err(e) => self.send_error(to, format!("cancel_order: {e}"), request_id),
+                    Err(e) => evs.push(error_json(format!("cancel_order: {e}"), request_id)),
                 }
             }
             ClientCmd::ClosePosition { symbol, quantity, request_id } => {
-                let (held, _) = self.ex.spot_basis(&symbol);
+                let s = self.session(to);
+                let (held, _) = s.ex.spot_basis(&symbol);
                 let q = quantity.unwrap_or(held);
                 if q <= 0.0 {
-                    self.send_error(to, "nothing to close".into(), request_id);
+                    evs.push(error_json("nothing to close".into(), request_id));
                 } else {
-                    match self.ex.create_order(
+                    match s.ex.create_order(
                         &symbol, "market", "sell", q, None, CreateOrderParams::new(),
                     ) {
                         Ok(order) => {
-                            self.directed(to, json!({
+                            evs.push(json!({
                                 "type": "order_update", "order": order,
                                 "request_id": request_id }));
-                            self.broadcast(self.account_event());
+                            evs.push(account_json(s));
+                            // A close realizes PnL (fills_seen intentionally
+                            // untouched — trade-event behavior unchanged).
+                            if s.ex.fetch_fills(None, None).len() > s.fills_seen
+                                && s.in_challenge
+                            {
+                                board_push = true;
+                            }
                         }
-                        Err(e) => self.send_error(to, format!("close_position: {e}"), request_id),
+                        Err(e) => evs.push(error_json(format!("close_position: {e}"), request_id)),
                     }
                 }
             }
             ClientCmd::Replay { action, steps, speed, step_ms, timestamp_ms, request_id } => {
-                match action.as_str() {
-                    "play" => self.ex.resume(),
-                    "pause" => self.ex.pause(),
-                    "step" => {
-                        // Advance exactly n bars even while paused (pause restored).
-                        let was_paused = self.ex.is_paused();
-                        if was_paused {
-                            self.ex.resume();
+                let known = matches!(
+                    action.as_str(),
+                    "play" | "pause" | "step" | "reset" | "set_speed" | "set_step"
+                );
+                if !known {
+                    evs.push(error_json(format!("unknown replay action: {action}"), request_id));
+                } else {
+                    let s = self.session(to);
+                    match action.as_str() {
+                        "play" => {
+                            s.ex.resume();
+                            s.last_step = std::time::Instant::now();
                         }
-                        if let Some(ms) = step_ms {
-                            self.ex.set_step_ms(ms);
-                            self.step_ms = ms;
+                        "pause" => s.ex.pause(),
+                        "step" => {
+                            // Advance exactly n bars even while paused (pause restored).
+                            let was_paused = s.ex.is_paused();
+                            if was_paused {
+                                s.ex.resume();
+                            }
+                            if let Some(ms) = step_ms {
+                                s.ex.set_step_ms(ms);
+                                s.step_ms = ms;
+                            }
+                            let fills_before = s.ex.fetch_fills(None, None).len();
+                            s.ex.step_n(steps.unwrap_or(1).max(1));
+                            if was_paused {
+                                s.ex.pause();
+                            }
+                            s.last_step = std::time::Instant::now();
+                            let d = delta_events(s);
+                            if s.ex.fetch_fills(None, None).len() > fills_before
+                                && s.in_challenge
+                            {
+                                board_push = true;
+                            }
+                            evs.extend(d);
                         }
-                        self.ex.step_n(steps.unwrap_or(1).max(1));
-                        if was_paused {
-                            self.ex.pause();
+                        "reset" => {
+                            let rows = s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None);
+                            let ts_ms = timestamp_ms.unwrap_or(
+                                rows.first().map(|r| r[0] as i64).unwrap_or_else(|| s.ex.now_ms()),
+                            );
+                            if let Some(ts) = DateTime::from_timestamp_millis(ts_ms) {
+                                s.ex.reset(ts);
+                            }
+                            // Sync the cursor to the new clock (the client follows
+                            // up with subscribe -> full snapshot). Broadcasting
+                            // every live bar as deltas here would be a burst of
+                            // thousands of messages; deltas resume from here.
+                            s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
+                            s.last_step = std::time::Instant::now();
+                            evs.push(account_json(s));
                         }
-                        self.push_delta();
-                    }
-                    "reset" => {
-                        let rows = self.ex.fetch_ohlcv(&self.symbol, &self.timeframe, None, None);
-                        let ts_ms = timestamp_ms.unwrap_or(
-                            rows.first().map(|r| r[0] as i64).unwrap_or_else(|| self.ex.now_ms()),
-                        );
-                        if let Some(ts) = DateTime::from_timestamp_millis(ts_ms) {
-                            self.ex.reset(ts);
-                        }
-                        // Sync the cursor to the new clock (the client follows
-                        // up with subscribe -> full snapshot). Broadcasting
-                        // every live bar as deltas here would be a burst of
-                        // thousands of messages; deltas resume from here.
-                        self.fed = self.ex.fetch_ohlcv_live(&self.symbol, &self.timeframe).len();
-                        self.broadcast(self.account_event());
-                        self.broadcast(replay_state_json(
-                            &self.ex, &self.symbol, &self.timeframe, self.speed, self.step_ms,
-                        ));
-                    }
-                    "set_speed" => {
-                        if let Some(s) = speed {
-                            if s > 0.0 && s <= 100.0 {
-                                self.speed = s;
+                        "set_speed" => {
+                            if let Some(v) = speed {
+                                if v > 0.0 && v <= 100.0 {
+                                    s.speed = v;
+                                }
                             }
                         }
+                        "set_step" => {
+                            if let Some(ms) = step_ms {
+                                let ms = ms.max(1);
+                                s.ex.set_step_ms(ms);
+                                s.step_ms = ms;
+                            }
+                        }
+                        _ => unreachable!("filtered by matches! above"),
                     }
-                    "set_step" => {
-                        if let Some(ms) = step_ms {
-                            let ms = ms.max(1);
-                            self.ex.set_step_ms(ms);
-                            self.step_ms = ms;
+                    if let Some(v) = speed {
+                        if action == "play" && v > 0.0 && v <= 100.0 {
+                            s.speed = v;
                         }
                     }
-                    other => {
-                        self.send_error(to, format!("unknown replay action: {other}"), request_id);
-                        return;
+                    evs.push(ack_replay(s, request_id));
+                }
+            }
+        }
+        self.send_all(to, evs);
+        if board_push {
+            self.push_board();
+        }
+    }
+
+    fn handle_job(&mut self, job: EngineJob, data_dir: &Path) {
+        match job {
+            EngineJob::Command { client_id, cmd } => self.handle_command(client_id, cmd, data_dir),
+            EngineJob::Disconnect { client_id } => {
+                if let Some(s) = self.sessions.remove(&client_id) {
+                    log!("[engine] session #{client_id} ({}) closed", s.nick);
+                    if s.in_challenge {
+                        self.push_board();
                     }
                 }
-                if let Some(s) = speed {
-                    if action == "play" && s > 0.0 && s <= 100.0 {
-                        self.speed = s;
-                    }
-                }
-                self.directed(
-                    to,
-                    json!({
-                        "type": "replay_state",
-                        "paused": self.ex.is_paused(),
-                        "now_ms": self.ex.now_ms(),
-                        "speed": self.speed,
-                        "step_ms": self.step_ms,
-                        "done": self.ex.replay_done(&self.symbol, &self.timeframe),
-                        "fed": self.ex.fetch_ohlcv_live(&self.symbol, &self.timeframe).len(),
-                        "total": self.ex.fetch_ohlcv(&self.symbol, &self.timeframe, None, None).len(),
-                        "request_id": request_id,
-                    }),
-                );
             }
         }
     }
 
-    /// One auto-tick while playing: exactly one sim step, then deltas.
-    fn auto_tick(&mut self) {
-        if self.ex.is_paused() {
-            return;
+    /// Sleep until the next session step is due (or the idle poll fires).
+    fn next_timeout(&self) -> Duration {
+        let mut d = Duration::from_millis(IDLE_POLL_MS);
+        let now = std::time::Instant::now();
+        for s in self.sessions.values() {
+            if s.symbol.is_empty() || s.ex.is_paused() {
+                continue;
+            }
+            let rem = speed_interval(s.speed).saturating_sub(now.duration_since(s.last_step));
+            if rem < d {
+                d = rem;
+            }
         }
-        if self.ex.replay_done(&self.symbol, &self.timeframe) {
-            self.ex.pause();
-            let replay =
-                replay_state_json(&self.ex, &self.symbol, &self.timeframe, self.speed, self.step_ms);
-            self.broadcast(replay);
-            return;
+        d
+    }
+
+    /// One auto-tick per playing session (each at its own speed): exactly one
+    /// sim step, then that session's deltas — addressed only to its client.
+    fn auto_tick_all(&mut self) {
+        let now = std::time::Instant::now();
+        let mut emissions: Vec<(u64, Vec<Value>)> = Vec::new();
+        for (&id, s) in &mut self.sessions {
+            if s.symbol.is_empty() || s.ex.is_paused() {
+                continue;
+            }
+            if now.duration_since(s.last_step) < speed_interval(s.speed) {
+                continue;
+            }
+            s.last_step = now;
+            if s.ex.replay_done(&s.symbol, &s.timeframe) {
+                s.ex.pause();
+                emissions.push((id, vec![replay_json(s)]));
+                continue;
+            }
+            s.ex.step_n(1);
+            emissions.push((id, delta_events(s)));
         }
-        self.ex.step_n(1);
-        self.push_delta();
+        // Auto-step fills move PnL: one board refresh if any participant filled.
+        let mut board_dirty = false;
+        for (id, evs) in &emissions {
+            let filled = evs
+                .iter()
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("trade"));
+            if filled && self.sessions.get(id).is_some_and(|s| s.in_challenge) {
+                board_dirty = true;
+                break;
+            }
+        }
+        for (id, evs) in emissions {
+            self.send_all(id, evs);
+        }
+        if board_dirty {
+            self.push_board();
+        }
+    }
+
+    /// Per-session heartbeat: lets the frontend distinguish a paused replay
+    /// from a dead connection (every HEARTBEAT_SECS per session).
+    fn heartbeat_all(&mut self) {
+        let now = std::time::Instant::now();
+        let mut beats: Vec<(u64, Value)> = Vec::new();
+        for (&id, s) in &mut self.sessions {
+            if s.last_beat.elapsed() >= Duration::from_secs(HEARTBEAT_SECS) {
+                s.last_beat = now;
+                beats.push((
+                    id,
+                    json!({
+                        "type": "heartbeat",
+                        "now_ms": s.ex.now_ms(),
+                        "paused": s.ex.is_paused(),
+                    }),
+                ));
+            }
+        }
+        for (id, v) in beats {
+            self.send_to(id, v);
+        }
     }
 }
 
@@ -479,8 +836,16 @@ fn parse_tif(s: &str) -> Option<simccxt_core::TimeInForce> {
 }
 
 // ---------------------------------------------------------------------------
-// Market-data loading (disk cache first, deterministic synthetic fallback)
+// Market-data loading (memory → disk cache → Binance download → synthetic)
 // ---------------------------------------------------------------------------
+
+/// Public Binance klines hosts, tried in order (api.binance.com is
+/// geo-restricted in some regions with HTTP 451 — the vision mirror is not).
+const BINANCE_HOSTS: [&str; 2] = ["https://api.binance.com", "https://data-api.binance.vision"];
+/// How many bars to pull when a series is missing from cache and memory.
+const DOWNLOAD_BARS: usize = 5_000;
+/// Politeness pause between klines pages (Binance rate limit).
+const PAGE_PAUSE: Duration = Duration::from_millis(150);
 
 /// Step size per timeframe.
 fn tf_step_ms(tf: &str) -> u64 {
@@ -544,6 +909,138 @@ fn load_csv(path: &PathBuf) -> Option<Vec<OHLCV>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Write candles to the on-disk cache (`ts_ms,open,high,low,close,volume`).
+fn save_csv(path: &Path, candles: &[OHLCV]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut wtr = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
+    wtr.write_record(["ts_ms", "open", "high", "low", "close", "volume"])
+        .map_err(|e| e.to_string())?;
+    for c in candles {
+        wtr.write_record([
+            c.timestamp.timestamp_millis().to_string(),
+            c.open.to_string(),
+            c.high.to_string(),
+            c.low.to_string(),
+            c.close.to_string(),
+            c.volume.to_string(),
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    wtr.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `"DOGE/USDT"` → `"DOGEUSDT"` (Binance spot symbol). `None` if not BASE/QUOTE.
+fn to_binance_symbol(symbol: &str) -> Option<String> {
+    let parts: Vec<&str> = symbol.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return None;
+    }
+    Some(format!("{}{}", parts[0], parts[1]).to_uppercase())
+}
+
+/// One Binance kline row → OHLCV: `[openTime, o, h, l, c, volume, ...]`
+/// (OHLCV cells arrive as JSON strings, openTime as a number).
+fn parse_kline_row(row: &Value) -> Option<OHLCV> {
+    let arr = row.as_array()?;
+    let ts = arr.first()?.as_i64()?;
+    let num = |i: usize| -> Option<f64> {
+        match arr.get(i)? {
+            Value::String(s) => s.parse().ok(),
+            Value::Number(n) => n.as_f64(),
+            _ => None,
+        }
+    };
+    let dt = DateTime::from_timestamp_millis(ts)?;
+    Some(OHLCV::new(dt, num(1)?, num(2)?, num(3)?, num(4)?, num(5)?))
+}
+
+/// One klines page from `host`. Non-2xx / transport / JSON errors → `Err`.
+fn fetch_klines_page(
+    host: &str,
+    sym: &str,
+    tf: &str,
+    start_ms: i64,
+    end_ms: i64,
+    limit: u32,
+) -> Result<Vec<OHLCV>, String> {
+    let url = format!(
+        "{host}/api/v3/klines?symbol={sym}&interval={tf}\
+         &startTime={start_ms}&endTime={end_ms}&limit={limit}"
+    );
+    // ureq 3: timeout lives on the agent, not the request builder.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build()
+        .into();
+    let mut res = agent
+        .get(&url)
+        .header("User-Agent", "simccxt/0.1")
+        .call()
+        .map_err(|e| format!("{host}: {e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("{host}: HTTP {}", res.status()));
+    }
+    let body = res.body_mut().read_to_string().map_err(|e| format!("{host}: {e}"))?;
+    let rows: Vec<Value> = serde_json::from_str(&body).map_err(|e| format!("{host}: {e}"))?;
+    Ok(rows.iter().filter_map(parse_kline_row).collect())
+}
+
+/// Download the most recent `bars` klines for `symbol@tf` from Binance
+/// (paginated, no API key). Tries both hosts per page; short page = end of
+/// available history. Returns bars sorted ascending by open time.
+fn download_series(symbol: &str, tf: &str, bars: usize) -> Result<Vec<OHLCV>, String> {
+    let sym = to_binance_symbol(symbol).ok_or_else(|| format!("bad symbol {symbol}"))?;
+    // Only intervals Binance knows — never invent a grid for unknown tf.
+    let step: i64 = match tf {
+        "1s" | "1m" | "5m" | "15m" | "1h" | "4h" | "1d" => tf_step_ms(tf) as i64,
+        _ => return Err(format!("unsupported timeframe {tf}")),
+    };
+    let end_ms = Utc::now().timestamp_millis();
+    let start_ms = end_ms - (bars as i64) * step;
+    let mut out: Vec<OHLCV> = Vec::with_capacity(bars);
+    let mut cursor = start_ms;
+    let mut last_err: Option<String> = None;
+
+    while cursor <= end_ms && out.len() < bars {
+        let limit = 1000u32; // Binance page cap
+        let mut page: Option<Vec<OHLCV>> = None;
+        for host in BINANCE_HOSTS {
+            match fetch_klines_page(host, &sym, tf, cursor, end_ms, limit) {
+                Ok(rows) => {
+                    page = Some(rows);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let Some(rows) = page else { break };
+        if rows.is_empty() {
+            break;
+        }
+        let short = rows.len() < limit as usize;
+        let last_open = rows
+            .last()
+            .map(|c| c.timestamp.timestamp_millis())
+            .unwrap_or(cursor);
+        out.extend(rows);
+        if short || last_open >= end_ms || last_open < cursor {
+            break;
+        }
+        cursor = last_open + step;
+        std::thread::sleep(PAGE_PAUSE);
+    }
+
+    if out.is_empty() {
+        return Err(last_err.unwrap_or_else(|| "no klines returned".into()));
+    }
+    out.sort_by_key(|c| c.timestamp.timestamp_millis());
+    out.dedup_by_key(|c| c.timestamp.timestamp_millis());
+    Ok(out)
+}
+
 /// Deterministic synthetic random walk (xorshift64, fixed seed) — explicit
 /// fallback when no cache file exists. Never silent: the source is logged.
 fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
@@ -572,20 +1069,50 @@ fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
     out
 }
 
-/// Make sure `symbol@timeframe` is loaded; cache-first, synthetic fallback.
-fn ensure_series(ex: &mut Exchange, symbol: &str, tf: &str, data_dir: &Path) {
+/// Make sure `symbol@timeframe` is loaded. Order: already in memory →
+/// disk cache → Binance download (saved to cache) → synthetic fallback.
+/// Network is only attempted when `allow_net` (off in unit tests, and with
+/// `--offline`); every source is logged — synthetic is never silent.
+fn ensure_series(
+    ex: &mut Exchange,
+    symbol: &str,
+    tf: &str,
+    data_dir: &Path,
+    allow_net: bool,
+) {
     if !ex.fetch_ohlcv(symbol, tf, None, Some(1)).is_empty() {
         return;
     }
     let path = data_dir.join(binance_file(symbol, tf));
     if let Some(candles) = load_csv(&path) {
         let n = candles.len();
-        if Symbol::parse(symbol).is_ok() {
-            ex.add_market(&Symbol::parse(symbol).unwrap(), MarketKind::Spot);
+        if let Ok(sym) = Symbol::parse(symbol) {
+            ex.add_market(&sym, MarketKind::Spot);
         }
         ex.load_candles(symbol, tf, candles);
         log!("[engine] {symbol} {tf}: {n} bars from cache ({})", path.display());
         return;
+    }
+    if allow_net {
+        log!("[engine] {symbol} {tf}: no cache, downloading {DOWNLOAD_BARS} bars from binance…");
+        match download_series(symbol, tf, DOWNLOAD_BARS) {
+            Ok(candles) => {
+                let n = candles.len();
+                if let Err(e) = save_csv(&path, &candles) {
+                    log!("[engine] {symbol} {tf}: cache write failed: {e}");
+                }
+                if let Ok(sym) = Symbol::parse(symbol) {
+                    ex.add_market(&sym, MarketKind::Spot);
+                }
+                ex.load_candles(symbol, tf, candles);
+                log!(
+                    "[engine] {symbol} {tf}: {n} bars from binance (cached {})",
+                    path.display()
+                );
+                return;
+            }
+            Err(e) => log!("[engine] {symbol} {tf}: binance download failed: {e}"),
+        }
     }
     let candles = synthetic(symbol, tf, 2000);
     if let Ok(sym) = Symbol::parse(symbol) {
@@ -635,7 +1162,7 @@ async fn handle_conn(
             let text = frame.into_text().unwrap_or_default();
             match serde_json::from_str::<ClientCmd>(&text) {
                 Ok(cmd) => {
-                    let job = EngineJob { client_id, cmd };
+                    let job = EngineJob::Command { client_id, cmd };
                     if jobs_tx.send(job).is_err() {
                         break;
                     }
@@ -690,6 +1217,8 @@ async fn handle_conn(
         _ = &mut write => "send-failed",
     };
     log!("[ws] #{client_id} disconnected ({reason})");
+    // Destroy the session: its account/clock die with the connection.
+    let _ = jobs.send(EngineJob::Disconnect { client_id });
 }
 
 #[derive(Debug)]
@@ -698,6 +1227,8 @@ struct Args {
     symbol: String,
     timeframe: String,
     data_dir: PathBuf,
+    /// `--offline`: never call Binance; missing series fall back to synthetic.
+    offline: bool,
 }
 
 fn parse_args() -> Args {
@@ -705,6 +1236,7 @@ fn parse_args() -> Args {
     let mut symbol = "BTC/USDT".to_string();
     let mut timeframe = "1m".to_string();
     let mut data_dir = PathBuf::from("data/ohlcv");
+    let mut offline = false;
     let mut it = std::env::args().skip(1).peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -712,14 +1244,15 @@ fn parse_args() -> Args {
             "--symbol" => symbol = it.next().unwrap_or(symbol),
             "--timeframe" | "--tf" => timeframe = it.next().unwrap_or(timeframe),
             "--data-dir" => data_dir = it.next().map(PathBuf::from).unwrap_or(data_dir),
+            "--offline" => offline = true,
             "--help" | "-h" => {
-                println!("simccxt-server [--port 9001] [--symbol BTC/USDT] [--timeframe 1m] [--data-dir data/ohlcv]");
+                println!("simccxt-server [--port 9001] [--symbol BTC/USDT] [--timeframe 1m] [--data-dir data/ohlcv] [--offline]");
                 std::process::exit(0);
             }
             _ => log!("[args] ignoring unknown flag {a}"),
         }
     }
-    Args { port, symbol, timeframe, data_dir }
+    Args { port, symbol, timeframe, data_dir, offline }
 }
 
 fn engine_main(
@@ -727,43 +1260,24 @@ fn engine_main(
     out: broadcast::Sender<String>,
     args: Args,
 ) {
-    let mut ex = Exchange::default();
-    ex.deposit("USDT", 1_000_000.0);
-    let mut engine = Engine {
-        ex,
-        symbol: String::new(),
-        timeframe: String::new(),
-        speed: DEFAULT_SPEED,
-        step_ms: 60_000,
-        fed: 0,
-        fills_seen: 0,
-        last_beat: std::time::Instant::now(),
-        out,
-    };
-    let note = engine.use_series(args.symbol, args.timeframe, &args.data_dir);
-    log!("[engine] initial series: {note}");
-    // Push the initial state so late subscribers get deltas only after this.
-    engine.fed = engine.ex.fetch_ohlcv_live(&engine.symbol, &engine.timeframe).len();
-    engine.broadcast(engine.account_event());
-    engine.broadcast(replay_state_json(
-        &engine.ex, &engine.symbol, &engine.timeframe, engine.speed, engine.step_ms,
-    ));
+    log!(
+        "[engine] cli defaults: {} {} (every session subscribes its own series, net={})",
+        args.symbol,
+        args.timeframe,
+        if args.offline { "off" } else { "binance" }
+    );
+    let mut engine = Engine::new(out).with_net(!args.offline);
 
     loop {
-        let interval = if engine.ex.is_paused() {
-            Duration::from_millis(IDLE_POLL_MS)
-        } else {
-            let ms = (1000.0 / engine.speed.max(0.05)).round() as u64;
-            Duration::from_millis(ms.clamp(10, 5000))
-        };
-        match rx.recv_timeout(interval) {
+        match rx.recv_timeout(engine.next_timeout()) {
             Ok(job) => {
-                engine.handle(job, &args.data_dir);
-                engine.maybe_heartbeat();
+                engine.handle_job(job, &args.data_dir);
+                engine.auto_tick_all();
+                engine.heartbeat_all();
             }
             Err(RecvTimeoutError::Timeout) => {
-                engine.auto_tick();
-                engine.maybe_heartbeat();
+                engine.auto_tick_all();
+                engine.heartbeat_all();
             }
             Err(RecvTimeoutError::Disconnected) => {
                 log!("[engine] job channel closed, exiting");
@@ -878,5 +1392,381 @@ mod tests {
             a.iter().map(|c| c.close).collect::<Vec<_>>(),
             b.iter().map(|c| c.close).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn binance_symbol_from_pair() {
+        assert_eq!(to_binance_symbol("DOGE/USDT").as_deref(), Some("DOGEUSDT"));
+        assert_eq!(to_binance_symbol("btc/usdt").as_deref(), Some("BTCUSDT"));
+        assert_eq!(to_binance_symbol("BTCUSDT"), None);
+        assert_eq!(to_binance_symbol("/USDT"), None);
+    }
+
+    #[test]
+    fn kline_row_parses_ohlcv() {
+        let row = serde_json::json!([
+            1789257600000i64, "77278.73", "77282.04", "77266.01", "77282.04",
+            "1.71117", 1789257659999i64, "132440.5", 42, "0", "0", "0"
+        ]);
+        let c = parse_kline_row(&row).expect("parses");
+        assert_eq!(c.timestamp.timestamp_millis(), 1_789_257_600_000);
+        assert_eq!(c.open, 77278.73);
+        assert_eq!(c.close, 77282.04);
+        assert_eq!(c.volume, 1.71117);
+    }
+
+    #[test]
+    fn save_and_load_csv_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("simccxt-csv-{}", std::process::id()));
+        let path = dir.join("TESTUSDT_1m.csv");
+        let candles = vec![
+            OHLCV::new(
+                DateTime::from_timestamp_millis(1_789_257_600_000).unwrap(),
+                1.0, 2.0, 0.5, 1.5, 10.0,
+            ),
+            OHLCV::new(
+                DateTime::from_timestamp_millis(1_789_257_660_000).unwrap(),
+                1.5, 3.0, 1.0, 2.5, 20.0,
+            ),
+        ];
+        save_csv(&path, &candles).expect("save");
+        let back = load_csv(&path).expect("load");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[1].close, 2.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_rejects_unknown_timeframe() {
+        // No network needed: validation fails before any request.
+        let err = download_series("BTC/USDT", "7m", 10).unwrap_err();
+        assert!(err.contains("unsupported timeframe"), "{err}");
+    }
+
+    #[test]
+    fn offline_engine_never_calls_network() {
+        // Engine::new has allow_net=false → synthetic path only (no HTTP in tests).
+        let (tx, _rx) = broadcast::channel::<String>(8);
+        let eng = Engine::new(tx);
+        assert!(!eng.allow_net);
+    }
+
+    // ------------------------------------------------------------------
+    // Session isolation: two connections must never share state.
+    // ------------------------------------------------------------------
+
+    fn subscribe_cmd(symbol: &str, timeframe: &str) -> ClientCmd {
+        ClientCmd::Subscribe {
+            symbol: symbol.into(),
+            timeframe: timeframe.into(),
+            request_id: None,
+        }
+    }
+
+    fn replay_cmd(action: &str) -> ClientCmd {
+        ClientCmd::Replay {
+            action: action.into(),
+            steps: None,
+            speed: None,
+            step_ms: None,
+            timestamp_ms: None,
+            request_id: None,
+        }
+    }
+
+    fn login_cmd(name: &str) -> ClientCmd {
+        ClientCmd::Login { name: name.into(), request_id: None }
+    }
+
+    fn challenge_cmd(join: bool, risk: Option<f64>) -> ClientCmd {
+        ClientCmd::Challenge { join, risk_usdt: risk, request_id: None }
+    }
+
+    /// Drain the bus, returning only challenge_board messages.
+    fn board_messages(rx: &mut broadcast::Receiver<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("valid json");
+            if v["type"] == "challenge_board" {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    fn test_data_dir() -> &'static Path {
+        // No cache files here: every series is deterministic synthetic data.
+        Path::new("/nonexistent-simccxt-session-test")
+    }
+
+    #[test]
+    fn sessions_have_independent_symbols_and_clocks() {
+        let (tx, mut rx) = broadcast::channel::<String>(512);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "1m"), data);
+        eng.handle_command(2, subscribe_cmd("ETH/USDT", "5m"), data);
+
+        // Each session keeps its own series.
+        assert_eq!(eng.sessions[&1].symbol, "BTC/USDT");
+        assert_eq!(eng.sessions[&1].timeframe, "1m");
+        assert_eq!(eng.sessions[&2].symbol, "ETH/USDT");
+        assert_eq!(eng.sessions[&2].timeframe, "5m");
+
+        // Pausing session 1 must not pause session 2 (subscribe resumes).
+        eng.handle_command(1, replay_cmd("pause"), data);
+        assert!(eng.sessions[&1].ex.is_paused());
+        assert!(!eng.sessions[&2].ex.is_paused());
+
+        // Every message on the bus is directed at exactly one session and
+        // snapshots carry the right symbol for their recipient.
+        let mut snaps = 0;
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("valid json");
+            let to = v
+                .get("to")
+                .and_then(|t| t.as_u64())
+                .expect("session message must carry `to`");
+            assert!(to == 1 || to == 2, "unknown recipient {to}");
+            if v["type"] == "snapshot" {
+                snaps += 1;
+                let want = if to == 1 { "BTC/USDT" } else { "ETH/USDT" };
+                assert_eq!(v["symbol"], want, "snapshot routed to the wrong session");
+            }
+        }
+        assert_eq!(snaps, 2, "one snapshot per subscriber");
+    }
+
+    #[test]
+    fn orders_do_not_leak_between_sessions() {
+        let (tx, _rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        for id in [1u64, 2u64] {
+            eng.handle_command(id, subscribe_cmd("BTC/USDT", "1m"), data);
+            // Two steps establish a reference price for the market order.
+            eng.handle_command(
+                id,
+                ClientCmd::Replay {
+                    action: "step".into(),
+                    steps: Some(2),
+                    speed: None,
+                    step_ms: None,
+                    timestamp_ms: None,
+                    request_id: None,
+                },
+                data,
+            );
+        }
+
+        // Session 1 buys; session 2 must stay a virgin 1M account.
+        eng.handle_command(
+            1,
+            ClientCmd::PlaceOrder {
+                symbol: "BTC/USDT".into(),
+                side: "buy".into(),
+                order_type: "market".into(),
+                quantity: 0.001,
+                price: None,
+                stop_price: None,
+                time_in_force: "GTC".into(),
+                post_only: false,
+                reduce_only: false,
+                request_id: None,
+            },
+            data,
+        );
+
+        let a1 = eng.sessions[&1].ex.account_snapshot();
+        let a2 = eng.sessions[&2].ex.account_snapshot();
+        assert!(
+            !a1["positions"].as_array().map(|p| p.is_empty()).unwrap_or(true),
+            "session 1 should hold a position after the market buy"
+        );
+        assert!(
+            a2["positions"].as_array().map(|p| p.is_empty()).unwrap_or(false),
+            "session 2 must not see session 1's position"
+        );
+        let equity2 = a2["equity"].as_f64().expect("equity");
+        assert!(
+            (equity2 - 1_000_000.0).abs() < 1e-6,
+            "session 2 equity must stay at the initial deposit, got {equity2}"
+        );
+        assert_eq!(eng.sessions[&2].ex.fetch_fills(None, None).len(), 0);
+    }
+
+    #[test]
+    fn disconnect_destroys_the_session() {
+        let (tx, _rx) = broadcast::channel::<String>(16);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        eng.handle_command(7, subscribe_cmd("BTC/USDT", "1m"), data);
+        assert!(eng.sessions.contains_key(&7), "first subscribe creates the session");
+
+        eng.handle_job(EngineJob::Disconnect { client_id: 7 }, data);
+        assert!(!eng.sessions.contains_key(&7), "disconnect must free the session");
+    }
+
+    // ------------------------------------------------------------------
+    // Challenge: nicks, join gating, board math/routing.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn nicks_are_unique_and_shaped() {
+        let mut sessions: HashMap<u64, Session> = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in 0..60u64 {
+            let n = unique_nick(&sessions);
+            assert_eq!(n.split('-').count(), 3, "shape A-B-NN, got {n}");
+            assert!(seen.insert(n.clone()), "duplicate nick {n}");
+            sessions.insert(id, new_session(n));
+        }
+    }
+
+    #[test]
+    fn nick_validation_and_r_math() {
+        assert_eq!(clean_nick("  Боб ").as_deref(), Some("Боб"));
+        assert_eq!(clean_nick(""), None);
+        assert_eq!(clean_nick("   "), None);
+        assert_eq!(clean_nick(&"x".repeat(25)), None);
+        assert_eq!(clean_nick(&"y".repeat(24)).map(|s| s.chars().count()), Some(24));
+        assert_eq!(clean_nick("a\nb"), None);
+        assert_eq!(r_of(20.0, 10.0), Some(2.0));
+        assert_eq!(r_of(0.0, 10.0), Some(0.0));
+        assert_eq!(r_of(5.0, 0.0), None);
+        assert_eq!(r_of(5.0, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn login_sets_nick_and_confirms() {
+        let (tx, mut rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        // Empty login keeps the server-assigned random nick, still acked.
+        eng.handle_command(1, login_cmd(""), data);
+        let assigned = eng.sessions[&1].nick.clone();
+        assert!(!assigned.is_empty(), "session always has a nick");
+        let mut saw_ok = false;
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("valid json");
+            if v["type"] == "login_ok" {
+                assert_eq!(v["to"], 1);
+                assert_eq!(v["nick"], assigned);
+                saw_ok = true;
+            }
+        }
+        assert!(saw_ok, "login_ok must arrive");
+
+        eng.handle_command(1, login_cmd("Тестер"), data);
+        assert_eq!(eng.sessions[&1].nick, "Тестер");
+        eng.handle_command(1, login_cmd(""), data);
+        assert_eq!(eng.sessions[&1].nick, "Тестер", "empty login keeps the nick");
+        eng.handle_command(1, login_cmd(&"z".repeat(30)), data);
+        assert_eq!(eng.sessions[&1].nick, "Тестер", "oversize nick rejected");
+    }
+
+    #[test]
+    fn challenge_join_requires_positive_risk() {
+        let (tx, mut rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        eng.handle_command(1, login_cmd("A"), data);
+        eng.handle_command(1, challenge_cmd(true, None), data);
+        assert!(!eng.sessions[&1].in_challenge, "no risk → no join");
+        eng.handle_command(1, challenge_cmd(true, Some(0.0)), data);
+        assert!(!eng.sessions[&1].in_challenge, "zero risk → no join");
+        // Only the login board so far: failed joins push nothing.
+        assert_eq!(board_messages(&mut rx).len(), 1);
+
+        eng.handle_command(1, challenge_cmd(true, Some(10.0)), data);
+        assert!(eng.sessions[&1].in_challenge);
+        assert_eq!(eng.sessions[&1].risk_usdt, 10.0);
+        let boards = board_messages(&mut rx);
+        assert_eq!(boards.len(), 1);
+        assert!(boards[0].get("to").is_none(), "board goes to everyone");
+        let rows = boards[0]["board"].as_array().expect("board array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["nick"], "A");
+        assert_eq!(rows[0]["risk"], 10.0);
+
+        eng.handle_command(1, challenge_cmd(false, None), data);
+        assert!(!eng.sessions[&1].in_challenge);
+        let boards = board_messages(&mut rx);
+        assert_eq!(boards.len(), 1);
+        assert!(boards[0]["board"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn board_orders_by_r_and_drops_on_disconnect() {
+        let (tx, mut rx) = broadcast::channel::<String>(512);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        for (id, nick) in [(1u64, "Первый"), (2u64, "Второй")] {
+            eng.handle_command(id, login_cmd(nick), data);
+            eng.handle_command(id, subscribe_cmd("BTC/USDT", "1m"), data);
+            eng.handle_command(id, challenge_cmd(true, Some(10.0)), data);
+        }
+        // Session 1 trades (buy + a few bars of drift); session 2 sits out.
+        eng.handle_command(
+            1,
+            ClientCmd::Replay {
+                action: "step".into(),
+                steps: Some(5),
+                speed: None,
+                step_ms: None,
+                timestamp_ms: None,
+                request_id: None,
+            },
+            data,
+        );
+        eng.handle_command(
+            1,
+            ClientCmd::PlaceOrder {
+                symbol: "BTC/USDT".into(),
+                side: "buy".into(),
+                order_type: "market".into(),
+                quantity: 0.001,
+                price: None,
+                stop_price: None,
+                time_in_force: "GTC".into(),
+                post_only: false,
+                reduce_only: false,
+                request_id: None,
+            },
+            data,
+        );
+
+        let boards = board_messages(&mut rx);
+        let last = boards.last().expect("board pushed after the trade");
+        let rows = last["board"].as_array().expect("board array");
+        assert_eq!(rows.len(), 2, "both participants listed");
+        let r0 = rows[0]["r"].as_f64().expect("r");
+        let r1 = rows[1]["r"].as_f64().expect("r");
+        assert!(r0 >= r1, "board sorted by R desc");
+        for row in rows {
+            let id = if row["nick"] == "Первый" { 1 } else { 2 };
+            let snap = eng.sessions[&id].ex.account_snapshot();
+            let pnl = snap["pnl"]["realized"].as_f64().unwrap_or(0.0)
+                + snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
+            let expect = (pnl / 10.0 * 100.0).round() / 100.0;
+            assert!(
+                (row["r"].as_f64().unwrap() - expect).abs() < 1e-9,
+                "R = pnl/risk for {}",
+                row["nick"]
+            );
+        }
+
+        eng.handle_job(EngineJob::Disconnect { client_id: 1 }, data);
+        let boards = board_messages(&mut rx);
+        let last = boards.last().expect("board pushed after disconnect");
+        let rows = last["board"].as_array().expect("board array");
+        assert_eq!(rows.len(), 1, "leaver drops off the board");
+        assert_eq!(rows[0]["nick"], "Второй");
     }
 }

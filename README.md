@@ -82,6 +82,13 @@ TypeScript + React terminal (frontend/)
     └── TradingView Lightweight Charts (candles, drawings stay in the browser)
 ```
 
+**Sessions (isolation).** Every WebSocket connection gets its own session: a
+private `Exchange` (own 1M USDT paper account, orders, positions), own series,
+own replay clock/speed, own push cursors. Every session event carries `to`
+(the session's `client_id`) and each socket forwards only its own messages;
+disconnect destroys the session. Two browsers = two users = zero shared state —
+except the opt-in challenge board (nick + stats only, no `to`, for everyone).
+
 The workspace deliberately contains **no research crates** — no indicators,
 feature-engineering, clustering (KMeans), support/resistance levels, zones,
 strategies, or ML. Everything between "load history" and "get state" runs in
@@ -91,9 +98,12 @@ Terminal side:
 
 ```
 frontend/src/app          TradingTerminal + App bootstrap
-frontend/src/components   Screener, ReplayControls, OrderPanel (risk terminal),
-                          Panels (full-width Account/Positions/Orders/Trades tabs),
-                          DrawTools (drawings list)
+frontend/src/components   CoinList (right-panel watchlist: add/remove/flag +
+                          timeframe), CriteriaCard (30 setup checkboxes),
+                          ChallengeCard (nick + opt-in leaderboard), ReplayControls,
+                          OrderPanel (deal ticket), Panels (full-width
+                          Account/Positions/Orders/Trades tabs)
+frontend/src/trade        criteria catalogue (30 ids + short overlay labels)
 frontend/src/chart        Bar chart (setData once, update per tick), DrawBar
                           (icon toolbar), HTML-overlaid drawings, ghost preview
 frontend/src/websocket    singleton connection (reconnect, watchdog), router
@@ -106,6 +116,13 @@ frontend/test             pure protocol/math tests (bun test / npm test)
 
 **Chart.** OHLC bars + volume (Lightweight Charts). Snapshot → `setData()`,
 ticks → `update()`; crosshair, zoom, pan and fills markers stay local.
+
+**Coin list** (top card of the right panel). Add coins (`BASE/QUOTE` input,
+Enter or `+`), remove them (`×`), flag them (flag icon → the coin moves into
+the pinned "флаг" group above the rest). Clicking a row switches the
+session's series in Rust; removing the active coin jumps to the next one.
+The list persists per browser (localStorage); the timeframe picker and the
+live price of the active coin live in the same card.
 
 **Drawings** (icon toolbar, top-right inside the chart; all local, never trade
 signals; drag to move with bar magnet, right-click / `Del` to delete,
@@ -123,14 +140,24 @@ signals; drag to move with bar magnet, right-click / `Del` to delete,
 Multi-click placement uses manual mouseup detection (the chart's own click
 event swallows rapid clicks and silently ate drawing points).
 
-**Risk terminal** (`Trade` card). Everything in USDT, no base-asset quantities:
+**Criteria** (right-panel card). 30 setup checkboxes with a search filter;
+selected ones render as chips in the chart's top-left overlay (max 8 + `+N`,
+clicks pass through to the chart). Selection persists per browser
+(localStorage); pure UI, never a trade signal.
 
-- capital + fixed risk per trade (e.g. $10);
-- market entry: stop-price field + BUY/SELL (entry = last price);
-- limit entry: price + stop fields;
-- pending entry: trigger + stop fields (stop order, market execution);
-- size = `risk / |entry − stop|`; entry is blocked without a stop;
-- positions table shows value in USDT.
+**Challenge** (right-panel card + topbar badge). Passwordless nick: the server
+assigns a random nick per session (`Быстрый-Бык-42`), typing your own overrides
+it. The «участвовать» checkbox opts in: the session's nick + risk + PnL + R
+appear on the shared board every participant sees (broadcast without `to`).
+R = (realized + unrealized) / fixed risk, sorted desc; the board refreshes on
+join/leave/disconnect/every fill and lives in server memory only. Nick and the
+opt-in persist per browser and restore on connect.
+
+**Deal ticket** (`Сделка` card). Everything in USDT, no base-asset quantities:
+capital + fixed risk per trade, entry-type dropdown (Рынок/Лимит/Стоп) with
+conditional price/trigger fields, always-required stop, BUY/SELL, one preview
+line (`≈ qty · риск $`). Size = `risk / |entry − stop|`; entry is blocked
+without a stop; positions table shows value in USDT.
 
 Legacy Python side (optional, not the app):
 
@@ -291,13 +318,21 @@ The terminal speaks to `simccxt-server` over one WebSocket
 (`src/server/src/main.rs` documents the protocol; `frontend/src/types/protocol.ts`
 mirrors it with explicit types, no `any`).
 
+**One connection = one isolated session** (see Architecture): its own account,
+series and replay clock. Every Rust → frontend session event carries `to`
+(the session's `client_id`); the per-socket writer drops messages addressed
+to other clients, so concurrent users never observe each other's state.
+
 Frontend → Rust commands: `subscribe`, `place_order`, `cancel_order`,
 `close_position`, `replay` (`play` / `pause` / `step` / `reset` / `set_speed` /
-`set_step`), `ping`.
+`set_step`), `login` (nick, empty = keep server-assigned), `challenge`
+(`join` + `risk_usdt`), `ping`.
 
 Rust → frontend events: `welcome`, `snapshot` (historical candles + account +
 replay state, once), then only deltas: `candle` (new/updated bar),
-`market_update`, `account_update`, `order_update`, `trade`, `replay_state`.
+`market_update`, `account_update`, `order_update`, `trade`, `replay_state`,
+plus `login_ok`, `challenge_ok` and the `challenge_board` broadcast (no `to`:
+every socket receives it).
 Keep-alive: `heartbeat` every 10 s while quiet (paused replay), and `resync`
 if a client lags behind (it re-subscribes for a fresh snapshot).
 
@@ -332,22 +367,25 @@ print(ex.fetch_fills(None, None))         # account's own fills
 
 ## Data layer: disk cache + Binance download
 
-`examples/market_data.py` (stdlib-only legacy helper) implements "not on the
-laptop → fetch from the internet". The Rust server reads the same cache files
-directly (`--data-dir data/ohlcv`), so the terminal needs no Python to load data:
+The Rust server itself implements "not on disk → fetch from the internet"
+(`src/server/src/main.rs`: `ensure_series` / `download_series`), so the terminal
+needs no Python to load data:
 
+- Order per `symbol@timeframe`: **already in memory → disk cache → Binance
+  download → synthetic fallback** (synthetic is always logged, never silent).
 - Cache files: `data/ohlcv/{SYMBOL}_{timeframe}.csv`
   (e.g. `data/ohlcv/BTCUSDT_1m.csv`), columns
-  `timestamp,open,high,low,close,volume` with millisecond timestamps.
-- `load_or_download(symbol, tf, start_ms, end_ms)`:
-  1. reads the cache file if present;
-  2. computes which bars of `[start, end)` are missing on the bar grid;
-  3. downloads **only the missing segments** from Binance public klines
-     (paginated, no API key), merges + dedupes + sorts, writes the cache back.
-- Repeat runs are instant (cache hit). Date ranges over 200 000 bars are
-  refused with a message — shrink the range or use a bigger timeframe.
-- Offline / bad symbol / empty range → caller falls back to deterministic
-  synthetic data (explicitly reported, never silent).
+  `ts_ms,open,high,low,close,volume` with millisecond timestamps.
+- Download: Binance public klines (`/api/v3/klines`, no API key), up to
+  5 000 bars, paginated (1 000/page, 150 ms between pages), hosts tried in
+  order `api.binance.com` → `data-api.binance.vision` (geo-restriction
+  mirror). Success writes the cache so the next run is offline-instant.
+- `--offline` disables downloads (synthetic fallback only). Unit tests always
+  run offline (`Engine::new` defaults `allow_net=false`).
+- Offline / bad symbol / empty range → deterministic synthetic data
+  (explicitly reported in the server log).
+- `examples/market_data.py` (stdlib-only legacy helper) can prefill the same
+  cache files for date ranges; repeat runs are instant (cache hit).
 
 `data/` is gitignored — cache is machine-local.
 

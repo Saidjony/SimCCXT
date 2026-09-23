@@ -35,6 +35,22 @@ describe("parseServerMessage", () => {
     assert.equal(parseServerMessage("not json"), null);
     assert.equal(parseServerMessage('{"no":"type"}'), null);
   });
+
+  it("accepts challenge traffic (login_ok / challenge_ok / board)", () => {
+    const ok = parseServerMessage('{"type":"login_ok","to":7,"nick":"Бык-1"}');
+    assert.equal(ok?.type, "login_ok");
+    const ch = parseServerMessage('{"type":"challenge_ok","to":7,"joined":true,"nick":"Бык-1"}');
+    assert.equal(ch?.type, "challenge_ok");
+    const board = parseServerMessage(
+      '{"type":"challenge_board","board":[{"nick":"A","risk":10,"pnl":20,"r":2,"equity":1000020}]}',
+    );
+    assert.equal(board?.type, "challenge_board");
+    if (board?.type === "challenge_board") {
+      assert.equal(board.board.length, 1);
+      assert.equal(board.board[0].nick, "A");
+      assert.equal(board.board[0].r, 2);
+    }
+  });
 });
 
 describe("applyCandleDelta", () => {

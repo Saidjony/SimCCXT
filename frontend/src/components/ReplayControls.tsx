@@ -2,46 +2,6 @@ import { sendSim } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
 import { formatTs } from "../types/protocol";
 
-const SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"];
-const TIMEFRAMES = ["1m", "5m", "15m", "1h"];
-
-/** Market & playback: symbol/timeframe picker (asks Rust for a new series). */
-export function Screener(): JSX.Element {
-  const symbol = useSim((s) => s.symbol);
-  const timeframe = useSim((s) => s.timeframe);
-  const status = useSim((s) => s.status);
-  const lastPrice = useSim((s) => s.lastPrice);
-
-  const load = (sym: string, tf: string): void => {
-    sendSim({ type: "subscribe", symbol: sym, timeframe: tf });
-  };
-
-  return (
-    <div className="card">
-      <h4>Market</h4>
-      <div className="row">
-        <span className="lbl">Symbol</span>
-        <select value={symbol} onChange={(e) => load(e.target.value, timeframe)}>
-          {SYMBOLS.map((s) => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
-        <span className="lbl">TF</span>
-        <select value={timeframe} onChange={(e) => load(symbol, e.target.value)}>
-          {TIMEFRAMES.map((t) => (
-            <option key={t} value={t}>{t}</option>
-          ))}
-        </select>
-      </div>
-      <div className="status">
-        last {Number.isFinite(lastPrice) ? lastPrice.toLocaleString("en-US") : "—"}
-        {" · "}
-        {status === "open" ? "● live" : status}
-      </div>
-    </div>
-  );
-}
-
 /** Replay transport: Rust owns the clock, the UI only sends commands. */
 export function ReplayControls(): JSX.Element {
   const replay = useSim((s) => s.replay);

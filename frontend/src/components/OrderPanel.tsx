@@ -9,10 +9,16 @@ function num(v: string): number | null {
   return v.trim() !== "" && Number.isFinite(n) && n > 0 ? n : null;
 }
 
+type EntryKind = "market" | "limit" | "stop";
+
+const KIND_LABEL: Record<EntryKind, string> = {
+  market: "Рынок",
+  limit: "Лимит",
+  stop: "Стоп",
+};
+
 /**
- * Manual trading, everything in USDT. Every button is one command to Rust;
- * execution, PnL and the clock stay in the engine.
- *
+ * Deal ticket: capital + fixed risk, one entry form with a type dropdown.
  * Sizing is risk-based: qty = fixedRiskUsdt / |entry - stop|.
  * Without a stop price entry is blocked (no defined risk).
  */
@@ -21,108 +27,107 @@ export function OrderPanel(): JSX.Element {
   const lastPrice = useSim((s) => s.lastPrice);
   const initialCapitalUsdt = useSim((s) => s.initialCapitalUsdt);
   const fixedRiskUsdt = useSim((s) => s.fixedRiskUsdt);
+  const inChallenge = useSim((s) => s.inChallenge);
   const base = symbol.split("/")[0] ?? "";
 
-  const [marketSl, setMarketSl] = useState("");
-  const [limitPrice, setLimitPrice] = useState("");
-  const [limitSl, setLimitSl] = useState("");
-  const [trigPrice, setTrigPrice] = useState("");
-  const [trigSl, setTrigSl] = useState("");
+  const [kind, setKind] = useState<EntryKind>("market");
+  const [price, setPrice] = useState("");
+  const [stop, setStop] = useState("");
   const [tif, setTif] = useState("GTC");
   const [postOnly, setPostOnly] = useState(false);
-  const lastOrder = useSim((s) => s.lastOrder);
   const error = useSim((s) => s.error);
 
-  const send = (
-    side: string,
-    orderType: string,
-    entry: number | null,
-    sl: number | null,
-    extra?: { price?: number; stopPrice?: number },
-  ): void => {
-    if (entry === null || sl === null) return;
-    const qty = calcQty(fixedRiskUsdt, entry, sl);
-    if (qty === null) return;
-    // stop_price goes only to stop orders: a market order with stopPrice
-    // would turn into a stop in the engine.
+  const send = (side: string): void => {
+    const sl = num(stop);
+    if (sl === null) return;
+    let orderType = kind;
+    let entry: number | null = null;
     const msg: ClientMessage = {
       type: "place_order", symbol, side, order_type: orderType,
-      quantity: qty, time_in_force: tif, post_only: postOnly,
+      quantity: 0, time_in_force: tif, post_only: postOnly,
       request_id: nextRequestId(),
     };
-    if (orderType === "limit" && extra?.price != null) msg.price = extra.price;
-    if (orderType === "stop" && extra?.stopPrice != null) msg.stop_price = extra.stopPrice;
-    sendSim(msg);
-  };
-
-  const preview = (entry: number | null, sl: number | null): string => {
-    if (entry === null || sl === null) return "укажи стоп — без него вход запрещён";
+    if (kind === "market") {
+      entry = lastPrice > 0 ? lastPrice : null;
+    } else if (kind === "limit") {
+      const p = num(price);
+      if (p === null) return;
+      entry = p;
+      msg.price = p;
+    } else {
+      const t = num(price);
+      if (t === null) return;
+      entry = t;
+      orderType = "stop";
+      msg.order_type = "stop";
+      msg.stop_price = t;
+    }
+    if (entry === null) return;
     const qty = calcQty(fixedRiskUsdt, entry, sl);
-    if (qty === null) return "стоп равен входу — объём бесконечный";
-    return `≈ ${qty.toPrecision(4)} ${base} · риск $${fixedRiskUsdt}`;
+    if (qty === null) return;
+    msg.quantity = qty;
+    sendSim(msg);
+    // While in the challenge the board shows our risk: keep it in sync.
+    if (inChallenge) {
+      sendSim({ type: "challenge", join: true, risk_usdt: fixedRiskUsdt });
+    }
   };
 
-  const mSl = num(marketSl);
-  const lPrice = num(limitPrice);
-  const lSl = num(limitSl);
-  const tPrice = num(trigPrice);
-  const tSl = num(trigSl);
-  const marketEntry = lastPrice > 0 ? lastPrice : null;
-
-  const blocked = (v: number | null): boolean => v === null;
+  const entryPreview = (): number | null => {
+    if (kind === "market") return lastPrice > 0 ? lastPrice : null;
+    return num(price);
+  };
+  const entry = entryPreview();
+  const sl = num(stop);
+  const qty = entry !== null && sl !== null ? calcQty(fixedRiskUsdt, entry, sl) : null;
+  const ready = qty !== null;
+  const preview =
+    qty !== null
+      ? `≈ ${qty.toPrecision(4)} ${base} · риск $${fixedRiskUsdt}`
+      : "укажи стоп — без него вход запрещён";
 
   return (
     <div className="card">
-      <h4>Риск</h4>
+      <h4>Сделка</h4>
       <div className="row">
-        <span className="lbl">Капитал, USDT</span>
+        <span className="lbl">Капитал</span>
         <input
           value={String(initialCapitalUsdt)}
           onChange={(e) => {
             const v = Number(e.target.value);
             if (Number.isFinite(v) && v > 0) store.setInitialCapitalUsdt(v);
           }}
-          style={{ width: 100 }}
+          style={{ width: 90 }}
+          aria-label="капитал, USDT"
         />
-        <span className="lbl">Риск, USDT</span>
+        <span className="lbl">Риск</span>
         <input
           value={String(fixedRiskUsdt)}
           onChange={(e) => {
             const v = Number(e.target.value);
             if (Number.isFinite(v) && v > 0) store.setFixedRiskUsdt(v);
           }}
-          style={{ width: 80 }}
+          style={{ width: 70 }}
+          aria-label="риск, USDT"
         />
       </div>
-      <div className="lbl" style={{ marginTop: 6 }}>
-        объём = ${fixedRiskUsdt} риск / |вход − стоп| · без стопа вход запрещён
-      </div>
-
-      <h4 style={{ marginTop: 12 }}>Вход по рынку</h4>
-      <div className="row">
-        <span className="lbl">Стоп</span>
-        <input value={marketSl} onChange={(e) => setMarketSl(e.target.value)}
-          placeholder="цена стопа" style={{ width: 100 }} />
-        <button className="btn b-green" disabled={blocked(mSl)} onClick={() => send("buy", "market", marketEntry, mSl)}>BUY</button>
-        <button className="btn b-red" disabled={blocked(mSl)} onClick={() => send("sell", "market", marketEntry, mSl)}>SELL</button>
-      </div>
-      <div className="status">{preview(marketEntry, mSl)}</div>
-
-      <h4 style={{ marginTop: 12 }}>Вход лимиткой</h4>
-      <div className="row">
-        <span className="lbl">Цена</span>
-        <input value={limitPrice} onChange={(e) => setLimitPrice(e.target.value)}
-          placeholder="цена" style={{ width: 90 }} />
-        <span className="lbl">Стоп</span>
-        <input value={limitSl} onChange={(e) => setLimitSl(e.target.value)}
-          placeholder="цена стопа" style={{ width: 90 }} />
-      </div>
       <div className="row" style={{ marginTop: 6 }}>
-        <button className="btn b-acc" disabled={blocked(lPrice) || blocked(lSl)}
-          onClick={() => send("buy", "limit", lPrice, lSl, { price: lPrice ?? undefined })}>Buy</button>
-        <button className="btn b-acc" disabled={blocked(lPrice) || blocked(lSl)}
-          onClick={() => send("sell", "limit", lPrice, lSl, { price: lPrice ?? undefined })}>Sell</button>
-        <select value={tif} onChange={(e) => setTif(e.target.value)} style={{ width: 76 }}>
+        <select
+          value={kind}
+          onChange={(e) => setKind(e.target.value as EntryKind)}
+          style={{ width: 100 }}
+          aria-label="тип входа"
+        >
+          {(Object.keys(KIND_LABEL) as EntryKind[]).map((k) => (
+            <option key={k} value={k}>{KIND_LABEL[k]}</option>
+          ))}
+        </select>
+        <select
+          value={tif}
+          onChange={(e) => setTif(e.target.value)}
+          style={{ width: 76 }}
+          aria-label="time in force"
+        >
           {["GTC", "IOC", "FOK"].map((t) => (
             <option key={t} value={t}>{t}</option>
           ))}
@@ -132,31 +137,31 @@ export function OrderPanel(): JSX.Element {
           {" post-only"}
         </label>
       </div>
-      <div className="status">{preview(lPrice, lSl)}</div>
-
-      <h4 style={{ marginTop: 12 }}>Отложенный вход</h4>
-      <div className="row">
-        <span className="lbl">Триггер</span>
-        <input value={trigPrice} onChange={(e) => setTrigPrice(e.target.value)}
-          placeholder="триггер → рынок" style={{ width: 90 }} />
+      <div className="row" style={{ marginTop: 6 }}>
+        {kind !== "market" && (
+          <>
+            <span className="lbl">{kind === "limit" ? "Цена" : "Триггер"}</span>
+            <input
+              value={price}
+              onChange={(e) => setPrice(e.target.value)}
+              placeholder={kind === "limit" ? "цена" : "триггер → рынок"}
+              style={{ width: 100 }}
+            />
+          </>
+        )}
         <span className="lbl">Стоп</span>
-        <input value={trigSl} onChange={(e) => setTrigSl(e.target.value)}
-          placeholder="цена стопа" style={{ width: 90 }} />
+        <input
+          value={stop}
+          onChange={(e) => setStop(e.target.value)}
+          placeholder="цена стопа"
+          style={{ width: 100 }}
+        />
       </div>
       <div className="row" style={{ marginTop: 6 }}>
-        <button className="btn b-dim" disabled={blocked(tPrice) || blocked(tSl)}
-          onClick={() => send("buy", "stop", tPrice, tSl, { stopPrice: tPrice ?? undefined })}>Buy</button>
-        <button className="btn b-dim" disabled={blocked(tPrice) || blocked(tSl)}
-          onClick={() => send("sell", "stop", tPrice, tSl, { stopPrice: tPrice ?? undefined })}>Sell</button>
+        <button className="btn b-green" disabled={!ready} onClick={() => send("buy")}>BUY</button>
+        <button className="btn b-red" disabled={!ready} onClick={() => send("sell")}>SELL</button>
       </div>
-      <div className="status">{preview(tPrice, tSl)}</div>
-
-      {lastOrder && (
-        <div className="status">
-          last: {lastOrder.side.toUpperCase()} {lastOrder.type} {lastOrder.status}
-          {lastOrder.average ? " @ " + lastOrder.average.toFixed(2) : ""}
-        </div>
-      )}
+      <div className="status">{preview}</div>
       {error && <div className="err">{error}</div>}
     </div>
   );

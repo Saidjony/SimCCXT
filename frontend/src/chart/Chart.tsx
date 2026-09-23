@@ -16,6 +16,7 @@ import type { CandleRow } from "../types/protocol";
 import { getState, store, useSim } from "../state/store";
 import { sendSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
+import { criterionLabel } from "../trade/criteria";
 import {
   countBars,
   formatRuler,
@@ -111,6 +112,7 @@ export function Chart(): JSX.Element {
   const symbol = useSim((s) => s.symbol);
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
+  const criteria = useSim((s) => s.criteria);
   const toolRef = useRef(tool);
   toolRef.current = tool;
 
@@ -315,6 +317,14 @@ export function Chart(): JSX.Element {
         {hover && (
           <div className="coin-ohlc" style={{ color: hover.up ? "#3d9a50" : "#d46666" }}>
             {hover.text}
+          </div>
+        )}
+        {criteria.length > 0 && (
+          <div className="coin-chips">
+            {criteria.slice(0, 8).map((id) => (
+              <span key={id} className="chip">✓ {criterionLabel(id)}</span>
+            ))}
+            {criteria.length > 8 && <span className="chip more">+{criteria.length - 8}</span>}
           </div>
         )}
         {tool !== "none" && <div className="coin-status">{TOOL_HINTS[tool]}</div>}
