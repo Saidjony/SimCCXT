@@ -21,7 +21,7 @@ function route(m: ServerMessage): void {
       }
       break;
     case "snapshot":
-      store.applySnapshot(m.symbol, m.timeframe, m.candles, m.account, m.replay);
+      store.applySnapshot(m.symbol, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period);
       break;
     case "candle":
       if (m.symbol === getState().symbol) store.applyCandle(m.candle);

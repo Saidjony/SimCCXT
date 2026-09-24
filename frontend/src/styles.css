@@ -290,3 +290,38 @@ td, th { padding: 3px 4px; }
 .board-table { margin-top: 8px; }
 .board-table tr.me td { font-weight: 700; }
 .board-table tr.me td:first-child::before { content: "▸ "; color: var(--accent); }
+/* Collapsible card headers (market list, criteria). */
+.card-head.collapsible { cursor: pointer; user-select: none; }
+.card-head.collapsible:hover h4 { color: var(--text); }
+.chev { color: var(--accent); font-size: 12px; margin-right: 2px; }
+/* Chart + OI pane column (TradingView-style subchart below). */
+.chartwrap { display: flex; flex-direction: column; }
+.chart { flex: 1 1 auto; min-height: 0; height: auto; }
+.oi-wrap {
+  position: relative; flex: 0 0 120px; height: 120px;
+  border-top: 1px solid var(--line); background: var(--bg1);
+}
+.oi-label {
+  position: absolute; top: 6px; left: 10px; z-index: 5; pointer-events: none;
+  font-size: 11px; font-weight: 700; color: #e0af68;
+  background: rgba(11, 14, 19, 0.7); border-radius: 5px; padding: 1px 8px;
+}
+/* Fixed-range volume profile of the visible bars (right side, POC flagged).
+ * Pointer-events none: panning/placement clicks pass through to the chart. */
+.vp-profile {
+  position: absolute; z-index: 4; pointer-events: none;
+  top: 0; bottom: 26px; right: 66px; width: 120px;
+  display: flex; flex-direction: column; justify-content: stretch;
+}
+.vp-row { position: relative; width: 100%; }
+.vp-bar {
+  position: absolute; right: 0; top: 1px; bottom: 1px;
+  background: rgba(74, 158, 196, 0.35); border-radius: 2px 0 0 2px;
+}
+.vp-row.poc .vp-bar { background: rgba(224, 175, 104, 0.55); }
+.vp-poc {
+  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+  font-size: 10px; font-weight: 700; color: #e0af68;
+  background: rgba(11, 14, 19, 0.8); border-radius: 4px; padding: 0 5px;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}

@@ -117,12 +117,27 @@ frontend/test             pure protocol/math tests (bun test / npm test)
 **Chart.** OHLC bars + volume (Lightweight Charts). Snapshot → `setData()`,
 ticks → `update()`; crosshair, zoom, pan and fills markers stay local.
 
-**Coin list** (top card of the right panel). Add coins (`BASE/QUOTE` input,
-Enter or `+`), remove them (`×`), flag them (flag icon → the coin moves into
-the pinned "флаг" group above the rest). Clicking a row switches the
-session's series in Rust; removing the active coin jumps to the next one.
-The list persists per browser (localStorage); the timeframe picker and the
-live price of the active coin live in the same card.
+**Open interest + CVD** (pane under the chart, TradingView-style). A separate
+chart with two line series on opposite scales: OI on the right, cumulative
+volume delta on the left; the time axis syncs both ways with the main chart.
+Toggle with the `OI` / `CVD` buttons (persisted per browser; the pane hides
+when both are off). OI comes in the snapshot (`oi` + `oi_period`) as static
+context — never replayed; CVD is computed client-side over the loaded series
+and follows every tick. Empty OI when the perp is missing or futures are
+unreachable.
+
+**Volume profile** (right side of the chart). Fixed-range horizontal volume
+over the VISIBLE bars: 24 levels, POC flagged with its price. Recomputed on
+every pan/zoom/data tick, so it always matches the bars on screen; clicks
+pass through to the chart.
+
+**Coin list** (top card of the right panel, collapsible via the header).
+Add coins (`BASE/QUOTE` input, Enter or `+`), remove them (`×`), flag them
+(flag icon → the coin moves into the pinned "флаг" group above the rest).
+Clicking a row switches the session's series in Rust; removing the active coin
+jumps to the next one. The list and its collapsed state persist per browser
+(localStorage); the timeframe picker and the live price of the active coin
+live in the same card.
 
 **Drawings** (icon toolbar, top-right inside the chart; all local, never trade
 signals; drag to move with bar magnet, right-click / `Del` to delete,
@@ -140,10 +155,11 @@ signals; drag to move with bar magnet, right-click / `Del` to delete,
 Multi-click placement uses manual mouseup detection (the chart's own click
 event swallows rapid clicks and silently ate drawing points).
 
-**Criteria** (right-panel card). 30 setup checkboxes with a search filter;
-selected ones render as chips in the chart's top-left overlay (max 8 + `+N`,
-clicks pass through to the chart). Selection persists per browser
-(localStorage); pure UI, never a trade signal.
+**Criteria** (right-panel card, collapsible via the header). 30 setup
+checkboxes with a search filter; selected ones render as chips in the
+chart's top-left overlay (max 8 + `+N`, clicks pass through to the chart).
+Selection and collapsed state persist per browser (localStorage); pure UI,
+never a trade signal.
 
 **Challenge** (right-panel card + topbar badge). Passwordless nick: the server
 assigns a random nick per session (`Быстрый-Бык-42`), typing your own overrides
@@ -380,6 +396,10 @@ needs no Python to load data:
   5 000 bars, paginated (1 000/page, 150 ms between pages), hosts tried in
   order `api.binance.com` → `data-api.binance.vision` (geo-restriction
   mirror). Success writes the cache so the next run is offline-instant.
+- Open interest: USDT-M futures `openInterestHist` (no API key), mapped
+  1m→5m (Binance has no 1m OI), up to 1 500 points, cached as
+  `data/ohlcv/{SYMBOL}_oi_{period}.csv`. No futures mirror exists — a
+  geo-block here means "no OI", klines still work.
 - `--offline` disables downloads (synthetic fallback only). Unit tests always
   run offline (`Engine::new` defaults `allow_net=false`).
 - Offline / bad symbol / empty range → deterministic synthetic data

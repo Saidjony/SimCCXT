@@ -6,6 +6,7 @@ import {
   barWord,
   calcQty,
   countBars,
+  cumulativeDelta,
   formatRuler,
   invertTime,
   positionBands,
@@ -14,6 +15,7 @@ import {
   rulerStats,
   snapTime,
   toBox,
+  volumeProfile,
 } from "../src/chart/overlays.ts";
 
 describe("toBox", () => {
@@ -108,5 +110,56 @@ describe("calcQty", () => {
     assert.equal(barWord(1), "бар");
     assert.equal(barWord(3), "бара");
     assert.equal(barWord(5), "баров");
+  });
+});
+
+describe("cumulativeDelta", () => {
+  it("adds volume on up bars, subtracts on down bars", () => {
+    // [ts, o, h, l, c, v]
+    const rows = [
+      [1, 10, 11, 9, 11, 5],
+      [2, 11, 12, 10, 10, 3],
+      [3, 10, 10, 10, 10, 7],
+    ] as Array<[number, number, number, number, number, number]>;
+    assert.deepEqual(cumulativeDelta(rows), [5, 2, 9]);
+  });
+
+  it("is empty without bars", () => {
+    assert.deepEqual(cumulativeDelta([]), []);
+  });
+});
+
+describe("volumeProfile", () => {
+  // two bars: up bar 10→12 vol 4, down bar 12→10 vol 6
+  const rows = [
+    [1, 10, 12, 10, 12, 4],
+    [2, 12, 12, 10, 10, 6],
+  ] as Array<[number, number, number, number, number, number]>;
+
+  it("splits the visible range into levels top-down with a POC", () => {
+    const { rows: levels, poc } = volumeProfile(rows, 0, 1, 2);
+    assert.equal(levels.length, 2);
+    assert.ok(levels[0].price > levels[1].price);
+    // all 10 units of volume are assigned somewhere
+    const total = levels.reduce((s, r) => s + r.volume, 0);
+    assert.ok(Math.abs(total - 10) < 1e-9);
+    const pocs = levels.filter((r) => r.poc);
+    assert.equal(pocs.length, 1);
+    assert.equal(poc, pocs[0].price);
+  });
+
+  it("clamps out-of-range indices and tolerates reversed order", () => {
+    const fwd = volumeProfile(rows, 0, 1, 4);
+    const rev = volumeProfile(rows, 1, 0, 4);
+    const far = volumeProfile(rows, -100, 999, 4);
+    assert.deepEqual(rev.rows.map((r) => r.volume), fwd.rows.map((r) => r.volume));
+    assert.deepEqual(far.rows.map((r) => r.volume), fwd.rows.map((r) => r.volume));
+  });
+
+  it("handles empty input and a single level", () => {
+    assert.deepEqual(volumeProfile([], 0, 5).rows, []);
+    const one = volumeProfile(rows, 0, 0, 1);
+    assert.equal(one.rows.length, 1);
+    assert.equal(one.rows[0].poc, true);
   });
 });

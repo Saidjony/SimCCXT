@@ -82,6 +82,7 @@ export function CoinList(): JSX.Element {
   const timeframe = useSim((s) => s.timeframe);
   const lastPrice = useSim((s) => s.lastPrice);
   const status = useSim((s) => s.status);
+  const collapsed = useSim((s) => s.collapsedMarket);
   const [input, setInput] = useState("");
   const [formErr, setFormErr] = useState<string | null>(null);
 
@@ -132,11 +133,16 @@ export function CoinList(): JSX.Element {
 
   return (
     <div className="card">
-      <div className="card-head">
-        <h4>Рынок</h4>
+      <div
+        className="card-head collapsible"
+        onClick={() => store.setCollapsedMarket(!collapsed)}
+        title={collapsed ? "развернуть" : "свернуть"}
+      >
+        <h4><span className="chev">{collapsed ? "▸" : "▾"}</span> Рынок</h4>
         <select
           className="tf-select"
           value={timeframe}
+          onClick={(e) => e.stopPropagation()}
           onChange={(e) => sendSim({ type: "subscribe", symbol, timeframe: e.target.value })}
         >
           {TIMEFRAMES.map((t) => (
@@ -144,6 +150,8 @@ export function CoinList(): JSX.Element {
           ))}
         </select>
       </div>
+      {!collapsed && (
+      <>
       <div className="coin-list">
         {flagged.length > 0 && (
           <>
@@ -185,6 +193,8 @@ export function CoinList(): JSX.Element {
         {" · "}
         {status === "open" ? "● live" : status}
       </div>
+      </>
+      )}
     </div>
   );
 }

@@ -158,6 +158,55 @@ function persistUser(name: string, inChallenge: boolean): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// UI preferences: OI pane visibility + collapsed cards. Pure UI, per browser.
+// ---------------------------------------------------------------------------
+
+const UI_KEY = "simccxt.ui.v1";
+
+interface UiPrefs {
+  oiVisible: boolean;
+  cvdVisible: boolean;
+  collapsedMarket: boolean;
+  collapsedCriteria: boolean;
+}
+
+function loadUi(): UiPrefs {
+  const dflt: UiPrefs = { oiVisible: true, cvdVisible: true, collapsedMarket: false, collapsedCriteria: false };
+  try {
+    const raw = window.localStorage.getItem(UI_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<UiPrefs>;
+      return {
+        oiVisible: parsed.oiVisible !== false,
+        cvdVisible: parsed.cvdVisible !== false,
+        collapsedMarket: parsed.collapsedMarket === true,
+        collapsedCriteria: parsed.collapsedCriteria === true,
+      };
+    }
+  } catch {
+    // private mode / corrupt data: defaults
+  }
+  return dflt;
+}
+
+function persistUi(p: UiPrefs): void {
+  try {
+    window.localStorage.setItem(UI_KEY, JSON.stringify(p));
+  } catch {
+    // storage unavailable: still works for this page load
+  }
+}
+
+function currentUi(): UiPrefs {
+  return {
+    oiVisible: state.oiVisible,
+    cvdVisible: state.cvdVisible,
+    collapsedMarket: state.collapsedMarket,
+    collapsedCriteria: state.collapsedCriteria,
+  };
+}
+
 export interface SimState {
   status: "connecting" | "open" | "closed";
   clientId: number | null;
@@ -194,6 +243,17 @@ export interface SimState {
   inChallenge: boolean;
   /** Last challenge board broadcast by the server (no `to`: for everyone). */
   board: ChallengeEntry[];
+  /** Open-interest history from the snapshot (static context, [[ts, usdt]]). */
+  oi: Array<[number, number]>;
+  /** OI grid actually loaded ("5m", "" when none). */
+  oiPeriod: string;
+  /** Show the OI pane under the chart (TradingView-style, toggleable). */
+  oiVisible: boolean;
+  /** Show the CVD line in the bottom pane (cumulative volume delta). */
+  cvdVisible: boolean;
+  /** Collapsed right-panel cards (persisted UI preference). */
+  collapsedMarket: boolean;
+  collapsedCriteria: boolean;
   /** Wall-clock ms of the last message from Rust (any type). */
   lastMsgAt: number;
   /** How many reconnects this page has done (diagnostics). */
@@ -237,6 +297,12 @@ let state: SimState = {
   serverNick: "",
   inChallenge: loadUser().inChallenge,
   board: [],
+  oi: [],
+  oiPeriod: "",
+  oiVisible: loadUi().oiVisible,
+  cvdVisible: loadUi().cvdVisible,
+  collapsedMarket: loadUi().collapsedMarket,
+  collapsedCriteria: loadUi().collapsedCriteria,
   lastMsgAt: 0,
   reconnects: 0,
 };
@@ -291,6 +357,8 @@ export const store = {
     candles: CandleRow[],
     account: AccountSnapshot,
     replay: ReplayState,
+    oi: Array<[number, number]>,
+    oiPeriod: string,
   ): void {
     set({
       symbol,
@@ -301,6 +369,8 @@ export const store = {
       lastPrice: candles.length ? candles[candles.length - 1][4] : 0,
       account,
       replay,
+      oi,
+      oiPeriod,
       error: null,
     });
   },
@@ -385,6 +455,26 @@ export const store = {
   },
   applyBoard(board: ChallengeEntry[]): void {
     set({ board });
+  },
+  setOiVisible(v: boolean): void {
+    if (state.oiVisible === v) return;
+    set({ oiVisible: v });
+    persistUi({ ...currentUi(), oiVisible: v });
+  },
+  setCvdVisible(v: boolean): void {
+    if (state.cvdVisible === v) return;
+    set({ cvdVisible: v });
+    persistUi({ ...currentUi(), cvdVisible: v });
+  },
+  setCollapsedMarket(v: boolean): void {
+    if (state.collapsedMarket === v) return;
+    set({ collapsedMarket: v });
+    persistUi({ ...currentUi(), collapsedMarket: v });
+  },
+  setCollapsedCriteria(v: boolean): void {
+    if (state.collapsedCriteria === v) return;
+    set({ collapsedCriteria: v });
+    persistUi({ ...currentUi(), collapsedCriteria: v });
   },
   /** Add a coin (already-normalized symbol). Returns null if dup/invalid. */
   addCoin(raw: string): string | null {

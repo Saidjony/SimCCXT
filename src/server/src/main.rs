@@ -66,7 +66,8 @@ use tokio::sync::broadcast;
 // Rust -> frontend:
 //   {"type":"welcome","client_id":7}
 //   {"type":"snapshot","to":7,"symbol":..,"timeframe":..,"candles":[[ts,o,h,l,c,v]..],
-//    "account":{..},"replay":{..}}
+//    "account":{..},"replay":{..},"oi":[[ts_ms,usdt]..],"oi_period":"5m"}
+//   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
 //   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
 //   {"type":"market_update","to":7,"symbol":..,"last":..,"timestamp":..}
 //   {"type":"account_update","to":7,"account":{..}}
@@ -204,6 +205,8 @@ struct Session {
     nick: String,      // challenge display name (random at creation)
     in_challenge: bool, // opt-in: publish nick+stats on the shared board
     risk_usdt: f64,    // fixed risk per trade, sent by the frontend on join
+    oi: Vec<(i64, f64)>, // open-interest history (ts_ms, USDT value), context only
+    oi_period: String, // OI grid actually loaded ("5m", "" when none)
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +349,7 @@ fn ack_replay(s: &Session, request_id: Option<String>) -> Value {
 fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
     // Only bars <= now: the chart reveals one new bar per tick instead of
     // the whole future at once. Later steps arrive as `candle` deltas.
+    // OI rides along whole (static context, never replayed): [[ts_ms, usdt]].
     let mut rows = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe);
     if rows.len() > SNAPSHOT_CAP {
         rows = rows[rows.len() - SNAPSHOT_CAP..].to_vec();
@@ -357,6 +361,8 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "candles": rows,
         "account": s.ex.account_snapshot(),
         "replay": replay_json(s),
+        "oi": s.oi,
+        "oi_period": s.oi_period,
         "request_id": request_id,
     })
 }
@@ -425,6 +431,8 @@ fn new_session(nick: String) -> Session {
         nick,
         in_challenge: false,
         risk_usdt: 0.0,
+        oi: Vec::new(),
+        oi_period: String::new(),
     }
 }
 
@@ -441,6 +449,7 @@ fn use_series(
     s.step_ms = tf_step_ms(&s.timeframe);
     s.ex.set_step_ms(s.step_ms);
     ensure_series(&mut s.ex, &s.symbol, &s.timeframe, data_dir, allow_net);
+    ensure_oi(&mut s.oi, &mut s.oi_period, &s.symbol, &s.timeframe, data_dir, allow_net);
     let rows = s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None);
     if let Some(first) = rows.first() {
         let ts = DateTime::from_timestamp_millis(first[0] as i64).unwrap_or_else(Utc::now);
@@ -836,15 +845,24 @@ fn parse_tif(s: &str) -> Option<simccxt_core::TimeInForce> {
 }
 
 // ---------------------------------------------------------------------------
-// Market-data loading (memory → disk cache → Binance download → synthetic)
+// Market-data loading via ccxt (memory → disk cache → Binance → synthetic)
 // ---------------------------------------------------------------------------
 
 /// Public Binance klines hosts, tried in order (api.binance.com is
 /// geo-restricted in some regions with HTTP 451 — the vision mirror is not).
+/// Direct REST (not the `ccxt` crate): ccxt needs >19GB RAM just to compile
+/// and gets OOM-killed on ordinary machines, which would break every build.
+/// This stays small, proven, and keeps the mirror fallback.
 const BINANCE_HOSTS: [&str; 2] = ["https://api.binance.com", "https://data-api.binance.vision"];
-/// How many bars to pull when a series is missing from cache and memory.
+/// How many klines to pull when a series is missing from cache and memory.
 const DOWNLOAD_BARS: usize = 5_000;
-/// Politeness pause between klines pages (Binance rate limit).
+/// Binance klines page cap.
+const KLINES_PAGE: u32 = 1_000;
+/// How many open-interest points to keep (coarser grid than klines).
+const OI_POINTS: usize = 1_500;
+/// Binance OI-history page cap.
+const OI_PAGE: u32 = 500;
+/// Politeness pause between download pages (Binance rate limit).
 const PAGE_PAUSE: Duration = Duration::from_millis(150);
 
 /// Step size per timeframe.
@@ -932,7 +950,8 @@ fn save_csv(path: &Path, candles: &[OHLCV]) -> Result<(), String> {
     Ok(())
 }
 
-/// `"DOGE/USDT"` → `"DOGEUSDT"` (Binance spot symbol). `None` if not BASE/QUOTE.
+/// `"DOGE/USDT"` → `"DOGEUSDT"` (Binance symbol, spot klines and USDT-M
+/// futures alike). `None` if not BASE/QUOTE.
 fn to_binance_symbol(symbol: &str) -> Option<String> {
     let parts: Vec<&str> = symbol.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -957,8 +976,37 @@ fn parse_kline_row(row: &Value) -> Option<OHLCV> {
     Some(OHLCV::new(dt, num(1)?, num(2)?, num(3)?, num(4)?, num(5)?))
 }
 
+/// One OI-history row → `(ts_ms, USDT value)`: `{sumOpenInterestValue,
+/// sumOpenInterest, timestamp}` (numbers arrive as JSON strings).
+fn parse_oi_row(row: &Value) -> Option<(i64, f64)> {
+    let ts = row.get("timestamp")?.as_i64()?;
+    let str_num = |k: &str| -> Option<f64> {
+        match row.get(k)? {
+            Value::String(s) => s.parse().ok(),
+            Value::Number(n) => n.as_f64(),
+            _ => None,
+        }
+    };
+    let v = str_num("sumOpenInterestValue").or_else(|| str_num("sumOpenInterest"))?;
+    if v.is_finite() {
+        Some((ts, v))
+    } else {
+        None
+    }
+}
+
+/// Shared HTTP agent (15s global timeout).
+fn http_agent() -> ureq::Agent {
+    // ureq 3: timeout lives on the agent, not the request builder.
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build()
+        .into()
+}
+
 /// One klines page from `host`. Non-2xx / transport / JSON errors → `Err`.
 fn fetch_klines_page(
+    agent: &ureq::Agent,
     host: &str,
     sym: &str,
     tf: &str,
@@ -970,11 +1018,6 @@ fn fetch_klines_page(
         "{host}/api/v3/klines?symbol={sym}&interval={tf}\
          &startTime={start_ms}&endTime={end_ms}&limit={limit}"
     );
-    // ureq 3: timeout lives on the agent, not the request builder.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(15)))
-        .build()
-        .into();
     let mut res = agent
         .get(&url)
         .header("User-Agent", "simccxt/0.1")
@@ -986,6 +1029,34 @@ fn fetch_klines_page(
     let body = res.body_mut().read_to_string().map_err(|e| format!("{host}: {e}"))?;
     let rows: Vec<Value> = serde_json::from_str(&body).map_err(|e| format!("{host}: {e}"))?;
     Ok(rows.iter().filter_map(parse_kline_row).collect())
+}
+
+/// One open-interest-history page from the USDT-M futures API
+/// (no mirror host exists for futures — a 451 here means "no OI").
+fn fetch_oi_page(
+    agent: &ureq::Agent,
+    sym: &str,
+    period: &str,
+    start_ms: i64,
+    end_ms: i64,
+    limit: u32,
+) -> Result<Vec<(i64, f64)>, String> {
+    let url = format!(
+        "https://fapi.binance.com/futures/data/openInterestHist\
+         ?symbol={sym}&period={period}\
+         &startTime={start_ms}&endTime={end_ms}&limit={limit}"
+    );
+    let mut res = agent
+        .get(&url)
+        .header("User-Agent", "simccxt/0.1")
+        .call()
+        .map_err(|e| format!("fapi: {e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("fapi: HTTP {}", res.status()));
+    }
+    let body = res.body_mut().read_to_string().map_err(|e| format!("fapi: {e}"))?;
+    let rows: Vec<Value> = serde_json::from_str(&body).map_err(|e| format!("fapi: {e}"))?;
+    Ok(rows.iter().filter_map(parse_oi_row).collect())
 }
 
 /// Download the most recent `bars` klines for `symbol@tf` from Binance
@@ -1003,12 +1074,12 @@ fn download_series(symbol: &str, tf: &str, bars: usize) -> Result<Vec<OHLCV>, St
     let mut out: Vec<OHLCV> = Vec::with_capacity(bars);
     let mut cursor = start_ms;
     let mut last_err: Option<String> = None;
+    let agent = http_agent();
 
     while cursor <= end_ms && out.len() < bars {
-        let limit = 1000u32; // Binance page cap
         let mut page: Option<Vec<OHLCV>> = None;
         for host in BINANCE_HOSTS {
-            match fetch_klines_page(host, &sym, tf, cursor, end_ms, limit) {
+            match fetch_klines_page(&agent, host, &sym, tf, cursor, end_ms, KLINES_PAGE) {
                 Ok(rows) => {
                     page = Some(rows);
                     break;
@@ -1020,7 +1091,7 @@ fn download_series(symbol: &str, tf: &str, bars: usize) -> Result<Vec<OHLCV>, St
         if rows.is_empty() {
             break;
         }
-        let short = rows.len() < limit as usize;
+        let short = rows.len() < KLINES_PAGE as usize;
         let last_open = rows
             .last()
             .map(|c| c.timestamp.timestamp_millis())
@@ -1038,6 +1109,102 @@ fn download_series(symbol: &str, tf: &str, bars: usize) -> Result<Vec<OHLCV>, St
     }
     out.sort_by_key(|c| c.timestamp.timestamp_millis());
     out.dedup_by_key(|c| c.timestamp.timestamp_millis());
+    Ok(out)
+}
+
+/// OI history grid per chart timeframe (Binance panics on 1m — map to 5m).
+fn oi_period(tf: &str) -> Option<&'static str> {
+    match tf {
+        "1s" | "1m" | "5m" => Some("5m"),
+        "15m" => Some("15m"),
+        "1h" => Some("1h"),
+        "4h" => Some("4h"),
+        "1d" => Some("1d"),
+        _ => None,
+    }
+}
+
+fn oi_file(symbol: &str, period: &str) -> String {
+    format!("{}_oi_{}.csv", symbol.replace('/', "").to_uppercase(), period)
+}
+
+/// Write `[(ts_ms, value)]` cache rows (`ts_ms,oi`).
+fn save_pairs_csv(path: &Path, rows: &[(i64, f64)]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut wtr = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
+    wtr.write_record(["ts_ms", "oi"]).map_err(|e| e.to_string())?;
+    for (ts, v) in rows {
+        wtr.write_record([ts.to_string(), v.to_string()])
+            .map_err(|e| e.to_string())?;
+    }
+    wtr.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_pairs_csv(path: &PathBuf) -> Option<Vec<(i64, f64)>> {
+    let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(path).ok()?;
+    let mut out = Vec::new();
+    for rec in rdr.records().flatten() {
+        if rec.len() < 2 {
+            continue;
+        }
+        let ms = parse_ts_ms(rec.get(0).unwrap_or(""))?;
+        let v = rec.get(1).unwrap_or("").parse::<f64>().ok()?;
+        out.push((ms, v));
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Download open-interest history (USDT value) for the USDT-M perp matching
+/// `symbol@tf`, paginated. Unlike klines, the OI endpoint returns the LATEST
+/// `limit` rows of the window — so pages walk BACKWARD via `endTime`.
+/// No mirror exists for futures: a 451/geo error here means "no OI"
+/// (klines still work via the mirror).
+fn download_oi(symbol: &str, tf: &str, points: usize) -> Result<Vec<(i64, f64)>, String> {
+    let period = oi_period(tf).ok_or_else(|| format!("no OI grid for {tf}"))?;
+    let sym = to_binance_symbol(symbol).ok_or_else(|| format!("bad symbol {symbol}"))?;
+    let step = tf_step_ms(period) as i64;
+    let end_ms = Utc::now().timestamp_millis();
+    let start_ms = end_ms - (points as i64) * step;
+    let mut out: Vec<(i64, f64)> = Vec::with_capacity(points);
+    let mut end = end_ms;
+    let mut last_err: Option<String> = None;
+    let agent = http_agent();
+
+    while end > start_ms && out.len() < points {
+        match fetch_oi_page(&agent, &sym, period, start_ms, end, OI_PAGE) {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    break;
+                }
+                let short = rows.len() < OI_PAGE as usize;
+                let mut first_ts = end;
+                for (ts, v) in rows {
+                    if ts >= start_ms && ts <= end {
+                        out.push((ts, v));
+                        first_ts = first_ts.min(ts);
+                    }
+                }
+                if short || first_ts <= start_ms || first_ts >= end {
+                    break;
+                }
+                end = first_ts - 1;
+                std::thread::sleep(PAGE_PAUSE);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return Err(last_err.unwrap_or_else(|| "no open interest returned".into()));
+    }
+    out.sort_by_key(|r| r.0);
+    out.dedup_by_key(|r| r.0);
     Ok(out)
 }
 
@@ -1067,6 +1234,48 @@ fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
         price = c;
     }
     out
+}
+
+/// Make sure open interest for `symbol@timeframe` is loaded into the
+/// session: disk cache → ccxt download (saved to cache) → empty + log.
+/// OI is chart context, never replayed: no synthetic fallback (an invented
+/// OI curve would be worse than none).
+fn ensure_oi(
+    oi: &mut Vec<(i64, f64)>,
+    oi_period_out: &mut String,
+    symbol: &str,
+    tf: &str,
+    data_dir: &Path,
+    allow_net: bool,
+) {
+    oi.clear();
+    oi_period_out.clear();
+    let Some(period) = oi_period(tf) else { return };
+    let path = data_dir.join(oi_file(symbol, period));
+    if let Some(rows) = load_pairs_csv(&path) {
+        log!("[engine] {symbol} OI@{period}: {} pts from cache ({})", rows.len(), path.display());
+        *oi = rows;
+        *oi_period_out = period.to_string();
+        return;
+    }
+    if allow_net {
+        log!("[engine] {symbol} OI@{period}: no cache, downloading…");
+        match download_oi(symbol, tf, OI_POINTS) {
+            Ok(rows) => {
+                if let Err(e) = save_pairs_csv(&path, &rows) {
+                    log!("[engine] {symbol} OI@{period}: cache write failed: {e}");
+                }
+                log!(
+                    "[engine] {symbol} OI@{period}: {} pts from binance (cached {})",
+                    rows.len(),
+                    path.display()
+                );
+                *oi = rows;
+                *oi_period_out = period.to_string();
+            }
+            Err(e) => log!("[engine] {symbol} OI@{period}: download failed: {e}"),
+        }
+    }
 }
 
 /// Make sure `symbol@timeframe` is loaded. Order: already in memory →
@@ -1416,6 +1625,23 @@ mod tests {
     }
 
     #[test]
+    fn oi_row_parses_value() {
+        let row = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "sumOpenInterest": "12345.6",
+            "sumOpenInterestValue": "987654321.5",
+            "timestamp": 1789257600000i64,
+        });
+        assert_eq!(parse_oi_row(&row), Some((1_789_257_600_000, 987654321.5)));
+        // Falls back to the base-asset amount when value is missing.
+        let row2 = serde_json::json!({
+            "symbol": "BTCUSDT", "sumOpenInterest": "12345.6", "timestamp": 1i64,
+        });
+        assert_eq!(parse_oi_row(&row2), Some((1, 12345.6)));
+        assert_eq!(parse_oi_row(&serde_json::json!({"a": 1})), None);
+    }
+
+    #[test]
     fn save_and_load_csv_roundtrip() {
         let dir = std::env::temp_dir().join(format!("simccxt-csv-{}", std::process::id()));
         let path = dir.join("TESTUSDT_1m.csv");
@@ -1441,6 +1667,28 @@ mod tests {
         // No network needed: validation fails before any request.
         let err = download_series("BTC/USDT", "7m", 10).unwrap_err();
         assert!(err.contains("unsupported timeframe"), "{err}");
+        assert!(download_oi("BTC/USDT", "7m", 10).is_err());
+    }
+
+    #[test]
+    fn oi_grid_mapping() {
+        // Binance has no 1m OI: we map to 5m instead.
+        assert_eq!(oi_period("1m"), Some("5m"));
+        assert_eq!(oi_period("1s"), Some("5m"));
+        assert_eq!(oi_period("15m"), Some("15m"));
+        assert_eq!(oi_period("1h"), Some("1h"));
+        assert_eq!(oi_period("7m"), None);
+    }
+
+    #[test]
+    fn oi_cache_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("simccxt-oi-{}", std::process::id()));
+        let path = dir.join("BTCUSDT_oi_5m.csv");
+        let rows = vec![(1_789_257_600_000i64, 1_234_567.5), (1_789_257_900_000i64, 1_300_000.0)];
+        save_pairs_csv(&path, &rows).expect("save");
+        let back = load_pairs_csv(&path).expect("load");
+        assert_eq!(back, rows);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

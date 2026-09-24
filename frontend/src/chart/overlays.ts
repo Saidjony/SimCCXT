@@ -168,3 +168,92 @@ export function calcQty(riskUsdt: number, entry: number, sl: number): number | n
   const qty = riskUsdt / dist;
   return Number.isFinite(qty) && qty > 0 ? qty : null;
 }
+
+export type OhlcRow = [number, number, number, number, number, number];
+
+/**
+ * Cumulative volume delta over the whole series: +volume on up bars
+ * (close >= open), -volume on down bars. Recomputed per tick; 10k bars
+ * is far below a millisecond, so no incremental bookkeeping.
+ */
+export function cumulativeDelta(rows: OhlcRow[]): number[] {
+  const out: number[] = new Array(rows.length);
+  let acc = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    acc += r[4] >= r[1] ? r[5] : -r[5];
+    out[i] = acc;
+  }
+  return out;
+}
+
+export interface ProfileRow {
+  /** Level mid price. */
+  price: number;
+  /** Volume assigned to the level. */
+  volume: number;
+  /** Point of control (max-volume level). */
+  poc: boolean;
+}
+
+/**
+ * Fixed-range volume profile over bar indices [fromIdx, toIdx] (inclusive,
+ * clamped, order-insensitive): splits the visible high–low range into
+ * `levels` rows and spreads each bar's volume across overlapped rows by
+ * overlap fraction. Returns rows top (high) → bottom (low), POC flagged.
+ * Pure — the chart calls it on every pan/zoom/data tick with the visible
+ * logical range, so the profile always matches the bars on screen.
+ */
+export function volumeProfile(
+  rows: OhlcRow[],
+  fromIdx: number,
+  toIdx: number,
+  levels = 24,
+): { rows: ProfileRow[]; poc: number | null } {
+  const n = rows.length;
+  if (!n || levels < 1) return { rows: [], poc: null };
+  const a = Math.max(0, Math.min(n - 1, Math.floor(fromIdx)));
+  const b = Math.max(0, Math.min(n - 1, Math.ceil(toIdx)));
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  let mn = Infinity;
+  let mx = -Infinity;
+  for (let i = lo; i <= hi; i++) {
+    const r = rows[i];
+    if (r[3] < mn) mn = r[3];
+    if (r[2] > mx) mx = r[2];
+  }
+  if (!Number.isFinite(mn) || !(mx > mn)) {
+    const p = Number.isFinite(mn) ? mn : 0;
+    let v = 0;
+    for (let i = lo; i <= hi; i++) v += rows[i][5];
+    return { rows: [{ price: p, volume: v, poc: true }], poc: p };
+  }
+  const vols: number[] = new Array(levels).fill(0);
+  const h = (mx - mn) / levels;
+  for (let i = lo; i <= hi; i++) {
+    const r = rows[i];
+    const span = r[2] - r[3];
+    if (!(span > 0)) {
+      const k = Math.min(levels - 1, Math.max(0, Math.floor((r[4] - mn) / h)));
+      vols[k] += r[5];
+      continue;
+    }
+    const k0 = Math.max(0, Math.floor((r[3] - mn) / h));
+    const k1 = Math.min(levels - 1, Math.floor((r[2] - mn) / h));
+    for (let k = k0; k <= k1; k++) {
+      const cellLo = mn + k * h;
+      const ov = Math.min(r[2], cellLo + h) - Math.max(r[3], cellLo);
+      if (ov > 0) vols[k] += (r[5] * ov) / span;
+    }
+  }
+  let pocK = 0;
+  for (let k = 1; k < levels; k++) {
+    if (vols[k] > vols[pocK]) pocK = k;
+  }
+  const out: ProfileRow[] = [];
+  for (let k = levels - 1; k >= 0; k--) {
+    out.push({ price: mn + (k + 0.5) * h, volume: vols[k], poc: k === pocK });
+  }
+  return { rows: out, poc: mn + (pocK + 0.5) * h };
+}

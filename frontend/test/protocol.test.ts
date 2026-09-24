@@ -36,6 +36,18 @@ describe("parseServerMessage", () => {
     assert.equal(parseServerMessage('{"no":"type"}'), null);
   });
 
+  it("accepts a snapshot with open interest", () => {
+    const m = parseServerMessage(
+      '{"type":"snapshot","symbol":"BTC/USDT","timeframe":"1m","candles":[],' +
+      '"account":{},"replay":{},"oi":[[1000,5.5]],"oi_period":"5m"}',
+    );
+    assert.equal(m?.type, "snapshot");
+    if (m?.type === "snapshot") {
+      assert.deepEqual(m.oi, [[1000, 5.5]]);
+      assert.equal(m.oi_period, "5m");
+    }
+  });
+
   it("accepts challenge traffic (login_ok / challenge_ok / board)", () => {
     const ok = parseServerMessage('{"type":"login_ok","to":7,"nick":"Бык-1"}');
     assert.equal(ok?.type, "login_ok");

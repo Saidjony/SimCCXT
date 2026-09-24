@@ -125,6 +125,9 @@ export type ServerMessage =
       candles: CandleRow[];
       account: AccountSnapshot;
       replay: ReplayState;
+      /** Open-interest context: [[ts_ms, usdt], ...], static (never replayed). */
+      oi: Array<[number, number]>;
+      oi_period: string;
       request_id?: string;
     }
   | { type: "candle"; to?: number; symbol: string; timeframe: string; candle: CandleRow; is_new: boolean }

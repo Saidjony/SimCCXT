@@ -8,6 +8,7 @@ import { store, useSim } from "../state/store";
  */
 export function CriteriaCard(): JSX.Element {
   const criteria = useSim((s) => s.criteria);
+  const collapsed = useSim((s) => s.collapsedCriteria);
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
   const visible = q
@@ -16,10 +17,16 @@ export function CriteriaCard(): JSX.Element {
 
   return (
     <div className="card">
-      <div className="card-head">
-        <h4>Критерии</h4>
+      <div
+        className="card-head collapsible"
+        onClick={() => store.setCollapsedCriteria(!collapsed)}
+        title={collapsed ? "развернуть" : "свернуть"}
+      >
+        <h4><span className="chev">{collapsed ? "▸" : "▾"}</span> Критерии</h4>
         <span className="lbl">{criteria.length} / {CRITERIA.length}</span>
       </div>
+      {!collapsed && (
+      <>
       <div className="coin-add" style={{ marginBottom: 6 }}>
         <input
           value={query}
@@ -46,6 +53,8 @@ export function CriteriaCard(): JSX.Element {
         ))}
         {visible.length === 0 && <div className="lbl">ничего не найдено</div>}
       </div>
+      </>
+      )}
     </div>
   );
 }

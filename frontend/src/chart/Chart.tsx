@@ -19,6 +19,7 @@ import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import {
   countBars,
+  cumulativeDelta,
   formatRuler,
   invertTime,
   positionBands,
@@ -27,6 +28,7 @@ import {
   rulerStats,
   snapTime,
   toBox,
+  volumeProfile,
 } from "./overlays";
 import { DrawBar } from "./DrawBar";
 
@@ -81,6 +83,12 @@ export function Chart(): JSX.Element {
   const chartRef = useRef<IChartApi | null>(null);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const oiWrapRef = useRef<HTMLDivElement | null>(null);
+  const oiChartRef = useRef<IChartApi | null>(null);
+  const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const cvdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  /** Guard against ping-pong when syncing the two time scales. */
+  const syncingRef = useRef(false);
   const pendingRef = useRef<Pt[]>([]);
   const previewRef = useRef<Pt | null>(null);
   const rafRef = useRef(0);
@@ -113,6 +121,9 @@ export function Chart(): JSX.Element {
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
   const criteria = useSim((s) => s.criteria);
+  const oiVisible = useSim((s) => s.oiVisible);
+  const cvdVisible = useSim((s) => s.cvdVisible);
+  const oiPeriod = useSim((s) => s.oiPeriod);
   const toolRef = useRef(tool);
   toolRef.current = tool;
 
@@ -256,6 +267,15 @@ export function Chart(): JSX.Element {
     pushBars(chart, bars, volume, s.candles, s.fullReset);
     store.consumedReset();
     if (followRef.current) chart.timeScale().scrollToRealTime();
+    // OI is static per snapshot: replace the whole line, then re-sync ranges.
+    // CVD follows every tick (cheap full recompute over the loaded series).
+    if (s.fullReset && oiSeriesRef.current && oiChartRef.current) {
+      pushOi(oiSeriesRef.current, s.oi);
+      syncOiToMain();
+    }
+    if (cvdSeriesRef.current) {
+      pushCvd(cvdSeriesRef.current, s.candles);
+    }
     setViewTick((n) => n + 1);
   }, [version]);
 
@@ -280,6 +300,101 @@ export function Chart(): JSX.Element {
       /* timestamps outside the visible series: ignore */
     }
   }, [fills]);
+
+  // Open-interest + CVD pane (TradingView-style subchart below the main
+  // chart): its own chart instance, OI on the right scale, CVD on the left,
+  // time scale synced both ways. Pane lives while either series is on.
+  useEffect(() => {
+    if (!oiVisible && !cvdVisible) {
+      oiChartRef.current = null;
+      oiSeriesRef.current = null;
+      cvdSeriesRef.current = null;
+      return;
+    }
+    const el = oiWrapRef.current;
+    if (!el) return;
+    const oic = createChart(el, {
+      width: el.clientWidth,
+      height: el.clientHeight,
+      layout: {
+        background: { type: ColorType.Solid, color: "#0b0e13" },
+        textColor: "#7d8590",
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: "#141b26" },
+        horzLines: { color: "#141b26" },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: "#222c3b" },
+      leftPriceScale: { visible: true, borderColor: "#222c3b" },
+      timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
+    });
+    const line = oic.addLineSeries({
+      color: "#e0af68",
+      lineWidth: 2,
+      priceLineVisible: false,
+      crosshairMarkerVisible: true,
+    });
+    const cvd = oic.addLineSeries({
+      color: "#4a9ec4",
+      lineWidth: 1,
+      priceScaleId: "left",
+      priceLineVisible: false,
+      crosshairMarkerVisible: true,
+    });
+    oiChartRef.current = oic;
+    oiSeriesRef.current = line;
+    cvdSeriesRef.current = cvd;
+    pushOi(line, getState().oi);
+    pushCvd(cvd, getState().candles);
+    line.applyOptions({ visible: getState().oiVisible });
+    cvd.applyOptions({ visible: getState().cvdVisible });
+    syncOiToMain();
+    const ro = new ResizeObserver(() => {
+      oic.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+    });
+    ro.observe(el);
+    const main = chartRef.current;
+    const onMainRange = (r: unknown): void => {
+      if (!r || syncingRef.current) return;
+      syncingRef.current = true;
+      try {
+        oic.timeScale().setVisibleLogicalRange(r as never);
+      } catch {
+        /* empty OI series: nothing to fit */
+      }
+      syncingRef.current = false;
+    };
+    const onOiRange = (r: unknown): void => {
+      if (!r || syncingRef.current || !main) return;
+      syncingRef.current = true;
+      try {
+        main.timeScale().setVisibleLogicalRange(r as never);
+      } catch {
+        /* out of data range: ignore */
+      }
+      syncingRef.current = false;
+    };
+    main?.timeScale().subscribeVisibleLogicalRangeChange(onMainRange);
+    oic.timeScale().subscribeVisibleLogicalRangeChange(onOiRange);
+    return () => {
+      main?.timeScale().unsubscribeVisibleLogicalRangeChange(onMainRange);
+      oic.timeScale().unsubscribeVisibleLogicalRangeChange(onOiRange);
+      ro.disconnect();
+      oic.remove();
+      oiChartRef.current = null;
+      oiSeriesRef.current = null;
+      cvdSeriesRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [oiVisible, cvdVisible]);
+
+  // Toggle a bottom-pane series without rebuilding the chart.
+  useEffect(() => {
+    oiSeriesRef.current?.applyOptions({ visible: oiVisible });
+    cvdSeriesRef.current?.applyOptions({ visible: cvdVisible });
+  }, [oiVisible, cvdVisible]);
 
   return (
     <div
@@ -310,6 +425,16 @@ export function Chart(): JSX.Element {
       }}
     >
       <div ref={containerRef} className="chart" />
+      {(oiVisible || cvdVisible) && (
+        <div ref={oiWrapRef} className="oi-wrap">
+          <div className="oi-label">
+            {[
+              oiVisible ? (oiPeriod ? "OI · " + oiPeriod : "OI") : "",
+              cvdVisible ? "CVD" : "",
+            ].filter(Boolean).join(" + ")}
+          </div>
+        </div>
+      )}
       <DrawBar />
       {renderOverlays()}
       <div className="coin-info">
@@ -330,6 +455,20 @@ export function Chart(): JSX.Element {
         {tool !== "none" && <div className="coin-status">{TOOL_HINTS[tool]}</div>}
       </div>
       <div className="chart-tools">
+        <button
+          className={oiVisible ? "btn b-acc" : "btn b-dim"}
+          onClick={() => store.setOiVisible(!oiVisible)}
+          title="Открытый интерес — панель под графиком"
+        >
+          OI
+        </button>
+        <button
+          className={cvdVisible ? "btn b-acc" : "btn b-dim"}
+          onClick={() => store.setCvdVisible(!cvdVisible)}
+          title="Cumulative volume delta — линия в нижней панели"
+        >
+          CVD
+        </button>
         <button
           className={follow ? "btn b-acc" : "btn b-dim"}
           onClick={() => {
@@ -381,6 +520,22 @@ export function Chart(): JSX.Element {
   function yToPrice(y: number): number | null {
     const v = barsRef.current?.coordinateToPrice(y);
     return typeof v === "number" ? v : null;
+  }
+
+  /** Fit the OI pane to the main chart's visible range (guarded by callers). */
+  function syncOiToMain(): void {
+    const main = chartRef.current;
+    const oic = oiChartRef.current;
+    if (!main || !oic) return;
+    const r = main.timeScale().getVisibleLogicalRange();
+    if (!r) return;
+    syncingRef.current = true;
+    try {
+      oic.timeScale().setVisibleLogicalRange(r);
+    } catch {
+      /* empty OI series: nothing to fit */
+    }
+    syncingRef.current = false;
   }
 
   function pointFromEvent(e: React.MouseEvent): Pt | null {
@@ -582,6 +737,8 @@ export function Chart(): JSX.Element {
       const el = drawingOverlay(d, false);
       if (el) items.push(el);
     }
+    const vp = profileOverlay();
+    if (vp) items.push(vp);
     // Ghost preview while placing multi-click tools.
     const ghost = ghostOverlay();
     if (ghost) items.push(ghost);
@@ -591,6 +748,44 @@ export function Chart(): JSX.Element {
       if (el) items.push(el);
     }
     return <>{items}</>;
+  }
+
+  /**
+   * Fixed-range volume profile of the VISIBLE bars (right side of the chart,
+   * POC flagged with its price). Recomputed on every pan/zoom/data tick via
+   * viewTick, so it always matches the bars on screen.
+   */
+  function profileOverlay(): JSX.Element | null {
+    const rows = getState().candles;
+    if (rows.length < 2) return null;
+    const range = chartRef.current?.timeScale().getVisibleLogicalRange();
+    const { rows: levels, poc } = volumeProfile(
+      rows,
+      range ? range.from : 0,
+      range ? range.to : rows.length - 1,
+      24,
+    );
+    if (!levels.length || poc === null) return null;
+    const maxV = levels.reduce((m, r) => Math.max(m, r.volume), 0);
+    if (!(maxV > 0)) return null;
+    return (
+      <div key="vp" className="vp-profile">
+        {levels.map((r, i) => (
+          <div
+            key={i}
+            className={"vp-row" + (r.poc ? " poc" : "")}
+            style={{ height: (100 / levels.length).toFixed(3) + "%" }}
+          >
+            <div className="vp-bar" style={{ width: ((r.volume / maxV) * 100).toFixed(1) + "%" }} />
+            {r.poc && (
+              <div className="vp-poc">
+                {r.price.toLocaleString("en-US", { maximumFractionDigits: 1 })}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    );
   }
 
   function drawingOverlay(d: Drawing, ghost: boolean): JSX.Element | null {
@@ -750,6 +945,15 @@ export function Chart(): JSX.Element {
     }
     return null;
   }
+}
+
+function pushOi(line: ISeriesApi<"Line">, rows: Array<[number, number]>): void {
+  line.setData(rows.map(([ms, v]) => ({ time: toTime(ms), value: v })));
+}
+
+function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[]): void {
+  const cvd = cumulativeDelta(rows);
+  line.setData(rows.map((r, i) => ({ time: toTime(r[0]), value: cvd[i] })));
 }
 
 function pushBars(
