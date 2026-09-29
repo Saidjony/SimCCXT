@@ -21,13 +21,19 @@ body {
 }
 .app { display: flex; flex-direction: column; min-height: 100vh; }
 .topbar {
+  position: sticky; top: 0; z-index: 50;
   display: flex; align-items: center; gap: 8px;
   padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--line);
 }
 .logo { font-weight: 700; }
+.exchange-picker {
+  display: flex; align-items: center; gap: 6px; margin-left: 12px;
+  color: var(--muted); font-size: 11px;
+}
+.exchange-picker select { padding: 4px 8px; border-color: #334155; font-weight: 600; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
 .dot.on { background: var(--green); }
-.toprow { display: flex; gap: 0; width: 100%; height: calc(100vh - 155px); min-height: 0; flex: 1 1 auto; }
+.toprow { display: flex; gap: 0; width: 100%; height: calc(100vh - 43px); min-height: 420px; flex: 0 0 auto; }
 .main { flex: 1 1 auto; min-width: 0; min-height: 0; height: 100%; }
 .side {
   width: 336px; flex: 0 0 336px;
@@ -41,7 +47,7 @@ body {
 .side::-webkit-scrollbar-track { background: transparent; }
 .side::-webkit-scrollbar-thumb { background: #2a3342; border-radius: 4px; }
 .side::-webkit-scrollbar-thumb:hover { background: #38445a; }
-.bottom { padding: 8px 10px 12px; }
+.bottom { padding: 12px 10px 20px; }
 .bottom-terminal { margin: 0; }
 .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
 .tab {
@@ -203,8 +209,8 @@ td, th { padding: 3px 4px; }
 .chart-tools { position: absolute; bottom: 14px; right: 14px; z-index: 6; display: flex; gap: 6px; }
 /* Drawing toolbar docked top-right inside the chart. */
 .drawbar {
-  position: absolute; top: 12px; right: 78px; z-index: 6;
-  display: flex; flex-direction: column; gap: 4px;
+  position: absolute; top: 12px; right: 82px; z-index: 6;
+  display: flex; flex-direction: row; gap: 4px;
   background: rgba(11, 14, 19, 0.72); border: 1px solid var(--line);
   border-radius: 10px; padding: 6px;
 }

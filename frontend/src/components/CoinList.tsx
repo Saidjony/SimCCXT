@@ -78,6 +78,7 @@ export function CoinList(): JSX.Element {
   const watchlist = useSim((s) => s.watchlist);
   const symbol = useSim((s) => s.symbol);
   const timeframe = useSim((s) => s.timeframe);
+  const exchange = useSim((s) => s.exchange);
   const lastPrice = useSim((s) => s.lastPrice);
   const status = useSim((s) => s.status);
   const collapsed = useSim((s) => s.collapsedMarket);
@@ -86,7 +87,7 @@ export function CoinList(): JSX.Element {
 
   const switchTo = (sym: string): void => {
     if (sym === symbol) return;
-    sendSim({ type: "subscribe", symbol: sym, timeframe });
+    sendSim({ type: "subscribe", symbol: sym, timeframe, exchange });
   };
 
   const remove = (sym: string): void => {
@@ -96,7 +97,12 @@ export function CoinList(): JSX.Element {
     if (wasActive) {
       const next = getState().watchlist[0];
       if (next) {
-        sendSim({ type: "subscribe", symbol: next.symbol, timeframe: getState().timeframe });
+        sendSim({
+          type: "subscribe",
+          symbol: next.symbol,
+          timeframe: getState().timeframe,
+          exchange: getState().exchange,
+        });
       }
     }
   };

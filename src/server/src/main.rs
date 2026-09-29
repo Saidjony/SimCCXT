@@ -49,7 +49,8 @@ use tokio::sync::broadcast;
 // ---------------------------------------------------------------------------
 //
 // Frontend -> Rust ("type" tagged):
-//   {"type":"subscribe","symbol":"BTC/USDT","timeframe":"1m","request_id":".."}
+//   {"type":"subscribe","symbol":"BTC/USDT","timeframe":"1m",
+//    "exchange":"binance","request_id":".."}
 //   {"type":"place_order","symbol":..,"side":"buy","order_type":"market",
 //    "quantity":0.1,"price":null,"stop_price":null,
 //    "time_in_force":"GTC","post_only":false,"reduce_only":false}
@@ -64,7 +65,8 @@ use tokio::sync::broadcast;
 //
 // Rust -> frontend:
 //   {"type":"welcome","client_id":7}
-//   {"type":"snapshot","to":7,"symbol":..,"timeframe":..,"candles":[[ts,o,h,l,c,v]..],
+//   {"type":"snapshot","to":7,"symbol":..,"timeframe":..,"exchange":"binance",
+//    "candles":[[ts,o,h,l,c,v]..],
 //    "account":{..},"replay":{..},"oi":[[ts_ms,usdt]..],"oi_period":"5m"}
 //   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
 //   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
@@ -114,7 +116,13 @@ const IDLE_POLL_MS: u64 = 50;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientCmd {
-    Subscribe { symbol: String, timeframe: String, request_id: Option<String> },
+    Subscribe {
+        symbol: String,
+        timeframe: String,
+        #[serde(default = "default_exchange")]
+        exchange: String,
+        request_id: Option<String>,
+    },
     PlaceOrder {
         symbol: String,
         side: String,
@@ -152,6 +160,10 @@ enum ClientCmd {
         request_id: Option<String>,
     },
     Ping,
+}
+
+fn default_exchange() -> String {
+    "binance".to_string()
 }
 
 /// One unit of work for the engine thread: a command from a client, or the
@@ -197,6 +209,7 @@ struct Session {
     ex: Exchange,
     symbol: String,
     timeframe: String,
+    exchange: String,
     speed: f64,   // ticks per second while playing
     step_ms: u64, // mirrored from Exchange::set_step_ms (no getter there)
     fed: usize,   // candles already pushed to this client
@@ -313,7 +326,7 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
 struct Engine {
     sessions: HashMap<u64, Session>,
     out: broadcast::Sender<String>,
-    /// Missing series may be downloaded from Binance (false in unit tests,
+    /// Missing series may be downloaded via CCXT (false in unit tests,
     /// and when the server is started with `--offline`).
     allow_net: bool,
 }
@@ -359,6 +372,7 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "type": "snapshot",
         "symbol": s.symbol,
         "timeframe": s.timeframe,
+        "exchange": s.exchange,
         "candles": rows,
         "account": s.ex.account_snapshot(),
         "replay": replay_json(s),
@@ -385,6 +399,7 @@ fn delta_events(s: &mut Session) -> Vec<Value> {
             "type": "candle",
             "symbol": s.symbol,
             "timeframe": s.timeframe,
+            "exchange": s.exchange,
             "candle": bar,
             "is_new": true,
         }));
@@ -423,6 +438,7 @@ fn new_session(nick: String) -> Session {
         ex,
         symbol: String::new(),
         timeframe: String::new(),
+        exchange: default_exchange(),
         speed: DEFAULT_SPEED,
         step_ms: 60_000,
         fed: 0,
@@ -442,16 +458,28 @@ fn use_series(
     s: &mut Session,
     symbol: String,
     timeframe: String,
+    exchange: String,
     data_dir: &Path,
     allow_net: bool,
-) -> String {
+) -> Result<String, String> {
+    let reload = exchange != s.exchange || symbol != s.symbol || timeframe != s.timeframe;
+    ensure_series(
+        &mut s.ex,
+        &exchange,
+        &symbol,
+        &timeframe,
+        data_dir,
+        allow_net,
+        reload,
+    )?;
+    let step_ms = tf_step_ms(&timeframe);
+    let rows = s.ex.fetch_ohlcv(&symbol, &timeframe, None, None);
+    ensure_oi(&mut s.oi, &mut s.oi_period, &exchange, &symbol, &timeframe, data_dir, allow_net);
     s.symbol = symbol;
     s.timeframe = timeframe;
-    s.step_ms = tf_step_ms(&s.timeframe);
+    s.exchange = exchange;
+    s.step_ms = step_ms;
     s.ex.set_step_ms(s.step_ms);
-    ensure_series(&mut s.ex, &s.symbol, &s.timeframe, data_dir, allow_net);
-    ensure_oi(&mut s.oi, &mut s.oi_period, &s.symbol, &s.timeframe, data_dir, allow_net);
-    let rows = s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None);
     if let Some(first) = rows.first() {
         let ts = DateTime::from_timestamp_millis(first[0] as i64).unwrap_or_else(Utc::now);
         s.ex.reset(ts);
@@ -460,7 +488,7 @@ fn use_series(
     s.fed = 0;
     s.fills_seen = s.ex.fetch_fills(None, None).len();
     s.last_step = std::time::Instant::now();
-    format!("{} {} ({} bars)", s.symbol, s.timeframe, rows.len())
+    Ok(format!("{} {} {} ({} bars)", s.exchange, s.symbol, s.timeframe, rows.len()))
 }
 
 impl Engine {
@@ -566,17 +594,29 @@ impl Engine {
                         "type": "challenge_ok", "joined": false, "request_id": request_id }));
                 }
             }
-            ClientCmd::Subscribe { symbol, timeframe, request_id } => {
+            ClientCmd::Subscribe { symbol, timeframe, exchange, request_id } => {
                 let allow_net = self.allow_net;
                 let s = self.session(to);
-                if s.symbol.is_empty() || symbol != s.symbol || timeframe != s.timeframe {
-                    let note = use_series(s, symbol, timeframe, data_dir, allow_net);
-                    log!("[engine] #{to} subscribe -> {note}");
+                let result = if s.symbol.is_empty() || symbol != s.symbol || timeframe != s.timeframe || exchange != s.exchange {
+                    use_series(s, symbol, timeframe, exchange, data_dir, allow_net).map(Some)
+                } else {
+                    Ok(None)
+                };
+                match result {
+                    Ok(Some(note)) => {
+                        log!("[engine] #{to} subscribe -> {note}");
+                        s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
+                        evs.push(snapshot_json(s, request_id));
+                    }
+                    Ok(None) => {
+                        s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
+                        evs.push(snapshot_json(s, request_id));
+                    }
+                    Err(err) => {
+                        log!("[engine] #{to} subscribe failed: {err}");
+                        evs.push(error_json(err, request_id));
+                    }
                 }
-                // (Re)sync the fed cursor to "everything live so far", then
-                // send the full snapshot; later steps only push deltas.
-                s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
-                evs.push(snapshot_json(s, request_id));
             }
             ClientCmd::PlaceOrder {
                 symbol, side, order_type, quantity, price, stop_price,
@@ -950,7 +990,7 @@ struct Args {
     symbol: String,
     timeframe: String,
     data_dir: PathBuf,
-    /// `--offline`: never call Binance; missing series fall back to synthetic.
+    /// `--offline`: never call CCXT; missing series fall back to synthetic.
     offline: bool,
 }
 
@@ -987,7 +1027,7 @@ fn engine_main(
         "[engine] cli defaults: {} {} (every session subscribes its own series, net={})",
         args.symbol,
         args.timeframe,
-        if args.offline { "off" } else { "binance" }
+        if args.offline { "off" } else { "CCXT" }
     );
     let mut engine = Engine::new(out).with_net(!args.offline);
 
@@ -1108,6 +1148,7 @@ mod tests {
         ClientCmd::Subscribe {
             symbol: symbol.into(),
             timeframe: timeframe.into(),
+            exchange: default_exchange(),
             request_id: None,
         }
     }

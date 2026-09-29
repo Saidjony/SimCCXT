@@ -1,34 +1,23 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crate::stamp;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use serde_json::Value;
+use ccxt::{from_id, TypedExchange, Value};
 use simccxt_broker::MarketKind;
 use simccxt_core::{Symbol, OHLCV};
 use simccxt_exchange::Exchange;
 
 // ---------------------------------------------------------------------------
-// Market-data loading (memory → disk cache → Binance → synthetic)
+// Market-data loading (memory → exchange-scoped disk cache → CCXT → synthetic)
 // ---------------------------------------------------------------------------
 
-/// Public Binance klines hosts, tried in order (api.binance.com is
-/// geo-restricted in some regions with HTTP 451 — the vision mirror is not).
-/// Direct REST (not the `ccxt` crate): ccxt needs >19GB RAM just to compile
-/// and gets OOM-killed on ordinary machines, which would break every build.
-/// This stays small, proven, and keeps the mirror fallback.
-const BINANCE_HOSTS: [&str; 2] = ["https://api.binance.com", "https://data-api.binance.vision"];
 /// How many klines to pull when a series is missing from cache and memory.
 const DOWNLOAD_BARS: usize = 5_000;
-/// Binance klines page cap.
-const KLINES_PAGE: u32 = 1_000;
+const OHLCV_PAGE: usize = 1_000;
 /// How many open-interest points to keep (coarser grid than klines).
 const OI_POINTS: usize = 1_500;
 const MAX_OI_HISTORY_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
-/// Binance OI-history page cap.
-const OI_PAGE: u32 = 500;
-/// Politeness pause between download pages (Binance rate limit).
-const PAGE_PAUSE: Duration = Duration::from_millis(150);
+const OI_PAGE: usize = 500;
 
 /// Step size per timeframe.
 pub(super) fn tf_step_ms(tf: &str) -> u64 {
@@ -46,6 +35,11 @@ pub(super) fn tf_step_ms(tf: &str) -> u64 {
 
 fn binance_file(symbol: &str, tf: &str) -> String {
     format!("{}_{}.csv", symbol.replace('/', "").to_uppercase(), tf)
+}
+
+fn series_file(exchange: &str, symbol: &str, tf: &str) -> String {
+    let file = binance_file(symbol, tf);
+    if exchange == "binance" { file } else { format!("{exchange}_{file}") }
 }
 
 /// Parse a timestamp cell: epoch seconds/ms (auto-detected) or ISO-8601.
@@ -126,175 +120,120 @@ fn save_csv(path: &Path, candles: &[OHLCV]) -> Result<(), String> {
     Ok(())
 }
 
-/// `"DOGE/USDT"` → `"DOGEUSDT"` (Binance symbol, spot klines and USDT-M
-/// futures alike). `None` if not BASE/QUOTE.
-fn to_binance_symbol(symbol: &str) -> Option<String> {
-    let parts: Vec<&str> = symbol.split('/').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return None;
-    }
-    Some(format!("{}{}", parts[0], parts[1]).to_uppercase())
-}
-
-/// One Binance kline row → OHLCV: `[openTime, o, h, l, c, volume, ...]`
-/// (OHLCV cells arrive as JSON strings, openTime as a number).
-fn parse_kline_row(row: &Value) -> Option<OHLCV> {
-    let arr = row.as_array()?;
-    let ts = arr.first()?.as_i64()?;
-    let num = |i: usize| -> Option<f64> {
-        match arr.get(i)? {
-            Value::String(s) => s.parse().ok(),
-            Value::Number(n) => n.as_f64(),
-            _ => None,
-        }
-    };
-    let dt = DateTime::from_timestamp_millis(ts)?;
-    Some(OHLCV::new(dt, num(1)?, num(2)?, num(3)?, num(4)?, num(5)?))
-}
-
-/// One OI-history row → `(ts_ms, USDT value)`: `{sumOpenInterestValue,
-/// sumOpenInterest, timestamp}` (numbers arrive as JSON strings).
-fn parse_oi_row(row: &Value) -> Option<(i64, f64)> {
-    let ts = row.get("timestamp")?.as_i64()?;
-    let str_num = |k: &str| -> Option<f64> {
-        match row.get(k)? {
-            Value::String(s) => s.parse().ok(),
-            Value::Number(n) => n.as_f64(),
-            _ => None,
-        }
-    };
-    let v = str_num("sumOpenInterestValue").or_else(|| str_num("sumOpenInterest"))?;
-    if v.is_finite() {
-        Some((ts, v))
-    } else {
-        None
-    }
-}
-
-/// Shared HTTP agent (15s global timeout).
-fn http_agent() -> ureq::Agent {
-    // ureq 3: timeout lives on the agent, not the request builder.
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(15)))
+fn ccxt_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
-        .into()
+        .map_err(|err| format!("failed to start CCXT runtime: {err}"))
 }
 
-/// One klines page from `host`. Non-2xx / transport / JSON errors → `Err`.
-fn fetch_klines_page(
-    agent: &ureq::Agent,
-    host: &str,
-    sym: &str,
-    tf: &str,
-    start_ms: i64,
-    end_ms: i64,
-    limit: u32,
-) -> Result<Vec<OHLCV>, String> {
-    let url = format!(
-        "{host}/api/v3/klines?symbol={sym}&interval={tf}\
-         &startTime={start_ms}&endTime={end_ms}&limit={limit}"
-    );
-    let mut res = agent
-        .get(&url)
-        .header("User-Agent", "simccxt/0.1")
-        .call()
-        .map_err(|e| format!("{host}: {e}"))?;
-    if !res.status().is_success() {
-        return Err(format!("{host}: HTTP {}", res.status()));
+fn ccxt_exchange(exchange: &str) -> Result<Box<dyn TypedExchange>, String> {
+    from_id(exchange, None).ok_or_else(|| format!("CCXT exchange '{exchange}' is not enabled"))
+}
+
+fn ccxt_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
+        .filter(|number| number.is_finite())
+}
+
+fn ccxt_timestamp_ms(value: &Value) -> Option<i64> {
+    if let Some(timestamp) = value.as_str() {
+        return parse_ts_ms(timestamp);
     }
-    let body = res
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("{host}: {e}"))?;
-    let rows: Vec<Value> = serde_json::from_str(&body).map_err(|e| format!("{host}: {e}"))?;
-    Ok(rows.iter().filter_map(parse_kline_row).collect())
+    ccxt_number(value).map(|timestamp| {
+        if timestamp.abs() < 1e12 {
+            (timestamp * 1000.0) as i64
+        } else {
+            timestamp as i64
+        }
+    })
 }
 
-/// One open-interest-history page from the USDT-M futures API
-/// (no mirror host exists for futures — a 451 here means "no OI").
-fn fetch_oi_page(
-    agent: &ureq::Agent,
-    sym: &str,
-    period: &str,
-    start_ms: i64,
-    end_ms: i64,
-    limit: u32,
-) -> Result<Vec<(i64, f64)>, String> {
-    let url = format!(
-        "https://fapi.binance.com/futures/data/openInterestHist\
-         ?symbol={sym}&period={period}\
-         &startTime={start_ms}&endTime={end_ms}&limit={limit}"
-    );
-    let mut res = agent
-        .get(&url)
-        .header("User-Agent", "simccxt/0.1")
-        .call()
-        .map_err(|e| format!("fapi: {e}"))?;
-    if !res.status().is_success() {
-        return Err(format!("fapi: HTTP {}", res.status()));
+fn oi_row(row: &Value) -> Option<(i64, f64)> {
+    let interest = ccxt::types::OpenInterest::from_value(row.clone());
+    let raw = row.as_map();
+    let timestamp = interest.timestamp.or_else(|| {
+        raw?.get("timestamp").and_then(ccxt_timestamp_ms)
+    })?;
+    let value = interest
+        .open_interest_value
+        .or(interest.quote_volume)
+        .or(interest.open_interest_amount)
+        .or_else(|| raw?.get("openInterest").and_then(ccxt_number))?;
+    value.is_finite().then_some((timestamp, value))
+}
+
+/// Fetch and normalize OHLCV through CCXT's unified API. Each exchange is
+/// instantiated only for this download; replay and order execution remain in
+/// the simulator's Exchange.
+fn download_series(exchange_id: &str, symbol: &str, tf: &str, bars: usize) -> Result<Vec<OHLCV>, String> {
+    if !["1s", "1m", "5m", "15m", "1h", "4h", "1d"].contains(&tf) {
+        return Err(format!("unsupported timeframe {tf}"));
     }
-    let body = res
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("fapi: {e}"))?;
-    let rows: Vec<Value> = serde_json::from_str(&body).map_err(|e| format!("fapi: {e}"))?;
-    Ok(rows.iter().filter_map(parse_oi_row).collect())
-}
-
-/// Download the most recent `bars` klines for `symbol@tf` from Binance
-/// (paginated, no API key). Tries both hosts per page; short page = end of
-/// available history. Returns bars sorted ascending by open time.
-fn download_series(symbol: &str, tf: &str, bars: usize) -> Result<Vec<OHLCV>, String> {
-    let sym = to_binance_symbol(symbol).ok_or_else(|| format!("bad symbol {symbol}"))?;
-    // Only intervals Binance knows — never invent a grid for unknown tf.
-    let step: i64 = match tf {
-        "1s" | "1m" | "5m" | "15m" | "1h" | "4h" | "1d" => tf_step_ms(tf) as i64,
-        _ => return Err(format!("unsupported timeframe {tf}")),
-    };
+    let step = tf_step_ms(tf) as i64;
     let end_ms = Utc::now().timestamp_millis();
-    let start_ms = end_ms - (bars as i64) * step;
-    let mut out: Vec<OHLCV> = Vec::with_capacity(bars);
-    let mut cursor = start_ms;
-    let mut last_err: Option<String> = None;
-    let agent = http_agent();
-
-    while cursor <= end_ms && out.len() < bars {
-        let mut page: Option<Vec<OHLCV>> = None;
-        for host in BINANCE_HOSTS {
-            match fetch_klines_page(&agent, host, &sym, tf, cursor, end_ms, KLINES_PAGE) {
-                Ok(rows) => {
-                    page = Some(rows);
-                    break;
-                }
-                Err(e) => last_err = Some(e),
+    let mut cursor = end_ms - (bars as i64) * step;
+    let mut exchange = ccxt_exchange(exchange_id)?;
+    let runtime = ccxt_runtime()?;
+    runtime.block_on(async {
+        exchange
+            .call_raw("load_markets", vec![Value::Bool(false), Value::Null])
+            .await
+            .map_err(|err| format!("{exchange_id}: load markets failed: {err}"))?;
+        let mut candles = Vec::with_capacity(bars);
+        while cursor <= end_ms && candles.len() < bars {
+            let limit = (bars - candles.len()).min(OHLCV_PAGE);
+            let page = exchange
+                .call_raw(
+                    "fetch_ohlcv",
+                    vec![
+                        Value::from(symbol),
+                        Value::from(tf),
+                        Value::Int(cursor),
+                        Value::Int(limit as i64),
+                        Value::Null,
+                    ],
+                )
+                .await
+                .map_err(|err| format!("{exchange_id} {symbol} {tf}: {err}"))?;
+            let Value::Arr(rows) = page else {
+                return Err(format!("{exchange_id} returned invalid OHLCV data"));
+            };
+            if rows.is_empty() {
+                break;
             }
+            let mut last_time = None;
+            for row in rows.iter() {
+                let Value::Arr(fields) = row else { continue };
+                if fields.len() < 6 { continue; }
+                let Some(ms) = fields.first().and_then(ccxt_number).map(|time| time as i64) else { continue };
+                let Some(dt) = DateTime::from_timestamp_millis(ms) else { continue };
+                let Some(open) = ccxt_number(&fields[1]) else { continue };
+                let Some(high) = ccxt_number(&fields[2]) else { continue };
+                let Some(low) = ccxt_number(&fields[3]) else { continue };
+                let Some(close) = ccxt_number(&fields[4]) else { continue };
+                let Some(volume) = ccxt_number(&fields[5]) else { continue };
+                candles.push(OHLCV::new(dt, open, high, low, close, volume));
+                last_time = Some(ms);
+            }
+            let Some(last_time) = last_time else { break };
+            if last_time < cursor {
+                break;
+            }
+            cursor = last_time + step;
         }
-        let Some(rows) = page else { break };
-        if rows.is_empty() {
-            break;
+        candles.sort_by_key(|candle| candle.timestamp.timestamp_millis());
+        candles.dedup_by_key(|candle| candle.timestamp.timestamp_millis());
+        if candles.is_empty() {
+            return Err(format!("{exchange_id} has no {symbol} candles at {tf}"));
         }
-        let short = rows.len() < KLINES_PAGE as usize;
-        let last_open = rows
-            .last()
-            .map(|c| c.timestamp.timestamp_millis())
-            .unwrap_or(cursor);
-        out.extend(rows);
-        if short || last_open >= end_ms || last_open < cursor {
-            break;
-        }
-        cursor = last_open + step;
-        std::thread::sleep(PAGE_PAUSE);
-    }
-
-    if out.is_empty() {
-        return Err(last_err.unwrap_or_else(|| "no klines returned".into()));
-    }
-    out.sort_by_key(|c| c.timestamp.timestamp_millis());
-    out.dedup_by_key(|c| c.timestamp.timestamp_millis());
-    Ok(out)
+        Ok(candles)
+    })
 }
 
-/// OI history grid per chart timeframe (Binance panics on 1m — map to 5m).
+/// OI history grid per chart timeframe (use 5m for the 1m candle interval).
 fn oi_period(tf: &str) -> Option<&'static str> {
     match tf {
         "1s" | "1m" | "5m" => Some("5m"),
@@ -311,12 +250,13 @@ fn oi_points(period: &str) -> usize {
     ((MAX_OI_HISTORY_MS / step_ms) as usize).min(OI_POINTS)
 }
 
-fn oi_file(symbol: &str, period: &str) -> String {
-    format!(
+fn oi_file(exchange: &str, symbol: &str, period: &str) -> String {
+    let file = format!(
         "{}_oi_{}.csv",
         symbol.replace('/', "").to_uppercase(),
         period
-    )
+    );
+    if exchange == "binance" { file } else { format!("{exchange}_{file}") }
 }
 
 /// Write `[(ts_ms, value)]` cache rows (`ts_ms,oi`).
@@ -356,55 +296,64 @@ fn load_pairs_csv(path: &PathBuf) -> Option<Vec<(i64, f64)>> {
     }
 }
 
-/// Download open-interest history (USDT value) for the USDT-M perp matching
-/// `symbol@tf`, paginated. Unlike klines, the OI endpoint returns the LATEST
-/// `limit` rows of the window — so pages walk BACKWARD via `endTime`.
-/// No mirror exists for futures: a 451/geo error here means "no OI"
-/// (klines still work via the mirror).
-fn download_oi(symbol: &str, tf: &str, points: usize) -> Result<Vec<(i64, f64)>, String> {
+/// Download open-interest history through CCXT where the selected venue
+/// exposes the unified fetchOpenInterestHistory method.
+fn download_oi(exchange_id: &str, symbol: &str, tf: &str, points: usize) -> Result<Vec<(i64, f64)>, String> {
     let period = oi_period(tf).ok_or_else(|| format!("no OI grid for {tf}"))?;
-    let sym = to_binance_symbol(symbol).ok_or_else(|| format!("bad symbol {symbol}"))?;
     let step = tf_step_ms(period) as i64;
     let end_ms = Utc::now().timestamp_millis();
     let start_ms = end_ms - (points as i64) * step;
-    let mut out: Vec<(i64, f64)> = Vec::with_capacity(points);
-    let mut end = end_ms;
-    let mut last_err: Option<String> = None;
-    let agent = http_agent();
-
-    while end > start_ms && out.len() < points {
-        match fetch_oi_page(&agent, &sym, period, start_ms, end, OI_PAGE) {
-            Ok(rows) => {
-                if rows.is_empty() {
-                    break;
+    let mut cursor = start_ms;
+    let swap_symbol = symbol
+        .split_once('/')
+        .map(|(base, quote)| format!("{base}/{quote}:{quote}"))
+        .unwrap_or_else(|| symbol.to_string());
+    let mut exchange = ccxt_exchange(exchange_id)?;
+    let runtime = ccxt_runtime()?;
+    runtime.block_on(async {
+        exchange
+            .call_raw("load_markets", vec![Value::Bool(false), Value::Null])
+            .await
+            .map_err(|err| format!("{exchange_id}: load markets failed: {err}"))?;
+        let mut out = Vec::with_capacity(points);
+        while cursor < end_ms && out.len() < points {
+            let limit = (points - out.len()).min(OI_PAGE);
+            let rows = exchange
+                .call_raw(
+                    "fetch_open_interest_history",
+                    vec![
+                        Value::from(swap_symbol.as_str()),
+                        Value::from(period),
+                        Value::Int(cursor),
+                        Value::Int(limit as i64),
+                        Value::Null,
+                    ],
+                )
+                .await
+                .map_err(|err| format!("{exchange_id} {swap_symbol} OI: {err}"))?;
+            let Value::Arr(rows) = rows else {
+                return Err(format!("{exchange_id} returned invalid OI data"));
+            };
+            if rows.is_empty() { break; }
+            let mut last_ts = None;
+            for row in rows.iter() {
+                let Some((ts, value)) = oi_row(row) else { continue };
+                last_ts = Some(last_ts.map_or(ts, |last: i64| last.max(ts)));
+                if ts >= start_ms && ts <= end_ms && value.is_finite() {
+                    out.push((ts, value));
                 }
-                let short = rows.len() < OI_PAGE as usize;
-                let mut first_ts = end;
-                for (ts, v) in rows {
-                    if ts >= start_ms && ts <= end {
-                        out.push((ts, v));
-                        first_ts = first_ts.min(ts);
-                    }
-                }
-                if short || first_ts <= start_ms || first_ts >= end {
-                    break;
-                }
-                end = first_ts - 1;
-                std::thread::sleep(PAGE_PAUSE);
             }
-            Err(e) => {
-                last_err = Some(e);
-                break;
-            }
+            let Some(last_ts) = last_ts else { break };
+            if last_ts < cursor { break; }
+            cursor = last_ts + 1;
         }
-    }
-
-    if out.is_empty() {
-        return Err(last_err.unwrap_or_else(|| "no open interest returned".into()));
-    }
-    out.sort_by_key(|r| r.0);
-    out.dedup_by_key(|r| r.0);
-    Ok(out)
+        out.sort_by_key(|row| row.0);
+        out.dedup_by_key(|row| row.0);
+        if out.is_empty() {
+            return Err(format!("{exchange_id} has no OI history for {symbol}"));
+        }
+        Ok(out)
+    })
 }
 
 /// Deterministic synthetic random walk (xorshift64, fixed seed) — explicit
@@ -437,12 +386,13 @@ fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
 }
 
 /// Make sure open interest for `symbol@timeframe` is loaded into the
-/// session: disk cache → Binance download (saved to cache) → empty + log.
+/// session: disk cache → CCXT download (saved to cache) → empty + log.
 /// OI is chart context, never replayed: no synthetic fallback (an invented
 /// OI curve would be worse than none).
 pub(super) fn ensure_oi(
     oi: &mut Vec<(i64, f64)>,
     oi_period_out: &mut String,
+    exchange: &str,
     symbol: &str,
     tf: &str,
     data_dir: &Path,
@@ -451,10 +401,10 @@ pub(super) fn ensure_oi(
     oi.clear();
     oi_period_out.clear();
     let Some(period) = oi_period(tf) else { return };
-    let path = data_dir.join(oi_file(symbol, period));
+    let path = data_dir.join(oi_file(exchange, symbol, period));
     if let Some(rows) = load_pairs_csv(&path) {
         log!(
-            "[engine] {symbol} OI@{period}: {} pts from cache ({})",
+            "[engine] {exchange} {symbol} OI@{period}: {} pts from cache ({})",
             rows.len(),
             path.display()
         );
@@ -463,40 +413,42 @@ pub(super) fn ensure_oi(
         return;
     }
     if allow_net {
-        log!("[engine] {symbol} OI@{period}: no cache, downloading…");
-        match download_oi(symbol, tf, oi_points(period)) {
+        log!("[engine] {exchange} {symbol} OI@{period}: no cache, downloading via CCXT…");
+        match download_oi(exchange, symbol, tf, oi_points(period)) {
             Ok(rows) => {
                 if let Err(e) = save_pairs_csv(&path, &rows) {
-                    log!("[engine] {symbol} OI@{period}: cache write failed: {e}");
+                    log!("[engine] {exchange} {symbol} OI@{period}: cache write failed: {e}");
                 }
                 log!(
-                    "[engine] {symbol} OI@{period}: {} pts from binance (cached {})",
+                    "[engine] {exchange} {symbol} OI@{period}: {} pts via CCXT (cached {})",
                     rows.len(),
                     path.display()
                 );
                 *oi = rows;
                 *oi_period_out = period.to_string();
             }
-            Err(e) => log!("[engine] {symbol} OI@{period}: download failed: {e}"),
+            Err(e) => log!("[engine] {exchange} {symbol} OI@{period}: download failed: {e}"),
         }
     }
 }
 
 /// Make sure `symbol@timeframe` is loaded. Order: already in memory →
-/// disk cache → Binance download (saved to cache) → synthetic fallback.
+/// disk cache → CCXT download (saved to cache) → synthetic fallback.
 /// Network is only attempted when `allow_net` (off in unit tests, and with
 /// `--offline`); every source is logged — synthetic is never silent.
 pub(super) fn ensure_series(
     ex: &mut Exchange,
+    exchange: &str,
     symbol: &str,
     tf: &str,
     data_dir: &Path,
     allow_net: bool,
-) {
-    if !ex.fetch_ohlcv(symbol, tf, None, Some(1)).is_empty() {
-        return;
+    force_reload: bool,
+) -> Result<(), String> {
+    if !force_reload && !ex.fetch_ohlcv(symbol, tf, None, Some(1)).is_empty() {
+        return Ok(());
     }
-    let path = data_dir.join(binance_file(symbol, tf));
+    let path = data_dir.join(series_file(exchange, symbol, tf));
     if let Some(candles) = load_csv(&path) {
         let n = candles.len();
         if let Ok(sym) = Symbol::parse(symbol) {
@@ -504,14 +456,14 @@ pub(super) fn ensure_series(
         }
         ex.load_candles(symbol, tf, candles);
         log!(
-            "[engine] {symbol} {tf}: {n} bars from cache ({})",
+            "[engine] {exchange} {symbol} {tf}: {n} bars from cache ({})",
             path.display()
         );
-        return;
+        return Ok(());
     }
     if allow_net {
-        log!("[engine] {symbol} {tf}: no cache, downloading {DOWNLOAD_BARS} bars from binance…");
-        match download_series(symbol, tf, DOWNLOAD_BARS) {
+        log!("[engine] {exchange} {symbol} {tf}: no cache, downloading {DOWNLOAD_BARS} bars via CCXT…");
+        match download_series(exchange, symbol, tf, DOWNLOAD_BARS) {
             Ok(candles) => {
                 let n = candles.len();
                 if let Err(e) = save_csv(&path, &candles) {
@@ -522,12 +474,12 @@ pub(super) fn ensure_series(
                 }
                 ex.load_candles(symbol, tf, candles);
                 log!(
-                    "[engine] {symbol} {tf}: {n} bars from binance (cached {})",
+                    "[engine] {exchange} {symbol} {tf}: {n} bars via CCXT (cached {})",
                     path.display()
                 );
-                return;
+                return Ok(());
             }
-            Err(e) => log!("[engine] {symbol} {tf}: binance download failed: {e}"),
+            Err(e) => return Err(format!("{exchange} {symbol} {tf}: {e}")),
         }
     }
     let candles = synthetic(symbol, tf, 2000);
@@ -536,9 +488,10 @@ pub(super) fn ensure_series(
     }
     ex.load_candles(symbol, tf, candles);
     log!(
-        "[engine] {symbol} {tf}: 2000 synthetic bars (no cache at {})",
+        "[engine] {exchange} {symbol} {tf}: 2000 synthetic bars (offline; no cache at {})",
         path.display()
     );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -568,54 +521,6 @@ mod tests {
             a.iter().map(|c| c.close).collect::<Vec<_>>(),
             b.iter().map(|c| c.close).collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn binance_symbol_from_pair() {
-        assert_eq!(to_binance_symbol("DOGE/USDT").as_deref(), Some("DOGEUSDT"));
-        assert_eq!(to_binance_symbol("btc/usdt").as_deref(), Some("BTCUSDT"));
-        assert_eq!(to_binance_symbol("BTCUSDT"), None);
-        assert_eq!(to_binance_symbol("/USDT"), None);
-    }
-
-    #[test]
-    fn kline_row_parses_ohlcv() {
-        let row = serde_json::json!([
-            1789257600000i64,
-            "77278.73",
-            "77282.04",
-            "77266.01",
-            "77282.04",
-            "1.71117",
-            1789257659999i64,
-            "132440.5",
-            42,
-            "0",
-            "0",
-            "0"
-        ]);
-        let c = parse_kline_row(&row).expect("parses");
-        assert_eq!(c.timestamp.timestamp_millis(), 1_789_257_600_000);
-        assert_eq!(c.open, 77278.73);
-        assert_eq!(c.close, 77282.04);
-        assert_eq!(c.volume, 1.71117);
-    }
-
-    #[test]
-    fn oi_row_parses_value() {
-        let row = serde_json::json!({
-            "symbol": "BTCUSDT",
-            "sumOpenInterest": "12345.6",
-            "sumOpenInterestValue": "987654321.5",
-            "timestamp": 1789257600000i64,
-        });
-        assert_eq!(parse_oi_row(&row), Some((1_789_257_600_000, 987654321.5)));
-        // Falls back to the base-asset amount when value is missing.
-        let row2 = serde_json::json!({
-            "symbol": "BTCUSDT", "sumOpenInterest": "12345.6", "timestamp": 1i64,
-        });
-        assert_eq!(parse_oi_row(&row2), Some((1, 12345.6)));
-        assert_eq!(parse_oi_row(&serde_json::json!({"a": 1})), None);
     }
 
     #[test]
@@ -650,14 +555,14 @@ mod tests {
     #[test]
     fn download_rejects_unknown_timeframe() {
         // No network needed: validation fails before any request.
-        let err = download_series("BTC/USDT", "7m", 10).unwrap_err();
+        let err = download_series("binance", "BTC/USDT", "7m", 10).unwrap_err();
         assert!(err.contains("unsupported timeframe"), "{err}");
-        assert!(download_oi("BTC/USDT", "7m", 10).is_err());
+        assert!(download_oi("binance", "BTC/USDT", "7m", 10).is_err());
     }
 
     #[test]
     fn oi_grid_mapping() {
-        // Binance has no 1m OI: we map to 5m instead.
+        // Most exchanges expose 1m candles but OI at 5m.
         assert_eq!(oi_period("1m"), Some("5m"));
         assert_eq!(oi_period("1s"), Some("5m"));
         assert_eq!(oi_period("15m"), Some("15m"));
@@ -666,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn oi_points_stay_within_binances_history_window() {
+    fn oi_points_stay_within_exchange_history_window() {
         assert_eq!(oi_points("1h"), 720);
         assert_eq!(oi_points("15m"), OI_POINTS);
         assert_eq!(oi_points("5m"), OI_POINTS);
@@ -674,9 +579,18 @@ mod tests {
     }
 
     #[test]
+    fn oi_rows_accept_bybit_raw_open_interest_fields() {
+        let row = Value::from(serde_json::json!({
+            "timestamp": "1790679600000",
+            "openInterest": "56029.63800000",
+        }));
+        assert_eq!(oi_row(&row), Some((1_790_679_600_000, 56_029.638)));
+    }
+
+    #[test]
     fn oi_cache_roundtrip() {
         let dir = std::env::temp_dir().join(format!("simccxt-oi-{}", std::process::id()));
-        let path = dir.join("BTCUSDT_oi_5m.csv");
+        let path = dir.join(oi_file("binance", "BTC/USDT", "5m"));
         let rows = vec![
             (1_789_257_600_000i64, 1_234_567.5),
             (1_789_257_900_000i64, 1_300_000.0),

@@ -32,6 +32,7 @@ export function MiniChart({
   mainTimeframe,
 }: Props): JSX.Element {
   const symbol = useSim((s) => s.symbol);
+  const exchange = useSim((s) => s.exchange);
   const replayNow = useSim((s) => s.replay.now_ms);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -134,6 +135,7 @@ export function MiniChart({
       low,
       close,
     })));
+    chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
     volume.setData(candles.map(([ts, open, high, low, close, amount]) => ({
       time: Math.floor(ts / 1000) as UTCTimestamp,
       value: amount,
@@ -167,23 +169,25 @@ export function MiniChart({
         const message = parseServerMessage(String(event.data));
         if (!message) return;
         if (message.type === "welcome") {
-          socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe }));
+          socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange }));
           const now = replayNowRef.current;
           lastSyncedBucketRef.current = Math.floor(now / timeframeMs(timeframe));
           lastMainTimeframeRef.current = mainTimeframe;
           if (now > 0) {
             socket?.send(JSON.stringify({ type: "replay", action: "reset", timestamp_ms: now }));
             socket?.send(JSON.stringify({ type: "replay", action: "pause" }));
-            socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe }));
+            socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange }));
           }
         } else if (message.type === "snapshot") {
-          if (message.symbol !== symbol || message.timeframe !== timeframe) return;
+          if (message.symbol !== symbol || message.timeframe !== timeframe ||
+              (message.type === "snapshot" && (message.exchange ?? "binance") !== exchange)) return;
           setCandles(message.candles);
           setStatus("");
         } else if (
           message.type === "candle" &&
           message.symbol === symbol &&
-          message.timeframe === timeframe
+          message.timeframe === timeframe &&
+          (message.exchange === undefined || message.exchange === exchange)
         ) {
           setCandles((previous) => applyCandle(previous, message));
         } else if (message.type === "error") {
@@ -209,7 +213,7 @@ export function MiniChart({
       }
       socketRef.current = null;
     };
-  }, [symbol, timeframe]);
+  }, [symbol, timeframe, exchange]);
 
   useEffect(() => {
     if (replayNow <= 0) return;
@@ -222,10 +226,10 @@ export function MiniChart({
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: "replay", action: "reset", timestamp_ms: replayNow }));
     socket.send(JSON.stringify({ type: "replay", action: "pause" }));
-    socket.send(JSON.stringify({ type: "subscribe", symbol, timeframe }));
-  }, [replayNow, symbol, timeframe, mainTimeframe]);
+    socket.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange }));
+  }, [replayNow, symbol, timeframe, mainTimeframe, exchange]);
 
-  const selectedCriteria = useSim((s) => s.chartCriteria[panel] ?? []);
+  const selectedCriteria = useSim((s) => s.chartCriteria[timeframe] ?? []);
   void viewTick;
 
   return (
@@ -241,7 +245,7 @@ export function MiniChart({
         >
           {CHART_TIMEFRAMES.map((item) => <option key={item} value={item}>{item}</option>)}
         </select>
-        <ChartCriteriaPicker panel={panel} />
+        <ChartCriteriaPicker timeframe={timeframe} />
         <button
           className="btn b-dim chart-maximize"
           onClick={onToggleMaximize}

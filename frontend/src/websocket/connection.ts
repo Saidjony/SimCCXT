@@ -49,7 +49,12 @@ class Connection {
       this.connect();
     } else if (this.ws.readyState === WebSocket.OPEN) {
       // Reused live socket (StrictMode remount): ask Rust for a fresh snapshot.
-      this.send({ type: "subscribe", symbol: getState().symbol, timeframe: getState().timeframe });
+      this.send({
+        type: "subscribe",
+        symbol: getState().symbol,
+        timeframe: getState().timeframe,
+        exchange: getState().exchange,
+      });
     }
     this.startWatchdog();
   }

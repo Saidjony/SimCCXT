@@ -5,6 +5,7 @@
 
 // A candle row is always [ts_ms, open, high, low, close, volume].
 export type CandleRow = [number, number, number, number, number, number];
+export type ExchangeId = "binance" | "bybit" | "okx";
 
 export interface BalanceLine {
   free: number;
@@ -81,7 +82,7 @@ export interface ChallengeEntry {
 // --- frontend -> Rust ---
 
 export type ClientMessage =
-  | { type: "subscribe"; symbol: string; timeframe: string; request_id?: string }
+  | { type: "subscribe"; symbol: string; timeframe: string; exchange?: ExchangeId; request_id?: string }
   | {
       type: "place_order";
       symbol: string;
@@ -122,6 +123,7 @@ export type ServerMessage =
       to?: number;
       symbol: string;
       timeframe: string;
+      exchange: ExchangeId;
       candles: CandleRow[];
       account: AccountSnapshot;
       replay: ReplayState;
@@ -130,7 +132,7 @@ export type ServerMessage =
       oi_period: string;
       request_id?: string;
     }
-  | { type: "candle"; to?: number; symbol: string; timeframe: string; candle: CandleRow; is_new: boolean }
+  | { type: "candle"; to?: number; symbol: string; timeframe: string; exchange?: ExchangeId; candle: CandleRow; is_new: boolean }
   | { type: "market_update"; to?: number; symbol: string; last: number; timestamp: number }
   | { type: "account_update"; to?: number; account: AccountSnapshot }
   | { type: "order_update"; to?: number; order: OrderLine; request_id?: string }
