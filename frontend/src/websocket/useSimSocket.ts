@@ -17,11 +17,16 @@ function route(m: ServerMessage): void {
       // then rejoin the challenge when the user opted in before.
       sendSim({ type: "login", name: getState().nick });
       if (getState().inChallenge) {
-        sendSim({ type: "challenge", join: true, risk_usdt: getState().fixedRiskUsdt });
+        sendSim({
+          type: "challenge",
+          join: true,
+          risk_usdt: getState().fixedRiskUsdt,
+          capital_usdt: getState().initialCapitalUsdt,
+        });
       }
       break;
     case "snapshot":
-      store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period);
+      store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period, m.fills);
       break;
     case "candle":
       if (m.symbol === getState().symbol && (!m.exchange || m.exchange === getState().exchange)) {

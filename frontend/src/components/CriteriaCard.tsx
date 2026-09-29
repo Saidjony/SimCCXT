@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { CRITERIA } from "../trade/criteria";
-import { store, useSim } from "../state/store";
+import { chartCriteriaKey, store, useSim } from "../state/store";
 
 /**
  * Setup checklist: 30 criteria as checkboxes with a search filter.
  * Selected ids render as chips in the chart's top-left overlay.
  */
 export function CriteriaCard(): JSX.Element {
-  const criteria = useSim((s) => s.criteria);
+  const symbol = useSim((s) => s.symbol);
+  const timeframe = useSim((s) => s.timeframe);
+  const criteria = useSim((s) => s.chartCriteria[chartCriteriaKey(s.symbol, s.timeframe)] ?? []);
   const collapsed = useSim((s) => s.collapsedCriteria);
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
@@ -22,7 +24,7 @@ export function CriteriaCard(): JSX.Element {
         onClick={() => store.setCollapsedCriteria(!collapsed)}
         title={collapsed ? "развернуть" : "свернуть"}
       >
-        <h4><span className="chev">{collapsed ? "▸" : "▾"}</span> Критерии</h4>
+        <h4><span className="chev">{collapsed ? "▸" : "▾"}</span> Критерии · {timeframe}</h4>
         <span className="lbl">{criteria.length} / {CRITERIA.length}</span>
       </div>
       {!collapsed && (
@@ -35,7 +37,7 @@ export function CriteriaCard(): JSX.Element {
           aria-label="найти критерий"
         />
         {criteria.length > 0 && (
-          <button className="btn b-dim" onClick={() => store.clearCriteria()} title="сбросить выбор">
+          <button className="btn b-dim" onClick={() => store.clearChartCriteria(symbol, timeframe)} title="сбросить выбор">
             ✕
           </button>
         )}
@@ -46,7 +48,7 @@ export function CriteriaCard(): JSX.Element {
             <input
               type="checkbox"
               checked={criteria.includes(c.id)}
-              onChange={() => store.toggleCriterion(c.id)}
+              onChange={() => store.toggleChartCriterion(symbol, timeframe, c.id)}
             />
             <span>{c.label}</span>
           </label>

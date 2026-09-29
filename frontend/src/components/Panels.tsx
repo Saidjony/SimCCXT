@@ -1,17 +1,25 @@
 import { useState } from "react";
 import { nextRequestId, sendSim } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
-import { formatMoney } from "../types/protocol";
+import { formatMoney, formatTs } from "../types/protocol";
+import { criterionLabel } from "../trade/criteria";
 
 /** Balances + equity + PnL, all computed in Rust. */
 export function Account(): JSX.Element {
   const account = useSim((s) => s.account);
   if (!account) return <div><h4>Account</h4><div className="lbl">—</div></div>;
   const rows = Object.entries(account.balances);
+  const symbol = useSim((s) => s.symbol);
   return (
     <div>
       <h4>Account</h4>
-      <div className="status big">Equity {formatMoney(account.equity)}</div>
+      <div className="account-summary">
+        <span>Equity <strong>{formatMoney(account.equity)}</strong></span>
+        <span>Realized <strong><PnL v={account.pnl.realized} /></strong></span>
+        <span>Unrealized <strong><PnL v={account.pnl.unrealized} /></strong></span>
+        <span>Fees <strong>{formatMoney(account.pnl.fees)}</strong></span>
+        <span>Updated <strong>{formatTs(account.time)}</strong></span>
+      </div>
       <table className="grid-table narrow-table">
         <thead><tr><th>Asset</th><th>Free</th><th>Locked</th><th>Total</th></tr></thead>
         <tbody>
@@ -25,10 +33,7 @@ export function Account(): JSX.Element {
           ))}
         </tbody>
       </table>
-      <div className="status">
-        uPnL <PnL v={account.pnl.unrealized} /> · realized {formatMoney(account.pnl.realized)}
-        {" · "}fees {formatMoney(account.pnl.fees)}
-      </div>
+      <CoinCriteriaSummary symbol={symbol} />
     </div>
   );
 }
@@ -47,16 +52,20 @@ export function Positions(): JSX.Element {
       {positions.length === 0 && <div className="lbl">flat</div>}
       {positions.length > 0 && (
         <table className="grid-table">
-          <thead><tr><th>Symbol</th><th>Side</th><th>Value, USDT</th><th>Entry</th><th>Mark</th><th>uPnL</th><th></th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Notional</th><th>Entry</th><th>Mark</th><th>uPnL</th><th>Realized</th><th>Lev.</th><th>Liq. price</th><th></th></tr></thead>
           <tbody>
             {positions.map((p) => (
               <tr key={p.symbol + p.side}>
                 <td>{p.symbol}</td>
                 <td><span className={"pill " + (p.side === "long" ? "pos" : "neg")}>{p.side.toUpperCase()}</span></td>
+                <td className="num">{p.qty.toPrecision(6)}</td>
                 <td className="num">{(p.qty * p.markPrice).toLocaleString("en-US", { maximumFractionDigits: 2 })}</td>
                 <td className="num">{p.entryPrice.toFixed(2)}</td>
                 <td className="num">{p.markPrice.toFixed(2)}</td>
                 <td className="num"><PnL v={p.unrealizedPnl} /></td>
+                <td className="num"><PnL v={p.realizedPnl} /></td>
+                <td className="num">{p.leverage.toFixed(2)}×</td>
+                <td className="num">{p.liquidationPrice > 0 ? p.liquidationPrice.toFixed(2) : "—"}</td>
                 <td className="num">
                   <button
                     className="btn b-dim btn-sm"
@@ -83,15 +92,21 @@ export function Orders(): JSX.Element {
       {orders.length === 0 && <div className="lbl">none open</div>}
       {orders.length > 0 && (
         <table className="grid-table">
-          <thead><tr><th>Side</th><th>Type</th><th>Filled/Amount</th><th>Price</th><th>Status</th><th></th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th>Filled</th><th>Remaining</th><th>Limit</th><th>Trigger</th><th>TIF</th><th>Flags</th><th>Status</th><th>Time</th><th></th></tr></thead>
           <tbody>
             {orders.map((o) => (
               <tr key={o.id}>
+                <td>{o.symbol}</td>
                 <td><span className={"pill " + (o.side === "buy" ? "pos" : "neg")}>{o.side.toUpperCase()}</span></td>
                 <td>{o.type}</td>
-                <td className="num">{o.amount - o.filled}/{o.amount}</td>
+                <td className="num">{o.filled.toPrecision(5)} / {o.amount.toPrecision(5)}</td>
+                <td className="num">{o.remaining.toPrecision(5)}</td>
                 <td className="num">{o.price ?? "mkt"}</td>
+                <td className="num">{o.triggerPrice?.toFixed(2) ?? "—"}</td>
+                <td>{o.timeInForce}</td>
+                <td>{o.reduceOnly ? "reduce-only " : ""}{o.postOnly ? "post-only" : ""}</td>
                 <td><span className="pill dim">{o.status}</span></td>
+                <td>{formatTs(o.timestamp)}</td>
                 <td className="num">
                   <button
                     className="btn b-red btn-sm"
@@ -120,20 +135,45 @@ export function Trades(): JSX.Element {
       {fills.length === 0 && <div className="lbl">no fills yet</div>}
       {fills.length > 0 && (
         <table className="grid-table">
-          <thead><tr><th>Side</th><th>Price</th><th>Qty</th><th>Fee</th></tr></thead>
+          <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Type</th><th>Price</th><th>Qty</th><th>Notional</th><th>Fee</th><th>Liquidity</th><th>Order ID</th></tr></thead>
           <tbody>
             {fills.map((f) => (
               <tr key={f.id}>
+                <td>{formatTs(f.timestamp)}</td>
+                <td>{f.symbol}</td>
                 <td><span className={"pill " + (f.side === "buy" ? "pos" : "neg")}>{f.side.toUpperCase()}</span></td>
+                <td>{f.type}</td>
                 <td className="num">{f.price.toFixed(2)}</td>
                 <td className="num">{f.amount}</td>
-                <td className="num">{f.fee.toFixed(4)}</td>
+                <td className="num">{formatMoney(f.cost)}</td>
+                <td className="num">{formatMoney(f.fee)}</td>
+                <td>{f.maker ? "Maker" : "Taker"}</td>
+                <td>{f.orderId}</td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
     </div>
+  );
+}
+
+function CoinCriteriaSummary({ symbol }: { symbol: string }): JSX.Element {
+  const criteria = useSim((s) => s.chartCriteria);
+  const groups = Object.entries(criteria)
+    .filter(([key, ids]) => key.startsWith(`${symbol}::`) && ids.length > 0)
+    .map(([key, ids]) => ({ timeframe: key.slice(symbol.length + 2), ids }));
+  return (
+    <section className="coin-criteria-summary">
+      <h4>Критерии {symbol} · все таймфреймы</h4>
+      {groups.length === 0 && <span className="lbl">Не выбраны</span>}
+      {groups.map(({ timeframe, ids }) => (
+        <div key={timeframe}>
+          <strong>{timeframe}</strong>
+          <span>{ids.map(criterionLabel).join(" · ")}</span>
+        </div>
+      ))}
+    </section>
   );
 }
 

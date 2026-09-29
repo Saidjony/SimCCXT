@@ -22,12 +22,15 @@ body {
 .app { display: flex; flex-direction: column; min-height: 100vh; }
 .topbar {
   position: sticky; top: 0; z-index: 50;
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;
+  min-height: 36px; max-height: 42px; padding: 3px 8px;
+  overflow-x: auto; scrollbar-width: none;
+  background: var(--bg2); border-bottom: 1px solid var(--line);
 }
+.topbar::-webkit-scrollbar { display: none; }
 .logo { font-weight: 700; }
 .exchange-picker {
-  display: flex; align-items: center; gap: 6px; margin-left: 12px;
+  display: flex; align-items: center; gap: 5px; margin-left: 4px;
   color: var(--muted); font-size: 11px;
 }
 .exchange-picker select { padding: 4px 8px; border-color: #334155; font-weight: 600; }
@@ -44,7 +47,8 @@ body {
   background: #0d1219;
 }
 .replay-buttons { display: flex; align-items: center; gap: 3px; }
-.replay-compact .btn { min-width: 30px; padding: 5px 8px; font-size: 12px; }
+.replay-compact .btn { min-width: 26px; padding: 3px 6px; font-size: 12px; }
+.replay-compact { gap: 4px; padding: 2px 4px; }
 .replay-progress-label, .replay-state {
   color: var(--muted); font-size: 10px; white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -90,7 +94,7 @@ body {
   color: var(--text); text-align: center; font: inherit; font-size: 10px;
 }
 .shortcut-menu small { color: var(--muted); line-height: 1.4; }
-.toprow { display: flex; gap: 0; width: 100%; height: calc(100vh - 43px); min-height: 420px; flex: 0 0 auto; }
+.toprow { display: flex; gap: 0; width: 100%; height: calc(100vh - 36px); min-height: 420px; flex: 0 0 auto; }
 .main { flex: 1 1 auto; min-width: 0; min-height: 0; height: 100%; }
 .side {
   width: 336px; flex: 0 0 336px;
@@ -265,8 +269,23 @@ td, th { padding: 3px 4px; }
 .neg { color: var(--red); }
 .progress { height: 4px; background: var(--bg2); border-radius: 2px; margin-top: 6px; }
 .progress > div { height: 100%; background: var(--accent); border-radius: 2px; }
-.chartwrap { position: relative; width: 100%; height: calc(100vh - 41px); min-height: 420px; }
+.chartwrap { position: relative; width: 100%; height: calc(100vh - 36px); min-height: 420px; }
 .chart { width: 100%; height: 100%; }
+.execution-lines {
+  position: absolute; z-index: 5; top: 0; left: 0; right: 72px;
+  pointer-events: none; overflow: hidden;
+}
+.execution-line {
+  position: absolute; left: 0; right: 0; border-top: 1px dashed;
+  opacity: 0.88; pointer-events: none;
+}
+.execution-line span {
+  position: absolute; right: 2px; top: -12px; padding: 1px 4px;
+  border-radius: 3px; background: rgba(11, 14, 19, 0.88);
+  font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.execution-line.entry { border-color: #e0af68; color: #e0af68; }
+.execution-line.stop { border-color: #d46666; color: #d46666; }
 .coin-info {
   position: absolute; top: 12px; left: 14px; z-index: 5; pointer-events: none;
   background: rgba(11, 14, 19, 0.62); border: 1px solid var(--line);
@@ -363,6 +382,19 @@ td, th { padding: 3px 4px; }
   border-radius: 8px; padding: 2px 10px; white-space: nowrap;
 }
 .board-table { margin-top: 8px; }
+.board-table-scroll { max-width: 100%; overflow-x: auto; }
+.board-table { min-width: 850px; font-size: 10px; }
+.board-table th, .board-table td { padding: 4px 6px; white-space: nowrap; }
+.account-summary {
+  display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 4px 0 12px;
+  color: var(--muted); font-size: 12px;
+}
+.account-summary strong { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.coin-criteria-summary { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.coin-criteria-summary h4 { margin: 0 0 8px; color: var(--muted); font-size: 11px; }
+.coin-criteria-summary > div { display: grid; grid-template-columns: 46px 1fr; gap: 8px; padding: 3px 0; font-size: 12px; }
+.coin-criteria-summary > div strong { color: var(--accent); }
+.coin-criteria-summary > div span { color: var(--text); }
 .board-table tr.me td { font-weight: 700; }
 .board-table tr.me td:first-child::before { content: "▸ "; color: var(--accent); }
 /* Collapsible card headers (market list, criteria). */
@@ -514,5 +546,5 @@ td, th { padding: 3px 4px; }
   .main { min-height: 100vh; }
   .chart-workspace { height: 100vh; min-height: 0; grid-template-rows: minmax(0, 1fr) 8px minmax(0, 1fr); }
   .chart-workspace-bottom { grid-template-columns: minmax(0, 1fr) 8px minmax(0, 1fr); }
-  .chart-workspace-maximized { height: calc(100vh - 41px); min-height: 400px; }
+  .chart-workspace-maximized { height: calc(100vh - 36px); min-height: 400px; }
 }

@@ -37,9 +37,10 @@ export function OrderPanel(): JSX.Element {
   const [postOnly, setPostOnly] = useState(false);
   const error = useSim((s) => s.error);
 
-  const send = (side: string): void => {
+  const send = (side: "buy" | "sell"): void => {
     const sl = num(stop);
-    if (sl === null) return;
+    const reference = kind === "market" ? lastPrice : num(price);
+    if (sl === null || reference === null || (side === "buy" ? sl >= reference : sl <= reference)) return;
     let orderType = kind;
     let entry: number | null = null;
     const msg: ClientMessage = {
@@ -66,11 +67,8 @@ export function OrderPanel(): JSX.Element {
     const qty = calcQty(fixedRiskUsdt, entry, sl);
     if (qty === null) return;
     msg.quantity = qty;
+    msg.stop_loss_price = sl;
     sendSim(msg);
-    // While in the challenge the board shows our risk: keep it in sync.
-    if (inChallenge) {
-      sendSim({ type: "challenge", join: true, risk_usdt: fixedRiskUsdt });
-    }
   };
 
   const entryPreview = (): number | null => {
@@ -81,6 +79,12 @@ export function OrderPanel(): JSX.Element {
   const sl = num(stop);
   const qty = entry !== null && sl !== null ? calcQty(fixedRiskUsdt, entry, sl) : null;
   const ready = qty !== null;
+  const validLongStop = kind === "market"
+    ? lastPrice > 0 && sl !== null && sl < lastPrice
+    : entry !== null && sl !== null && sl < entry;
+  const validShortStop = kind === "market"
+    ? lastPrice > 0 && sl !== null && sl > lastPrice
+    : entry !== null && sl !== null && sl > entry;
   const preview =
     qty !== null
       ? `≈ ${qty.toPrecision(4)} ${base} · риск $${fixedRiskUsdt}`
@@ -99,6 +103,7 @@ export function OrderPanel(): JSX.Element {
           }}
           style={{ width: 90 }}
           aria-label="капитал, USDT"
+          disabled={inChallenge}
         />
         <span className="lbl">Риск</span>
         <input
@@ -109,6 +114,7 @@ export function OrderPanel(): JSX.Element {
           }}
           style={{ width: 70 }}
           aria-label="риск, USDT"
+          disabled={inChallenge}
         />
       </div>
       <div className="row" style={{ marginTop: 6 }}>
@@ -149,7 +155,7 @@ export function OrderPanel(): JSX.Element {
             />
           </>
         )}
-        <span className="lbl">Стоп</span>
+        <span className="lbl">Стоп-лосс</span>
         <input
           value={stop}
           onChange={(e) => setStop(e.target.value)}
@@ -158,10 +164,10 @@ export function OrderPanel(): JSX.Element {
         />
       </div>
       <div className="row" style={{ marginTop: 6 }}>
-        <button className="btn b-green" disabled={!ready} onClick={() => send("buy")}>BUY</button>
-        <button className="btn b-red" disabled={!ready} onClick={() => send("sell")}>SELL</button>
+        <button className="btn b-green" disabled={!ready || !validLongStop} onClick={() => send("buy")}>BUY</button>
+        <button className="btn b-red" disabled={!ready || !validShortStop} onClick={() => send("sell")}>SELL</button>
       </div>
-      <div className="status">{preview}</div>
+      <div className="status">{inChallenge ? `${preview} · риск за раунд зафиксирован` : preview}</div>
       {error && <div className="err">{error}</div>}
     </div>
   );

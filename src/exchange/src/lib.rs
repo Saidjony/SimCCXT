@@ -373,6 +373,8 @@ impl Exchange {
                 "markPrice": mark,
                 "unrealizedPnl": pnl + pos.realized_pnl,
                 "realizedPnl": pos.realized_pnl,
+                "leverage": self.broker.portfolio().leverage(sym),
+                "liquidationPrice": pos.liquidation_price,
             }));
         }
         for (sym, (qty, avg)) in self.spot_cost.clone() {
@@ -389,14 +391,12 @@ impl Exchange {
                 "markPrice": mark,
                 "unrealizedPnl": unrealized,
                 "realizedPnl": 0.0,
+                "leverage": 1.0,
+                "liquidationPrice": 0.0,
             }));
         }
 
-        // Open orders (across all symbols).
-        let mut orders = Vec::new();
-        for order in self.all_open_orders() {
-            orders.push(order_json(&order));
-        }
+        let orders = self.fetch_open_orders(None);
 
         let total_pnl = self.broker.portfolio().unrealized_pnl()
             + self.broker.portfolio().realized_pnl()
@@ -433,16 +433,26 @@ impl Exchange {
     /// trade feed. Optional symbol filter and limit.
     pub fn fetch_fills(&self, symbol: Option<&str>, limit: Option<usize>) -> Vec<Value> {
         let mut fills = self.broker.fills(symbol);
+        let mut fill_indices = HashMap::<String, usize>::new();
+        let ids: Vec<String> = fills.iter().map(|fill| {
+            let index = fill_indices.entry(fill.order_id.clone()).or_default();
+            let id = format!("{}_{}", fill.order_id, *index);
+            *index += 1;
+            id
+        }).collect();
         fills.reverse(); // newest first, like a live exchange feed
+        let mut ids = ids;
+        ids.reverse();
         if let Some(limit) = limit {
             fills.truncate(limit);
+            ids.truncate(limit);
         }
         fills
             .into_iter()
-            .enumerate()
-            .map(|(i, f)| {
+            .zip(ids)
+            .map(|(f, id)| {
                 json!({
-                    "id": format!("{}_{}", f.order_id, i),
+                    "id": id,
                     "symbol": f.symbol.symbol,
                     "side": if f.side == Side::Buy { "buy" } else { "sell" },
                     "type": order_type_str(f.order_type),
@@ -757,7 +767,13 @@ impl Exchange {
                 }
             }
         }
+        orders.extend(self.broker.conditional_orders(symbol).iter().map(conditional_order_json));
         orders
+    }
+
+    /// Conditional order ID responsible for a newly triggered execution fill.
+    pub fn take_triggered_order_source(&mut self, order_id: &str) -> Option<String> {
+        self.broker.take_triggered_order_source(order_id)
     }
 
     fn all_open_orders(&self) -> Vec<simccxt_order_engine::Order> {
@@ -929,6 +945,12 @@ fn order_json(order: &simccxt_order_engine::Order) -> Value {
         "type": order_type_str(order.order_type),
         "side": if order.side == Side::Buy { "buy" } else { "sell" },
         "price": order.price,
+        "triggerPrice": if order.order_type == OrderType::Stop
+            || order.order_type == OrderType::StopLimit
+            || order.order_type == OrderType::TakeProfit
+            || order.order_type == OrderType::TakeProfitLimit
+            || order.order_type == OrderType::TrailingStop
+        { order.price } else { None },
         "amount": order.amount,
         "filled": order.filled,
         "remaining": order.remaining,
@@ -937,6 +959,31 @@ fn order_json(order: &simccxt_order_engine::Order) -> Value {
         "timestamp": order.timestamp.timestamp_millis(),
         "datetime": order.timestamp.to_rfc3339(),
         "fee": order.fee,
+        "timeInForce": format!("{:?}", order.time_in_force),
+        "reduceOnly": order.reduce_only,
+        "postOnly": order.post_only,
+    })
+}
+
+fn conditional_order_json(order: &simccxt_broker::ConditionalOrder) -> Value {
+    json!({
+        "id": format!("conditional_{}", order.id),
+        "symbol": order.symbol.symbol,
+        "type": order_type_str(order.order_type),
+        "side": if order.side == Side::Buy { "buy" } else { "sell" },
+        "price": order.price,
+        "triggerPrice": order.trigger_price,
+        "amount": order.amount,
+        "remaining": order.amount,
+        "filled": 0.0,
+        "average": 0.0,
+        "status": "open",
+        "timeInForce": "GTC",
+        "reduceOnly": order.reduce_only,
+        "postOnly": false,
+        "timestamp": order.timestamp.timestamp_millis(),
+        "datetime": order.timestamp.to_rfc3339(),
+        "fee": 0.0,
     })
 }
 
@@ -1073,6 +1120,45 @@ mod tests {
         assert_eq!(order["status"], "closed");
         assert_eq!(order["side"], "buy");
         assert_eq!(order["filled"], 1.0);
+    }
+
+    #[test]
+    fn fill_ids_remain_stable_as_new_trades_arrive() {
+        let mut ex = exchange_with_data();
+        ex.create_order("BTC/USDT", "market", "buy", 1.0, None, CreateOrderParams::new())
+            .unwrap();
+        let first_before = ex.fetch_fills(None, None);
+        let original_id = first_before[0]["id"].clone();
+        let order_id = first_before[0]["orderId"].clone();
+        let timestamp = ex.now();
+        ex.apply_price(&Symbol::parse("BTC/USDT").unwrap(), 100.0, timestamp);
+        ex.create_order("BTC/USDT", "market", "buy", 0.5, None, CreateOrderParams::new())
+            .unwrap();
+        let first_after = ex.fetch_fills(None, None).into_iter()
+            .find(|fill| fill["orderId"] == order_id)
+            .expect("original fill remains in history");
+        assert_eq!(first_after["id"], original_id);
+    }
+
+    #[test]
+    fn conditional_stops_are_visible_and_cancelable_as_open_orders() {
+        let mut ex = exchange_with_data();
+        let stop = ex.create_order(
+            "BTC/USDT",
+            "stop",
+            "sell",
+            0.5,
+            None,
+            CreateOrderParams::new().stop_price(90.0).reduce_only(true),
+        ).unwrap();
+        assert_eq!(stop["type"], "stop");
+        assert_eq!(stop["triggerPrice"], 90.0);
+        let open = ex.fetch_open_orders(Some("BTC/USDT"));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0]["reduceOnly"], true);
+        let canceled = ex.cancel_order(stop["id"].as_str().unwrap(), "BTC/USDT").unwrap();
+        assert_eq!(canceled["status"], "canceled");
+        assert!(ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
     }
 
     #[test]
