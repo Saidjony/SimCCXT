@@ -201,8 +201,10 @@ export function Chart(): JSX.Element {
     chart.timeScale().subscribeVisibleLogicalRangeChange(bump);
 
     const onKey = (e: KeyboardEvent): void => {
-      const tag = (e.target as HTMLElement | null)?.tagName ?? "";
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, button, a, summary, [contenteditable='true'], [role='button']")) {
+        return;
+      }
       if (e.key === "Delete" || e.key === "Backspace") {
         const id = getState().selectedId;
         if (id) {
@@ -213,6 +215,15 @@ export function Chart(): JSX.Element {
         store.setTool("none");
         store.selectDrawing(null);
         pendingRef.current = [];
+      } else if (!e.repeat && e.key === " ") {
+        e.preventDefault();
+        sendSim({ type: "replay", action: getState().replay.paused ? "play" : "pause" });
+      } else if (!e.repeat && e.key === "ArrowRight") {
+        e.preventDefault();
+        sendSim({ type: "replay", action: "step", steps: 1 });
+      } else if (!e.repeat && e.key === "Home") {
+        e.preventDefault();
+        sendSim({ type: "replay", action: "reset" });
       }
     };
     window.addEventListener("keydown", onKey);

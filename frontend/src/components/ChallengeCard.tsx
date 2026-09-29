@@ -19,6 +19,7 @@ function fmtMoney(n: number): string {
  * Join sends the current fixed risk so the board can show R multiples.
  */
 export function ChallengeCard(): JSX.Element {
+  const [collapsed, setCollapsed] = useState(false);
   const nick = useSim((s) => s.nick);
   const serverNick = useSim((s) => s.serverNick);
   const inChallenge = useSim((s) => s.inChallenge);
@@ -47,53 +48,65 @@ export function ChallengeCard(): JSX.Element {
 
   return (
     <div className="card">
-      <div className="card-head">
-        <h4>Челлендж</h4>
+      <div className="card-head challenge-card-head">
+        <h4>
+          <button
+            className="challenge-toggle"
+            onClick={() => setCollapsed((value) => !value)}
+            aria-expanded={!collapsed}
+            aria-controls="challenge-card-content"
+          >
+            <span className="chev">{collapsed ? "▸" : "▾"}</span>Челлендж
+          </button>
+        </h4>
         {serverNick && <span className="nick-badge">{serverNick}</span>}
+        {board.length > 0 && <span className="challenge-count">{board.length}</span>}
       </div>
-      <div className="coin-add">
-        <input
-          value={shown}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") applyNick();
-          }}
-          onBlur={() => {
-            if (draft !== null && draft !== nick) applyNick();
-            else setDraft(null);
-          }}
-          placeholder="твой ник (пусто = рандомный)"
-          aria-label="ник для челленджа"
-        />
+      <div id="challenge-card-content" hidden={collapsed}>
+        <div className="coin-add">
+          <input
+            value={shown}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") applyNick();
+            }}
+            onBlur={() => {
+              if (draft !== null && draft !== nick) applyNick();
+              else setDraft(null);
+            }}
+            placeholder="твой ник (пусто = рандомный)"
+            aria-label="ник для челленджа"
+          />
+        </div>
+        <label className="crit-row" style={{ marginTop: 6 }}>
+          <input type="checkbox" checked={inChallenge} onChange={toggleJoin} />
+          <span>участвовать (видно всем)</span>
+        </label>
+        {board.length === 0 && (
+          <div className="lbl" style={{ marginTop: 6 }}>пока пусто — участники появятся здесь</div>
+        )}
+        {board.length > 0 && (
+          <table className="grid-table board-table">
+            <thead>
+              <tr><th>Ник</th><th>Риск $</th><th>PnL $</th><th>R</th></tr>
+            </thead>
+            <tbody>
+              {board.map((e) => (
+                <tr key={e.nick} className={e.nick === serverNick ? "me" : ""}>
+                  <td>{e.nick}</td>
+                  <td className="num">{e.risk}</td>
+                  <td className={"num" + (e.pnl > 0 ? " pos" : e.pnl < 0 ? " neg" : "")}>
+                    {fmtMoney(e.pnl)}
+                  </td>
+                  <td className={"num" + (e.r > 0 ? " pos" : e.r < 0 ? " neg" : "")}>
+                    {fmtR(e.r)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
-      <label className="crit-row" style={{ marginTop: 6 }}>
-        <input type="checkbox" checked={inChallenge} onChange={toggleJoin} />
-        <span>участвовать (видно всем)</span>
-      </label>
-      {board.length === 0 && (
-        <div className="lbl" style={{ marginTop: 6 }}>пока пусто — участники появятся здесь</div>
-      )}
-      {board.length > 0 && (
-        <table className="grid-table board-table">
-          <thead>
-            <tr><th>Ник</th><th>Риск $</th><th>PnL $</th><th>R</th></tr>
-          </thead>
-          <tbody>
-            {board.map((e) => (
-              <tr key={e.nick} className={e.nick === serverNick ? "me" : ""}>
-                <td>{e.nick}</td>
-                <td className="num">{e.risk}</td>
-                <td className={"num" + (e.pnl > 0 ? " pos" : e.pnl < 0 ? " neg" : "")}>
-                  {fmtMoney(e.pnl)}
-                </td>
-                <td className={"num" + (e.r > 0 ? " pos" : e.r < 0 ? " neg" : "")}>
-                  {fmtR(e.r)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
     </div>
   );
 }
