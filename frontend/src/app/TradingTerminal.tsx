@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import { useSimSocket } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
 import { ChartWorkspace } from "../chart/ChartWorkspace";
-import { OrderPanel } from "../components/OrderPanel";
 import { ReplayControls } from "../components/ReplayControls";
 import { CoinList } from "../components/CoinList";
 import { ChallengeCard } from "../components/ChallengeCard";
 import { BottomTerminal } from "../components/Panels";
+import type { ExchangeId } from "../types/protocol";
+import { sendSim } from "../websocket/connection";
+import { store } from "../state/store";
 
 /** Connection + data-age badge: "connected · data 2s ago" vs "connecting…". */
 function ConnBadge(): JSX.Element {
@@ -36,11 +38,30 @@ export function TradingTerminal(): JSX.Element {
   useSimSocket();
   const error = useSim((s) => s.error);
   const serverNick = useSim((s) => s.serverNick);
+  const symbol = useSim((s) => s.symbol);
+  const timeframe = useSim((s) => s.timeframe);
+  const exchange = useSim((s) => s.exchange);
 
   return (
     <div className="app">
       <header className="topbar">
         <span className="logo">simccxt</span>
+        <label className="exchange-picker">
+          <span>Биржа</span>
+          <select
+            aria-label="Биржа данных"
+            value={exchange}
+            onChange={(event) => {
+              const next = event.target.value as ExchangeId;
+              store.setExchange(next);
+              sendSim({ type: "subscribe", symbol, timeframe, exchange: next });
+            }}
+          >
+            <option value="binance">Binance</option>
+            <option value="bybit">Bybit</option>
+            <option value="okx">OKX</option>
+          </select>
+        </label>
         <ConnBadge />
         {serverNick && <span className="nick-badge">вы: {serverNick}</span>}
         {error && <span className="err">{error}</span>}
@@ -53,7 +74,6 @@ export function TradingTerminal(): JSX.Element {
           <CoinList />
           <ChallengeCard />
           <ReplayControls />
-          <OrderPanel />
         </aside>
       </div>
       <div className="bottom">

@@ -3,6 +3,7 @@ import type {
   AccountSnapshot,
   CandleRow,
   ChallengeEntry,
+  ExchangeId,
   FillLine,
   OrderLine,
   ReplayState,
@@ -41,7 +42,27 @@ export interface CoinEntry {
   flagged: boolean;
 }
 
+function loadExchange(): ExchangeId {
+  try {
+    const saved = window.localStorage.getItem(EXCHANGE_KEY);
+    if (EXCHANGE_IDS.includes(saved as ExchangeId)) return saved as ExchangeId;
+  } catch {
+    // Use Binance when storage is unavailable.
+  }
+  return "binance";
+}
+
+function persistExchange(exchange: ExchangeId): void {
+  try {
+    window.localStorage.setItem(EXCHANGE_KEY, exchange);
+  } catch {
+    // Keep the selected exchange for this page load.
+  }
+}
+
 const WATCHLIST_KEY = "simccxt.watchlist.v1";
+const EXCHANGE_KEY = "simccxt.exchange.v1";
+const EXCHANGE_IDS: ExchangeId[] = ["binance", "bybit", "okx"];
 const DEFAULT_WATCHLIST: CoinEntry[] = [
   { symbol: "BTC/USDT", flagged: false },
   { symbol: "ETH/USDT", flagged: false },
@@ -139,15 +160,23 @@ function loadChartCriteria(): Record<string, string[]> {
     if (raw) {
       const parsed: unknown = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return Object.fromEntries(
-          Object.entries(parsed).map(([key, value]) => [key, validList(value)]),
-        );
+        const values = parsed as Record<string, unknown>;
+        const next: Record<string, string[]> = {};
+        for (const [panel, timeframe] of [["top", "5m"], ["hour", "1h"], ["day", "1d"]]) {
+          if (Array.isArray(values[panel]) && !Array.isArray(values[timeframe])) {
+            next[timeframe] = validList(values[panel]);
+          }
+        }
+        for (const [key, value] of Object.entries(values)) {
+          if (/^(1m|5m|15m|1h|4h|1d)$/.test(key)) next[key] = validList(value);
+        }
+        return next;
       }
     }
   } catch {
     // Private mode or corrupt data: use the legacy top-chart selection.
   }
-  return { top: loadCriteria() };
+  return { "5m": loadCriteria() };
 }
 
 function persistChartCriteria(criteria: Record<string, string[]>): void {
@@ -243,6 +272,7 @@ export interface SimState {
   status: "connecting" | "open" | "closed";
   clientId: number | null;
   symbol: string;
+  exchange: ExchangeId;
   timeframe: string;
   candles: CandleRow[];
   /** Bumped on every candle change; chart applies setData/update incrementally. */
@@ -310,6 +340,7 @@ let state: SimState = {
   status: "connecting",
   clientId: null,
   symbol: "BTC/USDT",
+  exchange: loadExchange(),
   timeframe: "5m",
   candles: [],
   candlesVersion: 0,
@@ -383,12 +414,18 @@ export const store = {
   setStatus(s: SimState["status"]): void {
     set({ status: s });
   },
+  setExchange(exchange: ExchangeId): void {
+    if (!EXCHANGE_IDS.includes(exchange)) return;
+    set({ exchange });
+    persistExchange(exchange);
+  },
   setClientId(id: number): void {
     set({ clientId: id });
   },
   /** Full historical dataset: afterwards only deltas arrive. */
   applySnapshot(
     symbol: string,
+    exchange: ExchangeId,
     timeframe: string,
     candles: CandleRow[],
     account: AccountSnapshot,
@@ -396,8 +433,10 @@ export const store = {
     oi: Array<[number, number]>,
     oiPeriod: string,
   ): void {
+    const selectedExchange = EXCHANGE_IDS.includes(exchange) ? exchange : state.exchange;
     set({
       symbol,
+      exchange: selectedExchange,
       timeframe,
       candles,
       candlesVersion: state.candlesVersion + 1,
@@ -409,6 +448,7 @@ export const store = {
       oiPeriod,
       error: null,
     });
+    persistExchange(selectedExchange);
   },
   consumedReset(): void {
     if (state.fullReset) set({ fullReset: false });

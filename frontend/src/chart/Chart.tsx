@@ -18,7 +18,6 @@ import { sendSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import {
-  alignOiToCandles,
   countBars,
   cumulativeDelta,
   formatRuler,
@@ -90,13 +89,15 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
  * Every drawing is an HTML overlay: uniform drag, right-click delete,
  * live ghost preview while placing.
  */
-export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
+export function Chart(): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const oiWrapRef = useRef<HTMLDivElement | null>(null);
+  const cvdWrapRef = useRef<HTMLDivElement | null>(null);
   const oiChartRef = useRef<IChartApi | null>(null);
+  const cvdChartRef = useRef<IChartApi | null>(null);
   const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const cvdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   /** Guard against ping-pong when syncing the two time scales. */
@@ -135,27 +136,16 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
   const symbol = useSim((s) => s.symbol);
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
-  const criteria = useSim((s) => s.chartCriteria[panelId] ?? []);
+  const criteria = useSim((s) => s.chartCriteria[s.timeframe] ?? []);
   const oiVisible = useSim((s) => s.oiVisible);
   const cvdVisible = useSim((s) => s.cvdVisible);
   const oiPeriod = useSim((s) => s.oiPeriod);
   const toolRef = useRef(tool);
   toolRef.current = tool;
   const marketData = getState();
-  const visibleRange = chartRef.current?.timeScale().getVisibleRange();
-  const visibleFromMs = visibleRange ? timeToMs(visibleRange.from) : null;
-  const visibleToMs = visibleRange ? timeToMs(visibleRange.to) : null;
-  const oiOverlapsVisibleRange =
-    marketData.oi.length > 0 &&
-    visibleFromMs !== null &&
-    visibleToMs !== null &&
-    marketData.oi[0][0] <= visibleToMs &&
-    marketData.oi[marketData.oi.length - 1][0] >= visibleFromMs;
   const oiLabel = marketData.oi.length === 0
     ? "OI · нет данных"
-    : oiOverlapsVisibleRange
-      ? "OI · " + (oiPeriod || "доступно")
-      : "OI · вне видимой области";
+    : "OI · " + (oiPeriod || "история");
 
   // Create the chart once.
   useEffect(() => {
@@ -314,11 +304,12 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
     try {
       pushBars(chart, bars, volume, s.candles, s.fullReset);
       store.consumedReset();
+      if (s.fullReset) chart.priceScale("right").applyOptions({ autoScale: true });
       if (followRef.current) chart.timeScale().scrollToRealTime();
-      // OI samples are sparse, so project them onto the candle grid. Keep the
-      // pane's dates aligned after snapshots and incremental candle updates.
-      if (oiSeriesRef.current && oiChartRef.current) {
-        pushOi(oiSeriesRef.current, s.oi, s.candles);
+      // OI has its own time axis; CVD remains aligned to the candle range.
+      if (s.fullReset && oiSeriesRef.current && oiChartRef.current) {
+        pushOi(oiSeriesRef.current, s.oi);
+        oiChartRef.current.timeScale().fitContent();
       }
       if (cvdSeriesRef.current) {
         pushCvd(cvdSeriesRef.current, s.candles);
@@ -326,9 +317,9 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
     } finally {
       syncingRef.current = false;
     }
-    if (oiChartRef.current) {
-      syncOiToMain();
-      scheduleOiSync();
+    if (cvdChartRef.current) {
+      syncCvdToMain();
+      scheduleCvdSync();
     }
     setViewTick((n) => n + 1);
   }, [version]);
@@ -355,96 +346,93 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
     }
   }, [fills]);
 
-  // Open-interest + CVD pane (TradingView-style subchart below the main
-  // chart): its own chart instance, OI on the right scale, CVD on the left.
-  // Both series use candle timestamps so logical ranges stay identical.
+  // OI gets its own fitted time axis so its shorter history is always visible.
+  // CVD remains tied to the main chart's candle range.
   useEffect(() => {
-    if (!oiVisible && !cvdVisible) {
+    const observers: ResizeObserver[] = [];
+    const main = chartRef.current;
+    let cvdRangeListener: (() => void) | null = null;
+    let mainRangeListener: (() => void) | null = null;
+
+    if (oiVisible && oiWrapRef.current) {
+      const el = oiWrapRef.current;
+      const chart = createChart(el, indicatorChartOptions(el, false));
+      const line = chart.addLineSeries({
+        color: "#e0af68",
+        lineWidth: 2,
+        priceLineVisible: false,
+        crosshairMarkerVisible: true,
+      });
+      oiChartRef.current = chart;
+      oiSeriesRef.current = line;
+      pushOi(line, getState().oi);
+      chart.timeScale().fitContent();
+      const observer = new ResizeObserver(() => {
+        chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+      });
+      observer.observe(el);
+      observers.push(observer);
+    } else {
       oiChartRef.current = null;
       oiSeriesRef.current = null;
+    }
+
+    if (cvdVisible && cvdWrapRef.current) {
+      const el = cvdWrapRef.current;
+      const chart = createChart(el, indicatorChartOptions(el, true));
+      const line = chart.addLineSeries({
+        color: "#4a9ec4",
+        lineWidth: 1,
+        priceScaleId: "left",
+        priceLineVisible: false,
+        crosshairMarkerVisible: true,
+      });
+      cvdChartRef.current = chart;
+      cvdSeriesRef.current = line;
+      pushCvd(line, getState().candles);
+      syncCvdToMain();
+      const observer = new ResizeObserver(() => {
+        chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+        scheduleCvdSync();
+      });
+      observer.observe(el);
+      observers.push(observer);
+      mainRangeListener = (): void => {
+        if (syncingRef.current) return;
+        syncCvdToMain();
+      };
+      cvdRangeListener = (): void => {
+        if (syncingRef.current || !main) return;
+        const range = chart.timeScale().getVisibleLogicalRange();
+        if (!range) return;
+        syncingRef.current = true;
+        try {
+          main.timeScale().setVisibleLogicalRange(range);
+        } catch {
+          // Main and CVD share candle timestamps; a transient empty range is ignored.
+        } finally {
+          syncingRef.current = false;
+        }
+      };
+      main?.timeScale().subscribeVisibleLogicalRangeChange(mainRangeListener);
+      chart.timeScale().subscribeVisibleLogicalRangeChange(cvdRangeListener);
+    } else {
+      cvdChartRef.current = null;
       cvdSeriesRef.current = null;
-      const main = chartRef.current;
       main?.priceScale("left").applyOptions({ visible: false, minimumWidth: 0 });
       main?.priceScale("right").applyOptions({ minimumWidth: 0 });
-      return;
     }
-    const el = oiWrapRef.current;
-    if (!el) return;
-    const oic = createChart(el, {
-      width: el.clientWidth,
-      height: el.clientHeight,
-      layout: {
-        background: { type: ColorType.Solid, color: "#0b0e13" },
-        textColor: "#7d8590",
-        fontSize: 11,
-      },
-      grid: {
-        vertLines: { color: "#141b26" },
-        horzLines: { color: "#141b26" },
-      },
-      crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: "#222c3b" },
-      leftPriceScale: { visible: true, borderColor: "#222c3b" },
-      timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
-    });
-    const line = oic.addLineSeries({
-      color: "#e0af68",
-      lineWidth: 2,
-      priceLineVisible: false,
-      crosshairMarkerVisible: true,
-    });
-    const cvd = oic.addLineSeries({
-      color: "#4a9ec4",
-      lineWidth: 1,
-      priceScaleId: "left",
-      priceLineVisible: false,
-      crosshairMarkerVisible: true,
-    });
-    oiChartRef.current = oic;
-    oiSeriesRef.current = line;
-    cvdSeriesRef.current = cvd;
-    pushOi(line, getState().oi, getState().candles);
-    pushCvd(cvd, getState().candles);
-    line.applyOptions({ visible: getState().oiVisible });
-    cvd.applyOptions({ visible: getState().cvdVisible });
-    syncOiToMain();
-    scheduleOiSync();
-    const ro = new ResizeObserver(() => {
-      oic.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-      if (chartRef.current) {
-        syncOiToMain();
-        scheduleOiSync();
-      }
-    });
-    ro.observe(el);
-    const main = chartRef.current;
-    const onMainRange = (): void => {
-      if (syncingRef.current || !main) return;
-      syncOiToMain();
-      scheduleOiSync();
-    };
-    const onOiRange = (): void => {
-      if (syncingRef.current || !main) return;
-      syncingRef.current = true;
-      try {
-        alignPriceScales(main, oic);
-        const range = oic.timeScale().getVisibleLogicalRange();
-        if (range) main.timeScale().setVisibleLogicalRange(range);
-      } catch {
-        /* The range may be outside the currently loaded candle history. */
-      } finally {
-        syncingRef.current = false;
-      }
-      scheduleOiSync();
-    };
-    main?.timeScale().subscribeVisibleLogicalRangeChange(onMainRange);
-    oic.timeScale().subscribeVisibleLogicalRangeChange(onOiRange);
+
     return () => {
-      main?.timeScale().unsubscribeVisibleLogicalRangeChange(onMainRange);
-      oic.timeScale().unsubscribeVisibleLogicalRangeChange(onOiRange);
-      ro.disconnect();
-      oic.remove();
+      if (mainRangeListener) main?.timeScale().unsubscribeVisibleLogicalRangeChange(mainRangeListener);
+      if (cvdRangeListener && cvdChartRef.current) {
+        cvdChartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(cvdRangeListener);
+      }
+      observers.forEach((observer) => observer.disconnect());
+      oiChartRef.current?.remove();
+      cvdChartRef.current?.remove();
       oiChartRef.current = null;
+      cvdChartRef.current = null;
       oiSeriesRef.current = null;
       cvdSeriesRef.current = null;
     };
@@ -452,11 +440,6 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
   }, [oiVisible, cvdVisible]);
 
   // Toggle a bottom-pane series without rebuilding the chart.
-  useEffect(() => {
-    oiSeriesRef.current?.applyOptions({ visible: oiVisible });
-    cvdSeriesRef.current?.applyOptions({ visible: cvdVisible });
-  }, [oiVisible, cvdVisible]);
-
   return (
     <div
       className="chartwrap"
@@ -486,11 +469,11 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
       }}
     >
       <div ref={containerRef} className="chart" />
-      {(oiVisible || cvdVisible) && (
+      {oiVisible && (
         <div
           ref={oiWrapRef}
           className="oi-wrap"
-          style={{ flexBasis: oiPaneHeight, height: oiPaneHeight }}
+          style={{ flexBasis: cvdVisible ? oiPaneHeight / 2 : oiPaneHeight, height: cvdVisible ? oiPaneHeight / 2 : oiPaneHeight }}
         >
           <div
             className="oi-resize-handle"
@@ -509,11 +492,35 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
             title="Перетащите, чтобы изменить высоту индикаторов"
           />
           <div className="oi-label">
-            {[
-              oiVisible ? oiLabel : "",
-              cvdVisible ? "CVD" : "",
-            ].filter(Boolean).join(" + ")}
+            {oiLabel}
           </div>
+        </div>
+      )}
+      {cvdVisible && (
+        <div
+          ref={cvdWrapRef}
+          className="oi-wrap cvd-wrap"
+          style={{ flexBasis: oiVisible ? oiPaneHeight / 2 : oiPaneHeight, height: oiVisible ? oiPaneHeight / 2 : oiPaneHeight }}
+        >
+          {!oiVisible && (
+            <div
+              className="oi-resize-handle"
+              role="separator"
+              aria-label="Изменить высоту панели индикаторов"
+              aria-orientation="horizontal"
+              aria-valuemin={72}
+              aria-valuemax={Math.round((containerRef.current?.parentElement?.clientHeight ?? 600) * 0.45)}
+              aria-valuenow={Math.round(oiPaneHeight)}
+              onPointerDown={startOiPaneResize}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowUp") updateOiPaneHeight(oiPaneHeight + 8);
+                if (event.key === "ArrowDown") updateOiPaneHeight(oiPaneHeight - 8);
+              }}
+              tabIndex={0}
+              title="Перетащите, чтобы изменить высоту индикаторов"
+            />
+          )}
+          <div className="oi-label">CVD</div>
         </div>
       )}
       <DrawBar />
@@ -673,33 +680,33 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
     }
   }
 
-  function scheduleOiSync(): void {
+  function scheduleCvdSync(): void {
     if (scaleSyncRafRef.current) {
       window.cancelAnimationFrame(scaleSyncRafRef.current);
     }
     scaleSyncRafRef.current = window.requestAnimationFrame(() => {
       scaleSyncRafRef.current = window.requestAnimationFrame(() => {
         scaleSyncRafRef.current = 0;
-        syncOiToMain();
+        syncCvdToMain();
         setViewTick((n) => n + 1);
       });
     });
   }
 
-  /** Fit the OI pane to the main chart's visible range (guarded by callers). */
-  function syncOiToMain(): void {
+  /** Keep the CVD candle index aligned with the main chart. */
+  function syncCvdToMain(): void {
     const main = chartRef.current;
-    const oic = oiChartRef.current;
-    if (!main || !oic) return;
+    const cvd = cvdChartRef.current;
+    if (!main || !cvd) return;
     const r = main.timeScale().getVisibleLogicalRange();
     if (!r) return;
     syncingRef.current = true;
     try {
-      alignPriceScales(main, oic);
+      alignPriceScales(main, cvd);
       const alignedRange = main.timeScale().getVisibleLogicalRange();
-      if (alignedRange) oic.timeScale().setVisibleLogicalRange(alignedRange);
+      if (alignedRange) cvd.timeScale().setVisibleLogicalRange(alignedRange);
     } catch {
-      /* An empty OI and CVD pane has no time range to synchronize. */
+      /* The CVD pane can briefly be empty while a snapshot is applied. */
     } finally {
       syncingRef.current = false;
     }
@@ -794,7 +801,7 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
   function replayFrom(ms: number): void {
     const s = getState();
     sendSim({ type: "replay", action: "reset", timestamp_ms: ms });
-    sendSim({ type: "subscribe", symbol: s.symbol, timeframe: s.timeframe });
+    sendSim({ type: "subscribe", symbol: s.symbol, timeframe: s.timeframe, exchange: s.exchange });
   }
 
   // ---- drag existing drawings ----
@@ -1127,13 +1134,33 @@ export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
   }
 }
 
-function pushOi(
-  line: ISeriesApi<"Line">,
-  samples: Array<[number, number]>,
-  candles: CandleRow[],
-): void {
-  const aligned = alignOiToCandles(candles, samples);
-  line.setData(aligned.map(([ms, v]) => ({ time: toTime(ms), value: v })));
+function indicatorChartOptions(el: HTMLDivElement, cvd: boolean) {
+  return {
+    width: el.clientWidth,
+    height: el.clientHeight,
+    layout: {
+      background: { type: ColorType.Solid, color: "#0b0e13" },
+      textColor: "#7d8590",
+      fontSize: 11,
+    },
+    grid: {
+      vertLines: { color: "#141b26" },
+      horzLines: { color: "#141b26" },
+    },
+    crosshair: { mode: CrosshairMode.Normal },
+    rightPriceScale: { borderColor: "#222c3b" },
+    leftPriceScale: { visible: cvd, borderColor: "#222c3b" },
+    timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
+  };
+}
+
+function pushOi(line: ISeriesApi<"Line">, samples: Array<[number, number]>): void {
+  line.setData(
+    samples
+      .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value))
+      .sort((a, b) => a[0] - b[0])
+      .map(([ms, value]) => ({ time: toTime(ms), value })),
+  );
 }
 
 function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[]): void {

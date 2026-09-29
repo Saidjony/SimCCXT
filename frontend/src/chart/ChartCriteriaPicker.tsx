@@ -1,8 +1,8 @@
 import { CRITERIA } from "../trade/criteria";
 import { store, useSim } from "../state/store";
 
-export function ChartCriteriaPicker({ panel }: { panel: string }): JSX.Element {
-  const selected = useSim((s) => s.chartCriteria[panel] ?? []);
+export function ChartCriteriaPicker({ timeframe }: { timeframe: string }): JSX.Element {
+  const selected = useSim((s) => s.chartCriteria[timeframe] ?? []);
 
   return (
     <details className="chart-criteria">
@@ -13,7 +13,7 @@ export function ChartCriteriaPicker({ panel }: { panel: string }): JSX.Element {
         <div className="chart-criteria-head">
           <span>Критерии графика</span>
           {selected.length > 0 && (
-            <button className="btn b-dim" onClick={() => store.clearChartCriteria(panel)}>
+            <button className="btn b-dim" onClick={() => store.clearChartCriteria(timeframe)}>
               Сбросить
             </button>
           )}
@@ -24,7 +24,7 @@ export function ChartCriteriaPicker({ panel }: { panel: string }): JSX.Element {
               <input
                 type="checkbox"
                 checked={selected.includes(criterion.id)}
-                onChange={() => store.toggleChartCriterion(panel, criterion.id)}
+                onChange={() => store.toggleChartCriterion(timeframe, criterion.id)}
               />
               <span>{criterion.label}</span>
             </label>

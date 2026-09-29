@@ -115,25 +115,21 @@ frontend/test             pure protocol/math tests (bun test / npm test)
 
 **Chart workspace.** Three charts: the main chart occupies the upper half,
 with two independent charts side by side below. Defaults are 5m, 1h and 1d;
-each chart has its own timeframe and criteria selection. The lower charts have
+each chart has its own timeframe; criteria are saved per timeframe and shared
+between panels showing that timeframe. The lower charts have
 independent market-data feeds. Drag the dividers to resize the panels and the
 main chart's indicator pane; layout sizes persist in the browser. Drawings are
 projected onto each chart's nearest candle and price scale. Expand any chart to
 fill the workspace and restore the three-panel layout with the same control.
-The main chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and
-fills markers.
+The price scale is reset to auto-fit when new timeframe data arrives. The main
+chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and fills markers.
 
-**Open interest + CVD** (pane under the main chart, TradingView-style). A separate
-chart with two line series on opposite scales: OI on the right, cumulative
-volume delta on the left; the time axis syncs both ways with the main chart.
-Toggle with the `OI` / `CVD` buttons (persisted per browser; the pane hides
-when both are off). OI comes in the snapshot (`oi` + `oi_period`) as static
-context — sparse OI samples are projected onto the candle timestamps, and both
-panels sync by visible time range (not bar index), including after timeframe
-changes. CVD is computed client-side over the loaded series and follows every
-tick. The chart displays when OI is unavailable or outside the visible range.
-Binance OI history is limited to 30 days; for a 1h grid, at most 720
-points are requested.
+**Open interest + CVD** are separate resizable charts below the price chart.
+OI uses an independent fitted time range so its shorter history stays visible;
+CVD follows the main chart's candle range. Toggle either with the `OI` / `CVD`
+buttons. CVD is computed client-side over the loaded series and follows every
+tick. If a venue does not expose open-interest history, that pane reports that
+there is no OI data.
 
 **Volume profile** (right side of the chart). Fixed-range horizontal volume
 over the VISIBLE bars: 64 price levels, POC flagged with its price. Recomputed
@@ -141,13 +137,22 @@ on pan/zoom/data changes and positioned through the chart's current price
 scale, so it tracks both visible bars and price-axis changes; clicks pass
 through to the chart.
 
+**Exchange and coin selection.** Choose Binance (default), Bybit or OKX in the
+top bar. The Rust server uses CCXT's unified API for exchange-specific OHLCV and
+available OI history, with exchange-scoped disk caches. Unsupported pairs or
+timeframes are reported instead of silently displaying synthetic candles.
+Paper orders and replay remain handled by the simulator.
+
 **Coin list** (top card of the right panel, collapsible via the header).
 Add coins (`BASE/QUOTE` input, Enter or `+`), remove them (`×`), flag them
 (flag icon → the coin moves into the pinned "флаг" group above the rest).
-Clicking a row switches the main chart's series in Rust; removing the active
+Clicking a row switches the main chart's series on the selected exchange in Rust; removing the active
 coin jumps to the next one. The list and its collapsed state persist per
-browser (localStorage). Each chart's criteria checklist is independent and
-persists per browser.
+browser (localStorage).
+
+**Account, positions, orders and trades** are in the full-width terminal below
+the charts; scroll down to view them. The paper-trading order form is also
+available as a bottom-terminal tab.
 
 **Drawings** (icon toolbar, top-right inside the chart; all local, never trade
 signals; drag to move with bar magnet, right-click / `Del` to delete,
@@ -391,28 +396,25 @@ print(ex.account_snapshot())              # position + PnL (Rust-computed)
 print(ex.fetch_fills(None, None))         # account's own fills
 ```
 
-## Data layer: disk cache + Binance download
+## Data layer: disk cache + Rust CCXT
 
 The Rust server itself implements "not on disk → fetch from the internet"
-(`src/server/src/main.rs`: `ensure_series` / `download_series`), so the terminal
-needs no Python to load data:
+(`src/server/src/market_data.rs`: `ensure_series` / `download_series`) using
+CCXT's unified exchange API, so the terminal needs no Python to load data:
 
-- Order per `symbol@timeframe`: **already in memory → disk cache → Binance
+- Order per `exchange@symbol@timeframe`: **already in memory → disk cache → CCXT
   download → synthetic fallback** (synthetic is always logged, never silent).
-- Cache files: `data/ohlcv/{SYMBOL}_{timeframe}.csv`
-  (e.g. `data/ohlcv/BTCUSDT_1m.csv`), columns
-  `ts_ms,open,high,low,close,volume` with millisecond timestamps.
-- Download: Binance public klines (`/api/v3/klines`, no API key), up to
-  5 000 bars, paginated (1 000/page, 150 ms between pages), hosts tried in
-  order `api.binance.com` → `data-api.binance.vision` (geo-restriction
-  mirror). Success writes the cache so the next run is offline-instant.
-- Open interest: USDT-M futures `openInterestHist` (no API key), mapped
-  1m→5m (Binance has no 1m OI), up to 1 500 points, cached as
-  `data/ohlcv/{SYMBOL}_oi_{period}.csv`. No futures mirror exists — a
-  geo-block here means "no OI", klines still work.
-- `--offline` disables downloads (synthetic fallback only). Unit tests always
-  run offline (`Engine::new` defaults `allow_net=false`).
-- Offline / bad symbol / empty range → deterministic synthetic data
+- Binance cache files retain `data/ohlcv/{SYMBOL}_{timeframe}.csv`;
+  Bybit and OKX caches have an exchange prefix.
+- Download: CCXT Rust is built with only the `binance`, `bybit` and `okx`
+  features; no API keys are required for public OHLCV.
+- Open interest is requested through CCXT where the selected venue supports
+  unified open-interest history. Samples are cached per exchange and symbol.
+- Online unsupported/invalid markets return a clear error instead of synthetic
+  data. `--offline` disables downloads and uses deterministic synthetic data.
+- `Engine::new` defaults to `allow_net=false`, so unit tests remain offline.
+- Historical cache format: `ts_ms,open,high,low,close,volume` with millisecond
+  timestamps.
   (explicitly reported in the server log).
 - `examples/market_data.py` (stdlib-only legacy helper) can prefill the same
   cache files for date ranges; repeat runs are instant (cache hit).
@@ -446,7 +448,7 @@ needs no Python to load data:
 | rapid clicks drop drawing points | fixed: placement uses manual mouseup detection, the chart's click event swallows fast clicks |
 | chart stays at 1 bar | clock starts paused after reset — press ▶ (play) |
 | `fetch_ohlcv_live` returns nothing after `reset` (legacy Python API) | clock starts paused — call `resume()` before `step()` |
-| Binance download slow/fails | normal for large ranges (paginated, ~0.15 s politeness delay); the server falls back to seeded synthetic data and logs it |
+| Live download slow/fails | check server logs and exchange/API availability; online download errors are surfaced instead of substituting synthetic data (synthetic bars are used only in offline mode) |
 | `import simccxt` resolves to a stray `simccxt.so` | delete repo-root copies; the venv-installed package is canonical (legacy bindings only) |
 
 ## License

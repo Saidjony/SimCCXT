@@ -2,6 +2,7 @@ import { useState } from "react";
 import { nextRequestId, sendSim } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
 import { formatMoney } from "../types/protocol";
+import { OrderPanel } from "./OrderPanel";
 
 /** Balances + equity + PnL, all computed in Rust. */
 export function Account(): JSX.Element {
@@ -137,13 +138,14 @@ export function Trades(): JSX.Element {
   );
 }
 
-type TabId = "account" | "positions" | "orders" | "trades";
+type TabId = "account" | "positions" | "orders" | "trades" | "trade";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "account", label: "Account" },
   { id: "positions", label: "Positions" },
   { id: "orders", label: "Orders" },
   { id: "trades", label: "Trades" },
+  { id: "trade", label: "New order" },
 ];
 
 /** Full-width bottom terminal: one wide table under tabs, no inner scroll. */
@@ -179,6 +181,7 @@ export function BottomTerminal(): JSX.Element {
         {tab === "positions" && <Positions />}
         {tab === "orders" && <Orders />}
         {tab === "trades" && <Trades />}
+        {tab === "trade" && <OrderPanel />}
       </div>
     </div>
   );

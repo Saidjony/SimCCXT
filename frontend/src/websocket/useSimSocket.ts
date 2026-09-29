@@ -12,7 +12,12 @@ function route(m: ServerMessage): void {
   switch (m.type) {
     case "welcome":
       store.setClientId(m.client_id);
-      sendSim({ type: "subscribe", symbol: getState().symbol, timeframe: getState().timeframe });
+      sendSim({
+        type: "subscribe",
+        symbol: getState().symbol,
+        timeframe: getState().timeframe,
+        exchange: getState().exchange,
+      });
       // Restore identity: login (stored nick or empty = server random nick),
       // then rejoin the challenge when the user opted in before.
       sendSim({ type: "login", name: getState().nick });
@@ -21,10 +26,12 @@ function route(m: ServerMessage): void {
       }
       break;
     case "snapshot":
-      store.applySnapshot(m.symbol, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period);
+      store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period);
       break;
     case "candle":
-      if (m.symbol === getState().symbol) store.applyCandle(m.candle);
+      if (m.symbol === getState().symbol && (!m.exchange || m.exchange === getState().exchange)) {
+        store.applyCandle(m.candle);
+      }
       break;
     case "market_update":
       store.applyMarket(m.last);
@@ -46,7 +53,12 @@ function route(m: ServerMessage): void {
       break;
     case "resync":
       // We lagged and missed candles: full snapshot again, then deltas resume.
-      sendSim({ type: "subscribe", symbol: getState().symbol, timeframe: getState().timeframe });
+      sendSim({
+        type: "subscribe",
+        symbol: getState().symbol,
+        timeframe: getState().timeframe,
+        exchange: getState().exchange,
+      });
       break;
     case "login_ok":
       store.applyLogin(m.nick);

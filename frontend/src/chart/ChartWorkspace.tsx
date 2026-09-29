@@ -57,6 +57,7 @@ function loadMiniTimeframes(): Timeframes {
 export function ChartWorkspace(): JSX.Element {
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const symbol = useSim((s) => s.symbol);
+  const exchange = useSim((s) => s.exchange);
   const timeframe = useSim((s) => s.timeframe);
   const [miniTimeframes, setMiniTimeframes] = useState(loadMiniTimeframes);
   const [layout, setLayout] = useState(loadLayout);
@@ -64,7 +65,7 @@ export function ChartWorkspace(): JSX.Element {
   const [maximized, setMaximized] = useState<PanelId | null>(null);
 
   const setMainTimeframe = (next: string): void => {
-    sendSim({ type: "subscribe", symbol, timeframe: next });
+    sendSim({ type: "subscribe", symbol, timeframe: next, exchange });
   };
   const setMiniTimeframe = (panel: Exclude<PanelId, "top">, next: string): void => {
     const value = { ...miniTimeframes, [panel]: next };
@@ -133,7 +134,7 @@ export function ChartWorkspace(): JSX.Element {
             >
               {CHART_TIMEFRAMES.map((item) => <option key={item} value={item}>{item}</option>)}
             </select>
-            <ChartCriteriaPicker panel="top" />
+            <ChartCriteriaPicker timeframe={timeframe} />
             <button
               className="btn b-dim chart-maximize"
               onClick={() => toggleMaximize("top")}
@@ -144,7 +145,7 @@ export function ChartWorkspace(): JSX.Element {
             </button>
           </header>
           <div className="chart-pane-body chart-pane-main">
-            <Chart panelId="top" />
+            <Chart />
           </div>
         </section>
       )}
