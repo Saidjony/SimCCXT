@@ -150,8 +150,12 @@ coin jumps to the next one. The list and its collapsed state persist per
 browser (localStorage).
 
 **Account, positions, orders and trades** are in the full-width terminal below
-the charts; scroll down to view them. The paper-trading order form is in the
-right panel under the collapsible Challenge card.
+the charts; scroll down to view them. The account tab includes selected
+criteria grouped by symbol and timeframe. Order/trade tables include trigger,
+execution, fee, maker/taker and timestamp details. Filled entries and exits
+are labeled on the chart; active entry and stop prices are drawn as horizontal
+levels. The paper-trading order form is in the right panel under the
+collapsible Challenge card.
 
 **Replay date window** is configured from the compact controls in the top bar.
 Choose the first visible-history date, the boundary after which bars reveal
@@ -185,18 +189,21 @@ never a trade signal.
 
 **Challenge** (right-panel card + topbar badge). Passwordless nick: the server
 assigns a random nick per session (`Быстрый-Бык-42`), typing your own overrides
-it. The «участвовать» checkbox opts in: the session's nick + risk + PnL + R
-appear on the shared board every participant sees (broadcast without `to`).
-R = (realized + unrealized) / fixed risk, sorted desc; the board refreshes on
-join/leave/disconnect/fills, so unrealized PnL can be stale while a position is
-open. It lives in server memory only. Nick and the opt-in persist per browser
-and restore on connect.
+it. The «участвовать» checkbox opts in: nick, fixed risk, capital, equity,
+realized/unrealized PnL, R, fill count and symbol appear on the shared board
+every participant sees. R = (realized + unrealized) / fixed risk; risk is fixed
+for the current session's challenge round. Unrealized PnL and ranks refresh
+with each replay bar. It lives in server memory only. Nick and the opt-in
+persist per browser and restore on connect.
 
 **Deal ticket** (`Сделка` card). Everything in USDT, no base-asset quantities:
 capital + fixed risk per trade, entry-type dropdown (Рынок/Лимит/Стоп) with
-conditional price/trigger fields, always-required stop, BUY/SELL, one preview
-line (`≈ qty · риск $`). Size = `risk / |entry − stop|`; entry is blocked
-without a stop; positions table shows value in USDT.
+conditional price/trigger fields, always-required stop-loss, BUY/SELL, one
+preview line (`≈ qty · риск $`). Size = `risk / |entry − stop|`; entry is
+blocked without a stop or when it is on the wrong side of the entry. A
+protective reduce-only stop is armed after each entry fill (including delayed
+limit/trigger fills), canceled when the position is closed, and can be canceled
+from Orders. Positions and fills include detailed risk/execution data.
 
 Legacy Python side (optional, not the app):
 

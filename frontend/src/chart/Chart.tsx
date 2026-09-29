@@ -13,7 +13,7 @@ import type {
   UTCTimestamp,
 } from "lightweight-charts";
 import type { CandleRow } from "../types/protocol";
-import { getState, store, useSim } from "../state/store";
+import { chartCriteriaKey, getState, store, useSim } from "../state/store";
 import { sendSim, subscribeSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
@@ -22,6 +22,7 @@ import {
   cumulativeDelta,
   formatRuler,
   invertTime,
+  nearestCandleTime,
   positionBands,
   positionDirection,
   profileBarLayout,
@@ -32,9 +33,21 @@ import {
   volumeProfile,
 } from "./overlays";
 import { DrawBar } from "./DrawBar";
+import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 
 function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
+}
+
+function lastAtOrBefore<T>(rows: T[], target: number, getTimestamp: (row: T) => number): number {
+  let lo = 0;
+  let hi = rows.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (getTimestamp(rows[mid]) <= target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo - 1;
 }
 
 function loadOiPaneHeight(): number {
@@ -92,6 +105,7 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
 export function Chart(): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const applyingCrosshairRef = useRef(false);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const oiWrapRef = useRef<HTMLDivElement | null>(null);
@@ -105,6 +119,7 @@ export function Chart(): JSX.Element {
   const scaleSyncRafRef = useRef(0);
   const pendingRef = useRef<Pt[]>([]);
   const previewRef = useRef<Pt | null>(null);
+  const candleTimesRef = useRef<number[]>([]);
   const rafRef = useRef(0);
   const rulerTimer = useRef(0);
   const dragRef = useRef<{
@@ -118,6 +133,7 @@ export function Chart(): JSX.Element {
   /** Set when an overlay was actually dragged: suppress the click that follows. */
   const suppressClickRef = useRef(false);
   const versionRef = useRef(0);
+  const cvdValuesRef = useRef<number[]>([]);
   const [follow, setFollow] = useState(true);
   const [oiPaneHeight, setOiPaneHeight] = useState(loadOiPaneHeight);
   const oiPaneHeightRef = useRef(oiPaneHeight);
@@ -133,10 +149,11 @@ export function Chart(): JSX.Element {
   const drawings = useSim((s) => s.drawings);
   const tool = useSim((s) => s.tool);
   const fills = useSim((s) => s.fills);
+  const account = useSim((s) => s.account);
   const symbol = useSim((s) => s.symbol);
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
-  const criteria = useSim((s) => s.chartCriteria[s.timeframe] ?? []);
+  const criteria = useSim((s) => s.chartCriteria[chartCriteriaKey(s.symbol, s.timeframe)] ?? []);
   const oiVisible = useSim((s) => s.oiVisible);
   const cvdVisible = useSim((s) => s.cvdVisible);
   const oiPeriod = useSim((s) => s.oiPeriod);
@@ -169,6 +186,47 @@ export function Chart(): JSX.Element {
       rightPriceScale: { borderColor: "#222c3b" },
       timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
     });
+    const onSharedCrosshair: Parameters<typeof subscribeCrosshair>[0] = ({ position, source }) => {
+      if (source === "main") return;
+      if (!position) {
+        chart.clearCrosshairPosition();
+        if (oiChartRef.current) oiChartRef.current.clearCrosshairPosition();
+        if (cvdChartRef.current) cvdChartRef.current.clearCrosshairPosition();
+        return;
+      }
+      const mainTimestamp = nearestCandleTime(candleTimesRef.current, position.timestamp);
+      if (mainTimestamp === null) {
+        chart.clearCrosshairPosition();
+        return;
+      }
+      const candleRows = getState().candles;
+      const candleIndex = lastAtOrBefore(candleRows, mainTimestamp, (row) => row[0]);
+      const crosshairPrice = position.price ?? candleRows[candleIndex]?.[4];
+      if (crosshairPrice === undefined) return;
+      const time = toTime(mainTimestamp);
+      applyingCrosshairRef.current = true;
+      chart.setCrosshairPosition(crosshairPrice, time, bars);
+      if (position.price === undefined) {
+        publishCrosshair({ timestamp: mainTimestamp, price: crosshairPrice }, "main");
+      }
+      const oiRows = getState().oi;
+      const oiIndex = lastAtOrBefore(oiRows, position.timestamp, (row) => row[0]);
+      const oiValue = oiIndex >= 0 ? oiRows[oiIndex][1] : null;
+      if (oiChartRef.current && oiSeriesRef.current) {
+        if (oiIndex >= 0 && oiValue !== null) {
+          oiChartRef.current.setCrosshairPosition(oiValue, toTime(oiRows[oiIndex][0]), oiSeriesRef.current);
+        }
+        else oiChartRef.current.clearCrosshairPosition();
+      }
+      const candles = candleRows;
+      if (cvdChartRef.current && cvdSeriesRef.current) {
+        const value = cvdValuesRef.current[candleIndex];
+        if (candleIndex >= 0 && value !== undefined) {
+          cvdChartRef.current.setCrosshairPosition(value, time, cvdSeriesRef.current);
+        } else cvdChartRef.current.clearCrosshairPosition();
+      }
+      window.requestAnimationFrame(() => { applyingCrosshairRef.current = false; });
+    };
     const bars = chart.addBarSeries({
       upColor: "#3d9a50",
       downColor: "#d46666",
@@ -183,6 +241,7 @@ export function Chart(): JSX.Element {
     chartRef.current = chart;
     barsRef.current = bars;
     volumeRef.current = volume;
+    const crosshairListener = subscribeCrosshair(onSharedCrosshair);
 
     const ro = new ResizeObserver(() => {
       chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
@@ -232,6 +291,7 @@ export function Chart(): JSX.Element {
 
     // Hover readout + ghost-preview mouse tracking (local, no roundtrip).
     chart.subscribeCrosshairMove((param: MouseEventParams) => {
+      if (applyingCrosshairRef.current) return;
       const data = param.seriesData?.get(bars) as
         | { open?: number; high?: number; low?: number; close?: number }
         | undefined;
@@ -245,6 +305,13 @@ export function Chart(): JSX.Element {
         });
       } else {
         setHover(null);
+      }
+      const price = param.point ? bars.coordinateToPrice(param.point.y) : null;
+      const timestamp = param.time === undefined ? null : timeToMs(param.time);
+      if (price !== null && timestamp !== null && Number.isFinite(timestamp)) {
+        publishCrosshair({ timestamp, price }, "main");
+      } else {
+        publishCrosshair(null, "main");
       }
       // Ghost preview while placing multi-click tools.
       const active = toolRef.current;
@@ -275,6 +342,7 @@ export function Chart(): JSX.Element {
     // (double-click suppression), which silently ate drawing points.
 
     // Seed with whatever is already in the store.
+    candleTimesRef.current = getState().candles.map(([timestamp]) => timestamp);
     pushBars(chart, bars, volume, getState().candles, true);
     versionRef.current = getState().candlesVersion;
 
@@ -283,6 +351,8 @@ export function Chart(): JSX.Element {
       if (rafRef.current) window.cancelAnimationFrame(rafRef.current);
       if (priceScaleRaf) window.cancelAnimationFrame(priceScaleRaf);
       window.removeEventListener("keydown", onKey);
+      crosshairListener();
+      publishCrosshair(null, "main");
       el.removeEventListener("pointermove", onPriceScaleMove);
       ro.disconnect();
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(bump);
@@ -313,6 +383,7 @@ export function Chart(): JSX.Element {
     if (version === versionRef.current) return;
     versionRef.current = version;
     const s = getState();
+    candleTimesRef.current = s.candles.map(([timestamp]) => timestamp);
     syncingRef.current = true;
     try {
       pushBars(chart, bars, volume, s.candles, s.fullReset);
@@ -325,6 +396,7 @@ export function Chart(): JSX.Element {
         oiChartRef.current.timeScale().fitContent();
       }
       if (cvdSeriesRef.current) {
+        cvdValuesRef.current = cumulativeDelta(s.candles);
         pushCvd(cvdSeriesRef.current, s.candles);
       }
     } finally {
@@ -341,23 +413,51 @@ export function Chart(): JSX.Element {
   useEffect(() => {
     const bars = barsRef.current;
     if (!bars) return;
-    const marks: SeriesMarker<Time>[] = [];
-    for (const f of fills.slice(0, 200)) {
-      marks.push({
-        time: toTime(f.timestamp),
-        position: f.side === "buy" ? "belowBar" : "aboveBar",
-        color: f.side === "buy" ? "#3d9a50" : "#d46666",
-        shape: f.side === "buy" ? "arrowUp" : "arrowDown",
-        text: (f.side === "buy" ? "B " : "S ") + f.price.toFixed(0),
-      });
+    const marksByTime = new Map<number, SeriesMarker<Time>>();
+    const times = candleTimes();
+    let signedQty = 0;
+    const chronological = fills
+      .filter((fill) => fill.symbol === symbol)
+      .slice()
+      .sort((a, b) => a.timestamp - b.timestamp);
+    for (const f of chronological) {
+      const signedFill = f.side === "buy" ? f.amount : -f.amount;
+      const priorQty = signedQty;
+      signedQty += signedFill;
+      if (!times.length || f.timestamp < times[0] || f.timestamp > times[times.length - 1]) continue;
+      const markerTime = toTime(snapTime(times, f.timestamp));
+      const priorDirection = Math.sign(priorQty);
+      const nextDirection = Math.sign(signedQty);
+      const action = priorDirection === 0
+        ? `ВХОД ${nextDirection > 0 ? "LONG" : "SHORT"}`
+        : Math.sign(signedFill) === priorDirection
+          ? `ДОБОР ${priorDirection > 0 ? "LONG" : "SHORT"}`
+          : Math.abs(signedQty) < 1e-10
+            ? `ВЫХОД ${priorDirection > 0 ? "LONG" : "SHORT"}`
+            : priorDirection !== nextDirection
+              ? `РАЗВОРОТ ${nextDirection > 0 ? "LONG" : "SHORT"}`
+              : `СОКРАЩЕНИЕ ${priorDirection > 0 ? "LONG" : "SHORT"}`;
+      const key = Number(markerTime);
+      const previous = marksByTime.get(key);
+      const text = `${action} · ${f.price.toFixed(2)}`;
+      marksByTime.set(key, previous
+        ? { ...previous, text: `${previous.text} / ${text}` }
+        : {
+            time: markerTime,
+            position: f.side === "buy" ? "belowBar" : "aboveBar",
+            color: action.startsWith("ВЫХОД") ? "#e0af68" : f.side === "buy" ? "#3d9a50" : "#d46666",
+            shape: f.side === "buy" ? "arrowUp" : "arrowDown",
+            text,
+          });
     }
+    const marks = [...marksByTime.values()];
     marks.sort((a, b) => Number(a.time) - Number(b.time));
     try {
       bars.setMarkers(marks);
     } catch {
       /* timestamps outside the visible series: ignore */
     }
-  }, [fills]);
+  }, [fills, symbol, version]);
 
   // Indicators share the main chart's visible time range.
   useEffect(() => {
@@ -366,6 +466,8 @@ export function Chart(): JSX.Element {
     let oiRangeListener: (() => void) | null = null;
     let cvdRangeListener: (() => void) | null = null;
     let mainRangeListener: (() => void) | null = null;
+    let oiCrosshairMove: ((param: MouseEventParams) => void) | null = null;
+    let cvdCrosshairMove: ((param: MouseEventParams) => void) | null = null;
 
     if (oiVisible && oiWrapRef.current) {
       const el = oiWrapRef.current;
@@ -389,6 +491,15 @@ export function Chart(): JSX.Element {
         if (!syncingRef.current) syncMainFromIndicator(chart);
       };
       chart.timeScale().subscribeVisibleLogicalRangeChange(oiRangeListener);
+      oiCrosshairMove = (param: MouseEventParams): void => {
+        if (applyingCrosshairRef.current) return;
+        const timestamp = param.time === undefined ? null : timeToMs(param.time);
+        publishCrosshair(
+          timestamp === null ? null : { timestamp },
+          "oi",
+        );
+      };
+      chart.subscribeCrosshairMove(oiCrosshairMove);
     } else {
       oiChartRef.current = null;
       oiSeriesRef.current = null;
@@ -406,6 +517,7 @@ export function Chart(): JSX.Element {
       });
       cvdChartRef.current = chart;
       cvdSeriesRef.current = line;
+      cvdValuesRef.current = cumulativeDelta(getState().candles);
       pushCvd(line, getState().candles);
       syncIndicatorsToMain();
       const observer = new ResizeObserver(() => {
@@ -418,6 +530,15 @@ export function Chart(): JSX.Element {
         if (!syncingRef.current) syncMainFromIndicator(chart);
       };
       chart.timeScale().subscribeVisibleLogicalRangeChange(cvdRangeListener);
+      cvdCrosshairMove = (param: MouseEventParams): void => {
+        if (applyingCrosshairRef.current) return;
+        const timestamp = param.time === undefined ? null : timeToMs(param.time);
+        publishCrosshair(
+          timestamp === null ? null : { timestamp },
+          "cvd",
+        );
+      };
+      chart.subscribeCrosshairMove(cvdCrosshairMove);
     } else {
       cvdChartRef.current = null;
       cvdSeriesRef.current = null;
@@ -437,8 +558,14 @@ export function Chart(): JSX.Element {
       if (oiRangeListener && oiChartRef.current) {
         oiChartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(oiRangeListener);
       }
+      if (oiCrosshairMove && oiChartRef.current) {
+        oiChartRef.current.unsubscribeCrosshairMove(oiCrosshairMove);
+      }
       if (cvdRangeListener && cvdChartRef.current) {
         cvdChartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(cvdRangeListener);
+      }
+      if (cvdCrosshairMove && cvdChartRef.current) {
+        cvdChartRef.current.unsubscribeCrosshairMove(cvdCrosshairMove);
       }
       observers.forEach((observer) => observer.disconnect());
       oiChartRef.current?.remove();
@@ -488,6 +615,29 @@ export function Chart(): JSX.Element {
       }}
     >
       <div ref={containerRef} className="chart" />
+      <div
+        className="execution-lines"
+        style={{ height: containerRef.current?.clientHeight ?? 0 }}
+      >
+        {account?.positions.filter((position) => position.symbol === symbol).map((position) => {
+          const y = yFor(position.entryPrice);
+          return y === null ? null : (
+            <div key={`entry-${position.symbol}`} className="execution-line entry" style={{ top: y }}>
+              <span>{position.side.toUpperCase()} entry · {position.entryPrice.toFixed(2)}</span>
+            </div>
+          );
+        })}
+        {account?.open.filter((order) => order.symbol === symbol && order.triggerPrice !== null).map((order) => {
+          const trigger = order.triggerPrice;
+          if (trigger === null) return null;
+          const y = trigger === null ? null : yFor(trigger);
+          return y === null ? null : (
+            <div key={order.id} className="execution-line stop" style={{ top: y }}>
+              <span>STOP {order.side.toUpperCase()} · {trigger.toFixed(2)} · {order.remaining}</span>
+            </div>
+          );
+        })}
+      </div>
       {oiVisible && (
         <div
           ref={oiWrapRef}

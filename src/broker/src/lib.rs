@@ -176,6 +176,7 @@ pub struct Broker {
     fees: FeeSchedule,
     conditional: Vec<ConditionalOrder>,
     next_conditional_id: u64,
+    triggered_order_sources: HashMap<String, String>,
     /// Chronological log of every fill against the account's own orders.
     fill_log: Vec<FillLog>,
 }
@@ -190,6 +191,7 @@ impl Default for Broker {
             fees: FeeSchedule::default(),
             conditional: Vec::new(),
             next_conditional_id: 1,
+            triggered_order_sources: HashMap::new(),
             fill_log: Vec::new(),
         }
     }
@@ -316,14 +318,15 @@ impl Broker {
                     reduce_only: request.reduce_only,
                     timestamp,
                 };
+                let conditional_order_id = conditional.id;
                 self.next_conditional_id += 1;
                 self.conditional.push(conditional);
                 return Ok(Order {
-                    id: "conditional".into(),
+                    id: format!("conditional_{conditional_order_id}"),
                     symbol: request.symbol,
                     side: request.side,
                     order_type: request.order_type,
-                    price: request.price,
+                    price: request.price.or(Some(trigger_price)),
                     amount: request.amount,
                     remaining: request.amount,
                     filled: 0.0,
@@ -615,10 +618,48 @@ impl Broker {
 
     /// Cancel an open order.
     pub fn cancel_order(&mut self, symbol: &str, id: &str) -> Result<Order, BrokerError> {
+        if let Some(raw_id) = id.strip_prefix("conditional_") {
+            let conditional_id = raw_id.parse::<u64>()
+                .map_err(|_| BrokerError::UnknownOrder(id.to_string()))?;
+            let index = self.conditional.iter().position(|c| {
+                c.id == conditional_id && c.symbol.symbol == symbol
+            }).ok_or_else(|| BrokerError::UnknownOrder(id.to_string()))?;
+            let conditional = self.conditional.remove(index);
+            return Ok(Order {
+                id: id.to_string(),
+                symbol: conditional.symbol,
+                side: conditional.side,
+                order_type: conditional.order_type,
+                price: conditional.price.or(Some(conditional.trigger_price)),
+                amount: conditional.amount,
+                remaining: conditional.amount,
+                filled: 0.0,
+                average_price: 0.0,
+                status: OrderStatus::Canceled,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: conditional.reduce_only,
+                post_only: false,
+                timestamp: conditional.timestamp,
+                fee: 0.0,
+            });
+        }
         let engine = self.engine_mut(symbol).ok_or_else(|| BrokerError::UnknownSymbol(symbol.to_string()))?;
         let order = engine.cancel_order(id).ok_or_else(|| BrokerError::UnknownOrder(id.to_string()))?;
         self.release_locked(symbol, &order);
         Ok(order)
+    }
+
+    /// Active trigger orders (stop / take-profit) not held by a matching engine.
+    pub fn conditional_orders(&self, symbol: Option<&str>) -> Vec<ConditionalOrder> {
+        self.conditional.iter()
+            .filter(|order| symbol.map(|s| s == order.symbol.symbol).unwrap_or(true))
+            .cloned()
+            .collect()
+    }
+
+    /// Return and forget the trigger order that produced an execution fill.
+    pub fn take_triggered_order_source(&mut self, order_id: &str) -> Option<String> {
+        self.triggered_order_sources.remove(order_id)
     }
 
     fn release_locked(&mut self, symbol: &str, order: &Order) {
@@ -823,6 +864,10 @@ impl Broker {
                 post_only: false,
             };
             if let Ok(order) = self.execute_immediate(request, timestamp) {
+                self.triggered_order_sources.insert(
+                    order.id.clone(),
+                    format!("conditional_{}", c.id),
+                );
                 executed.push(order);
             }
         }
@@ -984,10 +1029,25 @@ mod tests {
         req.stop_price = Some(110.0);
         let order = b.submit_order(req, ts()).unwrap();
         assert_eq!(order.status, OrderStatus::New);
+        assert!(order.id.starts_with("conditional_"));
         assert!(b.on_price_update(&btc(), 105.0, ts()).is_empty());
         let exec = b.on_price_update(&btc(), 111.0, ts());
         assert_eq!(exec.len(), 1);
         assert_eq!(exec[0].status, OrderStatus::Filled);
+        assert_eq!(b.take_triggered_order_source(&exec[0].id), Some(order.id));
+    }
+
+    #[test]
+    fn test_conditional_order_can_be_cancelled() {
+        let mut b = spot_broker();
+        let mut req = BrokerOrderRequest::market(btc(), Side::Sell, 1.0);
+        req.order_type = OrderType::Stop;
+        req.stop_price = Some(90.0);
+        let order = b.submit_order(req, ts()).unwrap();
+        assert_eq!(b.conditional_orders(Some("BTC/USDT")).len(), 1);
+        let canceled = b.cancel_order("BTC/USDT", &order.id).unwrap();
+        assert_eq!(canceled.status, OrderStatus::Canceled);
+        assert!(b.conditional_orders(Some("BTC/USDT")).is_empty());
     }
 
     #[test]

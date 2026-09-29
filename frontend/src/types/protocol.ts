@@ -21,6 +21,8 @@ export interface PositionLine {
   markPrice: number;
   unrealizedPnl: number;
   realizedPnl: number;
+  leverage: number;
+  liquidationPrice: number;
 }
 
 export interface OrderLine {
@@ -36,6 +38,10 @@ export interface OrderLine {
   status: string;
   timestamp: number;
   fee: number;
+  timeInForce: string;
+  triggerPrice: number | null;
+  reduceOnly: boolean;
+  postOnly: boolean;
 }
 
 export interface FillLine {
@@ -49,6 +55,8 @@ export interface FillLine {
   fee: number;
   orderId: string;
   timestamp: number;
+  datetime: string;
+  maker: boolean;
 }
 
 export interface AccountSnapshot {
@@ -80,9 +88,14 @@ export interface ReplayWindow {
 export interface ChallengeEntry {
   nick: string;
   risk: number;
+  capital: number;
+  realized: number;
+  unrealized: number;
   pnl: number;
   r: number;
   equity: number;
+  trades: number;
+  symbol: string;
 }
 
 // --- frontend -> Rust ---
@@ -106,6 +119,7 @@ export type ClientMessage =
       quantity: number;
       price?: number | null;
       stop_price?: number | null;
+      stop_loss_price?: number | null;
       time_in_force?: string;
       post_only?: boolean;
       reduce_only?: boolean;
@@ -123,7 +137,7 @@ export type ClientMessage =
       request_id?: string;
     }
   | { type: "login"; name: string; request_id?: string }
-  | { type: "challenge"; join: boolean; risk_usdt?: number; request_id?: string }
+  | { type: "challenge"; join: boolean; risk_usdt?: number; capital_usdt?: number; request_id?: string }
   | { type: "ping" };
 
 // --- Rust -> frontend ---
@@ -145,6 +159,7 @@ export type ServerMessage =
       /** Open-interest context: [[ts_ms, usdt], ...], static (never replayed). */
       oi: Array<[number, number]>;
       oi_period: string;
+      fills?: FillLine[];
       request_id?: string;
     }
   | { type: "candle"; to?: number; symbol: string; timeframe: string; exchange?: ExchangeId; candle: CandleRow; is_new: boolean }

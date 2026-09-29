@@ -185,6 +185,10 @@ function persistCriteria(list: string[]): void {
   }
 }
 
+export function chartCriteriaKey(symbol: string, timeframe: string): string {
+  return `${symbol}::${timeframe}`;
+}
+
 function loadChartCriteria(): Record<string, string[]> {
   const validList = (value: unknown): string[] => {
     if (!Array.isArray(value)) return [];
@@ -201,11 +205,15 @@ function loadChartCriteria(): Record<string, string[]> {
         const next: Record<string, string[]> = {};
         for (const [panel, timeframe] of [["top", "5m"], ["hour", "1h"], ["day", "1d"]]) {
           if (Array.isArray(values[panel]) && !Array.isArray(values[timeframe])) {
-            next[timeframe] = validList(values[panel]);
+            next[chartCriteriaKey("BTC/USDT", timeframe)] = validList(values[panel]);
           }
         }
         for (const [key, value] of Object.entries(values)) {
-          if (/^(1m|5m|15m|1h|4h|1d)$/.test(key)) next[key] = validList(value);
+          if (/^(1m|5m|15m|1h|4h|1d)$/.test(key)) {
+            next[chartCriteriaKey("BTC/USDT", key)] = validList(value);
+          } else if (/^[A-Z0-9]{2,12}\/[A-Z0-9]{2,12}::(1m|5m|15m|1h|4h|1d)$/.test(key)) {
+            next[key] = validList(value);
+          }
         }
         return next;
       }
@@ -213,7 +221,7 @@ function loadChartCriteria(): Record<string, string[]> {
   } catch {
     // Private mode or corrupt data: use the legacy top-chart selection.
   }
-  return { "5m": loadCriteria() };
+  return { [chartCriteriaKey("BTC/USDT", "5m")]: loadCriteria() };
 }
 
 function persistChartCriteria(criteria: Record<string, string[]>): void {
@@ -471,6 +479,7 @@ export const store = {
     replay: ReplayState,
     oi: Array<[number, number]>,
     oiPeriod: string,
+    fills: FillLine[] = [],
   ): void {
     const selectedExchange = EXCHANGE_IDS.includes(exchange) ? exchange : state.exchange;
     set({
@@ -485,6 +494,7 @@ export const store = {
       replay,
       oi,
       oiPeriod,
+      fills: fills.slice(0, 500),
       error: null,
     });
     persistExchange(selectedExchange);
@@ -576,19 +586,21 @@ export const store = {
       persistCriteria([]);
     }
   },
-  toggleChartCriterion(panel: string, id: string): void {
+  toggleChartCriterion(symbol: string, timeframe: string, id: string): void {
     if (!CRITERION_IDS.has(id)) return;
-    const current = state.chartCriteria[panel] ?? [];
+    const key = chartCriteriaKey(symbol, timeframe);
+    const current = state.chartCriteria[key] ?? [];
     const selected = current.includes(id)
       ? current.filter((criterion) => criterion !== id)
       : [...current, id];
-    const chartCriteria = { ...state.chartCriteria, [panel]: selected };
+    const chartCriteria = { ...state.chartCriteria, [key]: selected };
     set({ chartCriteria });
     persistChartCriteria(chartCriteria);
   },
-  clearChartCriteria(panel: string): void {
-    if (!state.chartCriteria[panel]?.length) return;
-    const chartCriteria = { ...state.chartCriteria, [panel]: [] };
+  clearChartCriteria(symbol: string, timeframe: string): void {
+    const key = chartCriteriaKey(symbol, timeframe);
+    if (!state.chartCriteria[key]?.length) return;
+    const chartCriteria = { ...state.chartCriteria, [key]: [] };
     set({ chartCriteria });
     persistChartCriteria(chartCriteria);
   },

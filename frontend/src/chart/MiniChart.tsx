@@ -4,11 +4,12 @@ import type { AutoscaleInfo, IChartApi, ISeriesApi, UTCTimestamp } from "lightwe
 import type { CandleRow, ServerMessage } from "../types/protocol";
 import { parseServerMessage } from "../types/protocol";
 import type { Drawing } from "../state/store";
-import { useSim } from "../state/store";
+import { chartCriteriaKey, useSim } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import { nearestCandleTime } from "./overlays";
 import { wsUrl } from "../websocket/connection";
 import { ChartCriteriaPicker } from "./ChartCriteriaPicker";
+import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 
 export const CHART_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 
@@ -37,6 +38,7 @@ export function MiniChart({
   const replayNow = useSim((s) => s.replay.now_ms);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const applyingCrosshairRef = useRef(false);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -93,6 +95,41 @@ export function MiniChart({
     observer.observe(el);
     const onRange = (): void => setViewTick((tick) => tick + 1);
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRange);
+    const crosshairListener = subscribeCrosshair(({ position, source }) => {
+      if (source === panel) return;
+      const currentChart = chartRef.current;
+      const currentBars = barsRef.current;
+      if (!currentChart || !currentBars || !position || candleTimesRef.current.length === 0) {
+        currentChart?.clearCrosshairPosition();
+        return;
+      }
+      if (position.price === undefined) return;
+      const timestamp = nearestCandleTime(candleTimesRef.current, position.timestamp);
+      if (timestamp === null) return;
+      applyingCrosshairRef.current = true;
+      currentChart.setCrosshairPosition(
+        position.price,
+        Math.floor(timestamp / 1000) as UTCTimestamp,
+        currentBars,
+      );
+      window.requestAnimationFrame(() => { applyingCrosshairRef.current = false; });
+    });
+    const onCrosshairMove = (param: import("lightweight-charts").MouseEventParams): void => {
+      if (applyingCrosshairRef.current) return;
+      const point = param.point;
+      if (!point || param.time === undefined || !barsRef.current) {
+        publishCrosshair(null, panel);
+        return;
+      }
+      const price = barsRef.current.coordinateToPrice(point.y);
+      const timestamp = typeof param.time === "number"
+        ? param.time * 1000
+        : typeof param.time === "string"
+          ? Date.parse(param.time + (param.time.length === 10 ? "T00:00:00Z" : "Z"))
+          : Date.UTC(param.time.year, param.time.month - 1, param.time.day);
+      if (price !== null && Number.isFinite(timestamp)) publishCrosshair({ timestamp, price }, panel);
+    };
+    chart.subscribeCrosshairMove(onCrosshairMove);
     let pointerRaf = 0;
     const onPointerMove = (): void => {
       if (pointerRaf) return;
@@ -105,6 +142,9 @@ export function MiniChart({
     return () => {
       observer.disconnect();
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRange);
+      crosshairListener();
+      chart.unsubscribeCrosshairMove(onCrosshairMove);
+      publishCrosshair(null, panel);
       el.removeEventListener("pointermove", onPointerMove);
       if (pointerRaf) window.cancelAnimationFrame(pointerRaf);
       chart.remove();
@@ -239,7 +279,7 @@ export function MiniChart({
     replayWindow.end_ms,
   ]);
 
-  const selectedCriteria = useSim((s) => s.chartCriteria[timeframe] ?? []);
+  const selectedCriteria = useSim((s) => s.chartCriteria[chartCriteriaKey(s.symbol, timeframe)] ?? []);
   void viewTick;
 
   return (

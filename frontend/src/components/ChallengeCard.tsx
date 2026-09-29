@@ -25,6 +25,7 @@ export function ChallengeCard(): JSX.Element {
   const inChallenge = useSim((s) => s.inChallenge);
   const board = useSim((s) => s.board);
   const fixedRiskUsdt = useSim((s) => s.fixedRiskUsdt);
+  const initialCapitalUsdt = useSim((s) => s.initialCapitalUsdt);
   const [draft, setDraft] = useState<string | null>(null);
   const shown = draft ?? nick;
 
@@ -42,6 +43,7 @@ export function ChallengeCard(): JSX.Element {
       type: "challenge",
       join,
       risk_usdt: join ? fixedRiskUsdt : undefined,
+      capital_usdt: join ? initialCapitalUsdt : undefined,
       request_id: nextRequestId(),
     });
   };
@@ -86,25 +88,33 @@ export function ChallengeCard(): JSX.Element {
           <div className="lbl" style={{ marginTop: 6 }}>пока пусто — участники появятся здесь</div>
         )}
         {board.length > 0 && (
+          <div className="board-table-scroll">
           <table className="grid-table board-table">
             <thead>
-              <tr><th>Ник</th><th>Риск $</th><th>PnL $</th><th>R</th></tr>
+              <tr><th>Ник</th><th>Риск</th><th>Капитал</th><th>Equity</th><th>Realized</th><th>Unrealized</th><th>PnL</th><th>R</th><th>Сделки</th><th>Рынок</th></tr>
             </thead>
             <tbody>
               {board.map((e) => (
                 <tr key={e.nick} className={e.nick === serverNick ? "me" : ""}>
                   <td>{e.nick}</td>
                   <td className="num">{e.risk}</td>
+                  <td className="num">{fmtMoney(e.capital)}</td>
+                  <td className="num">{fmtMoney(e.equity)}</td>
+                  <td className={"num" + (e.realized > 0 ? " pos" : e.realized < 0 ? " neg" : "")}>{fmtMoney(e.realized)}</td>
+                  <td className={"num" + (e.unrealized > 0 ? " pos" : e.unrealized < 0 ? " neg" : "")}>{fmtMoney(e.unrealized)}</td>
                   <td className={"num" + (e.pnl > 0 ? " pos" : e.pnl < 0 ? " neg" : "")}>
                     {fmtMoney(e.pnl)}
                   </td>
                   <td className={"num" + (e.r > 0 ? " pos" : e.r < 0 ? " neg" : "")}>
                     {fmtR(e.r)}
                   </td>
+                  <td className="num">{e.trades}</td>
+                  <td>{e.symbol}</td>
                 </tr>
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>

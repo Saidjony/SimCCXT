@@ -55,14 +55,16 @@ use tokio::sync::broadcast;
 //    "exchange":"binance","request_id":".."}
 //   {"type":"place_order","symbol":..,"side":"buy","order_type":"market",
 //    "quantity":0.1,"price":null,"stop_price":null,
+//    "stop_loss_price":49000.0,
 //    "time_in_force":"GTC","post_only":false,"reduce_only":false}
 //   {"type":"cancel_order","order_id":"..","symbol":"BTC/USDT"}
 //   {"type":"close_position","symbol":"BTC/USDT","quantity":null}
 //   {"type":"replay","action":"play|pause|step|reset|set_speed|set_step",
 //    "steps":1,"speed":2.0,"step_ms":60000,"timestamp_ms":null}
 //   {"type":"login","name":"..","request_id":".."}   (empty name = keep current nick)
-//   {"type":"challenge","join":true,"risk_usdt":10,"request_id":".."}
-//    (join needs risk_usdt>0; resend join to update the risk)
+//   {"type":"challenge","join":true,"risk_usdt":10,"capital_usdt":1000,
+//    "request_id":".."}
+//    (risk_usdt must be >0 and is fixed for the current session)
 //   {"type":"ping"}
 //
 // Rust -> frontend:
@@ -96,8 +98,9 @@ use tokio::sync::broadcast;
 // (sent by the frontend on join — the fixed risk per trade). Participants are
 // published as `{nick, risk, pnl, r, equity}` with R = (realized+unrealized) /
 // risk_usdt, sorted by R desc. The board broadcasts to ALL sockets (no `to`)
-// on login / join / leave / disconnect / new fills. In-memory only: a server
-// restart empties the board. No passwords — nicks are not authenticated.
+// on login / join / leave / disconnect / fills and replay mark updates.
+// In-memory only: a server restart empties the board. No passwords — nicks are
+// not authenticated.
 //
 // A candle row is always [ts_ms, open, high, low, close, volume].
 // `account` is exactly `Exchange::account_snapshot()` (balances, equity, pnl,
@@ -135,6 +138,7 @@ enum ClientCmd {
         quantity: f64,
         price: Option<f64>,
         stop_price: Option<f64>,
+        stop_loss_price: Option<f64>,
         #[serde(default)]
         time_in_force: String,
         #[serde(default)]
@@ -150,6 +154,7 @@ enum ClientCmd {
         join: bool,
         #[serde(default)]
         risk_usdt: Option<f64>,
+        capital_usdt: Option<f64>,
         request_id: Option<String>,
     },
     Replay {
@@ -224,12 +229,23 @@ struct Session {
     nick: String,      // challenge display name (random at creation)
     in_challenge: bool, // opt-in: publish nick+stats on the shared board
     risk_usdt: f64,    // fixed risk per trade, sent by the frontend on join
+    capital_usdt: f64,
+    pending_protections: Vec<PendingProtection>,
+    active_protections: Vec<(String, String, String)>,
     oi: Vec<(i64, f64)>, // open-interest history (ts_ms, USDT value), context only
     oi_period: String, // OI grid actually loaded ("5m", "" when none)
     oi_fed: usize,
     range_start_ms: i64,
     reveal_start_ms: i64,
     range_end_ms: i64,
+}
+
+struct PendingProtection {
+    symbol: String,
+    entry_side: String,
+    entry_order_id: String,
+    stop_price: f64,
+    remaining: f64,
 }
 
 struct RequestedWindow {
@@ -325,13 +341,19 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
         let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
         let equity = snap["equity"].as_f64().unwrap_or(0.0);
         let pnl = realized + unrealized;
+        let trades = s.ex.fetch_fills(None, None).len();
         let r = r_of(pnl, s.risk_usdt).unwrap_or(0.0);
         rows.push((r, json!({
             "nick": s.nick,
             "risk": s.risk_usdt,
+            "capital": s.capital_usdt,
+            "realized": realized,
+            "unrealized": unrealized,
             "pnl": pnl,
             "r": (r * 100.0).round() / 100.0,
             "equity": (equity * 100.0).round() / 100.0,
+            "trades": trades,
+            "symbol": s.symbol,
         })));
     }
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -393,8 +415,90 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "replay": replay_json(s),
         "oi": s.oi.iter().filter(|(ts, _)| *ts <= s.ex.now_ms()).collect::<Vec<_>>(),
         "oi_period": s.oi_period,
+        "fills": s.ex.fetch_fills(None, Some(500)),
         "request_id": request_id,
     })
+}
+
+/// Attach a protective stop to every newly executed entry fill.
+/// Pending limit/trigger entries are kept in the session until they fill.
+fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
+    let fills = s.ex.fetch_fills(None, None);
+    if fills.len() <= s.fills_seen {
+        return Vec::new();
+    }
+    let fresh_count = fills.len() - s.fills_seen;
+    let mut fresh: Vec<Value> = fills.into_iter().take(fresh_count).collect();
+    fresh.reverse();
+    let mut events = Vec::new();
+    for fill in fresh {
+        let symbol = fill["symbol"].as_str().unwrap_or_default().to_string();
+        let side = fill["side"].as_str().unwrap_or_default().to_string();
+        let order_id = fill["orderId"].as_str().unwrap_or_default().to_string();
+        let source_order_id = s.ex.take_triggered_order_source(&order_id);
+        let amount = fill["amount"].as_f64().unwrap_or(0.0);
+        let pending_index = s.pending_protections.iter().position(|pending| {
+            pending.symbol == symbol
+                && pending.entry_side == side
+                && (pending.entry_order_id == order_id
+                    || source_order_id.as_deref() == Some(pending.entry_order_id.as_str()))
+        });
+        if let Some(index) = pending_index {
+            let protect_amount = amount.min(s.pending_protections[index].remaining);
+            let stop_price = s.pending_protections[index].stop_price;
+            let entry_side = s.pending_protections[index].entry_side.clone();
+            let stop_side = if entry_side == "buy" { "sell" } else { "buy" };
+            match s.ex.create_order(
+                &symbol,
+                "stop",
+                stop_side,
+                protect_amount,
+                None,
+                CreateOrderParams::new().stop_price(stop_price).reduce_only(true),
+            ) {
+                Ok(order) => {
+                    if let Some(id) = order["id"].as_str() {
+                        s.active_protections.push((symbol.clone(), entry_side, id.to_string()));
+                    }
+                    events.push(json!({ "type": "order_update", "order": order }));
+                }
+                Err(error) => events.push(error_json(
+                    format!("stop loss could not be armed for {symbol}: {error}"),
+                    None,
+                )),
+            }
+            s.pending_protections[index].remaining -= protect_amount;
+            if s.pending_protections[index].remaining <= f64::EPSILON {
+                s.pending_protections.remove(index);
+            }
+        } else if let Some(index) = s.active_protections.iter().position(|(protected_symbol, entry_side, stop_id)| {
+            protected_symbol == &symbol
+                && source_order_id.as_deref() == Some(stop_id.as_str())
+                && *entry_side != side
+        }) {
+            let (_, protected_side, _) = s.active_protections.remove(index);
+            if protected_side == "buy" && s.ex.spot_basis(&symbol).0 <= f64::EPSILON {
+                let mut rest = Vec::new();
+                for (active_symbol, active_side, active_id) in s.active_protections.drain(..) {
+                    if active_symbol == symbol && active_side == protected_side {
+                        if let Err(error) = s.ex.cancel_order(&active_id, &symbol) {
+                            events.push(error_json(
+                                format!("could not cancel remaining stop {active_id}: {error}"),
+                                None,
+                            ));
+                        }
+                    } else {
+                        rest.push((active_symbol, active_side, active_id));
+                    }
+                }
+                s.active_protections = rest;
+            }
+        }
+        events.push(json!({ "type": "trade", "fill": fill }));
+    }
+    s.fills_seen = s.ex.fetch_fills(None, None).len();
+    events.push(account_json(s));
+    events
 }
 
 fn account_json(s: &Session) -> Value {
@@ -436,17 +540,7 @@ fn delta_events(s: &mut Session) -> Vec<Value> {
         "timestamp": s.ex.now_ms(),
     }));
     // New fills produced by the step (e.g. triggered stop/TP).
-    let fills = s.ex.fetch_fills(None, None);
-    if fills.len() > s.fills_seen {
-        // fetch_fills is newest-first; take the unknown prefix and
-        // re-emit oldest-first so the UI appends in order.
-        let mut fresh: Vec<&Value> = fills.iter().take(fills.len() - s.fills_seen).collect();
-        fresh.reverse();
-        for f in fresh {
-            ev.push(json!({ "type": "trade", "fill": f }));
-        }
-        s.fills_seen = fills.len();
-    }
+    ev.extend(fresh_fill_events(s));
     ev.push(account_json(s));
     ev.push(replay_json(s));
     ev
@@ -471,6 +565,9 @@ fn new_session(nick: String) -> Session {
         nick,
         in_challenge: false,
         risk_usdt: 0.0,
+        capital_usdt: 0.0,
+        pending_protections: Vec::new(),
+        active_protections: Vec::new(),
         oi: Vec::new(),
         oi_period: String::new(),
         oi_fed: 0,
@@ -631,23 +728,48 @@ impl Engine {
                 }
                 board_push = true; // a newcomer should see the current board
             }
-            ClientCmd::Challenge { join, risk_usdt, request_id } => {
+            ClientCmd::Challenge { join, risk_usdt, capital_usdt, request_id } => {
                 let s = self.session(to);
                 if join {
                     match risk_usdt {
                         Some(r) if r > 0.0 && r.is_finite() => {
-                            s.risk_usdt = r;
-                            s.in_challenge = true;
-                            log!("[engine] #{to} ({}) joins the challenge, risk ${r}", s.nick);
-                            evs.push(json!({
-                                "type": "challenge_ok", "joined": true,
-                                "nick": s.nick, "request_id": request_id }));
-                            board_push = true;
+                            let capital_changed = capital_usdt.is_some_and(|capital| {
+                                s.capital_usdt > 0.0 && (s.capital_usdt - capital).abs() > f64::EPSILON
+                            });
+                            if (s.risk_usdt > 0.0 && (s.risk_usdt - r).abs() > f64::EPSILON)
+                                || capital_changed
+                            {
+                                evs.push(error_json(
+                                    "risk and capital are fixed for the current challenge round".into(),
+                                    request_id.clone(),
+                                ));
+                                evs.push(json!({
+                                    "type": "challenge_ok", "joined": false,
+                                    "request_id": request_id,
+                                }));
+                            } else {
+                                s.risk_usdt = r;
+                                if let Some(capital) = capital_usdt.filter(|value| value.is_finite() && *value > 0.0) {
+                                    s.capital_usdt = capital;
+                                }
+                                s.in_challenge = true;
+                                log!("[engine] #{to} ({}) joins the challenge, risk ${r}", s.nick);
+                                evs.push(json!({
+                                    "type": "challenge_ok", "joined": true,
+                                    "nick": s.nick, "request_id": request_id }));
+                                board_push = true;
+                            }
                         }
-                        _ => evs.push(error_json(
-                            "challenge: нужен риск > 0 (поле «Риск» в сделке)".into(),
-                            request_id,
-                        )),
+                        _ => {
+                            evs.push(error_json(
+                                "challenge: нужен риск > 0 (поле «Риск» в сделке)".into(),
+                                request_id.clone(),
+                            ));
+                            evs.push(json!({
+                                "type": "challenge_ok", "joined": false,
+                                "request_id": request_id,
+                            }));
+                        }
                     }
                 } else if s.in_challenge {
                     s.in_challenge = false;
@@ -698,46 +820,64 @@ impl Engine {
                 }
             }
             ClientCmd::PlaceOrder {
-                symbol, side, order_type, quantity, price, stop_price,
+                symbol, side, order_type, quantity, price, stop_price, stop_loss_price,
                 time_in_force, post_only, reduce_only, request_id,
             } => {
                 let s = self.session(to);
-                let mut p = CreateOrderParams::new();
-                p.stop_price = stop_price;
-                p.reduce_only = reduce_only;
-                p.post_only = post_only;
-                if !time_in_force.is_empty() {
-                    if let Some(tif) = parse_tif(&time_in_force) {
-                        p.time_in_force = tif;
-                    }
-                }
-                match s.ex.create_order(&symbol, &order_type, &side, quantity, price, p) {
-                    Ok(order) => {
-                        evs.push(json!({
-                            "type": "order_update", "order": order, "request_id": request_id }));
-                        let fills = s.ex.fetch_fills(None, None);
-                        if fills.len() > s.fills_seen {
-                            let mut fresh: Vec<&Value> =
-                                fills.iter().take(fills.len() - s.fills_seen).collect();
-                            fresh.reverse();
-                            for f in fresh {
-                                evs.push(json!({ "type": "trade", "fill": f }));
-                            }
-                            s.fills_seen = fills.len();
-                            // A fill moves PnL: refresh the board for everyone.
-                            if s.in_challenge {
-                                board_push = true;
+                let valid_stop = if let Some(stop) = stop_loss_price {
+                    let reference = price.or(stop_price).or_else(|| s.ex.last_price_for(&symbol));
+                    reference.is_some_and(|entry| {
+                        stop.is_finite()
+                            && stop > 0.0
+                            && if side == "buy" { stop < entry } else { stop > entry }
+                    })
+                } else {
+                    true
+                };
+                if !valid_stop {
+                    evs.push(error_json(
+                        "stop loss must be below the entry price for BUY and above it for SELL".into(),
+                        request_id,
+                    ));
+                } else {
+                    let mut p = CreateOrderParams::new();
+                        p.stop_price = stop_price;
+                        p.reduce_only = reduce_only;
+                        p.post_only = post_only;
+                        if !time_in_force.is_empty() {
+                            if let Some(tif) = parse_tif(&time_in_force) {
+                                p.time_in_force = tif;
                             }
                         }
-                        evs.push(account_json(s));
-                    }
-                    Err(e) => evs.push(error_json(format!("place_order: {e}"), request_id)),
+                        match s.ex.create_order(&symbol, &order_type, &side, quantity, price, p) {
+                            Ok(order) => {
+                                evs.push(json!({
+                                    "type": "order_update", "order": order, "request_id": request_id }));
+                                if let Some(stop_price) = stop_loss_price {
+                                    let order_id = order["id"].as_str().unwrap_or_default().to_string();
+                                    s.pending_protections.push(PendingProtection {
+                                        symbol: symbol.clone(),
+                                        entry_side: side.clone(),
+                                        entry_order_id: order_id,
+                                        stop_price,
+                                        remaining: quantity,
+                                    });
+                                }
+                                let fill_events = fresh_fill_events(s);
+                                board_push |= s.in_challenge
+                                    && fill_events.iter().any(|event| event["type"] == "trade");
+                                evs.extend(fill_events);
+                            }
+                            Err(e) => evs.push(error_json(format!("place_order: {e}"), request_id)),
+                        }
                 }
             }
             ClientCmd::CancelOrder { order_id, symbol, request_id } => {
                 let s = self.session(to);
                 match s.ex.cancel_order(&order_id, &symbol) {
                     Ok(order) => {
+                        s.pending_protections.retain(|pending| pending.entry_order_id != order_id);
+                        s.active_protections.retain(|(_, _, active_id)| active_id != &order_id);
                         evs.push(json!({
                             "type": "order_update", "order": order, "request_id": request_id }));
                         evs.push(account_json(s));
@@ -747,26 +887,63 @@ impl Engine {
             }
             ClientCmd::ClosePosition { symbol, quantity, request_id } => {
                 let s = self.session(to);
-                let (held, _) = s.ex.spot_basis(&symbol);
+                let snapshot = s.ex.account_snapshot();
+                let position = snapshot["positions"].as_array().and_then(|positions| {
+                    positions.iter().find(|position| position["symbol"] == symbol)
+                }).cloned();
+                let (held, side) = if let Some(position) = position {
+                    (
+                        position["qty"].as_f64().unwrap_or(0.0),
+                        if position["side"] == "short" { "buy" } else { "sell" },
+                    )
+                } else {
+                    let (qty, _) = s.ex.spot_basis(&symbol);
+                    (qty, "sell")
+                };
                 let q = quantity.unwrap_or(held);
                 if q <= 0.0 {
                     evs.push(error_json("nothing to close".into(), request_id));
                 } else {
+                    let mut pending = Vec::new();
+                    for protection in s.pending_protections.drain(..) {
+                        if protection.symbol == symbol {
+                            if let Err(error) = s.ex.cancel_order(&protection.entry_order_id, &symbol) {
+                                evs.push(error_json(
+                                    format!("could not cancel pending entry {}: {error}", protection.entry_order_id),
+                                    request_id.clone(),
+                                ));
+                            }
+                        } else {
+                            pending.push(protection);
+                        }
+                    }
+                    s.pending_protections = pending;
+                    let mut active = Vec::new();
+                    for (active_symbol, entry_side, active_id) in s.active_protections.drain(..) {
+                        if active_symbol == symbol {
+                            if let Err(error) = s.ex.cancel_order(&active_id, &symbol) {
+                                evs.push(error_json(
+                                    format!("could not cancel protective stop {active_id}: {error}"),
+                                    request_id.clone(),
+                                ));
+                            }
+                        } else {
+                            active.push((active_symbol, entry_side, active_id));
+                        }
+                    }
+                    s.active_protections = active;
                     match s.ex.create_order(
-                        &symbol, "market", "sell", q, None, CreateOrderParams::new(),
+                        &symbol, "market", side, q, None,
+                        CreateOrderParams::new().reduce_only(true),
                     ) {
                         Ok(order) => {
                             evs.push(json!({
                                 "type": "order_update", "order": order,
                                 "request_id": request_id }));
-                            evs.push(account_json(s));
-                            // A close realizes PnL (fills_seen intentionally
-                            // untouched — trade-event behavior unchanged).
-                            if s.ex.fetch_fills(None, None).len() > s.fills_seen
-                                && s.in_challenge
-                            {
-                                board_push = true;
-                            }
+                            let fill_events = fresh_fill_events(s);
+                            board_push |= s.in_challenge
+                                && fill_events.iter().any(|event| event["type"] == "trade");
+                            evs.extend(fill_events);
                         }
                         Err(e) => evs.push(error_json(format!("close_position: {e}"), request_id)),
                     }
@@ -914,17 +1091,10 @@ impl Engine {
             s.ex.step_n(1);
             emissions.push((id, delta_events(s)));
         }
-        // Auto-step fills move PnL: one board refresh if any participant filled.
-        let mut board_dirty = false;
-        for (id, evs) in &emissions {
-            let filled = evs
-                .iter()
-                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("trade"));
-            if filled && self.sessions.get(id).is_some_and(|s| s.in_challenge) {
-                board_dirty = true;
-                break;
-            }
-        }
+        // Mark-to-market changes unrealized PnL on every replay tick.
+        let board_dirty = emissions.iter().any(|(id, _)| {
+            self.sessions.get(id).is_some_and(|session| session.in_challenge)
+        });
         for (id, evs) in emissions {
             self.send_all(id, evs);
         }
@@ -1273,7 +1443,7 @@ mod tests {
     }
 
     fn challenge_cmd(join: bool, risk: Option<f64>) -> ClientCmd {
-        ClientCmd::Challenge { join, risk_usdt: risk, request_id: None }
+        ClientCmd::Challenge { join, risk_usdt: risk, capital_usdt: Some(1000.0), request_id: None }
     }
 
     /// Drain the bus, returning only challenge_board messages.
@@ -1365,6 +1535,7 @@ mod tests {
                 quantity: 0.001,
                 price: None,
                 stop_price: None,
+                stop_loss_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,
@@ -1389,6 +1560,181 @@ mod tests {
             "session 2 equity must stay at the initial deposit, got {equity2}"
         );
         assert_eq!(eng.sessions[&2].ex.fetch_fills(None, None).len(), 0);
+    }
+
+    fn place_protected_market_entry(eng: &mut Engine, client_id: u64, data: &Path) -> f64 {
+        eng.handle_command(client_id, subscribe_cmd("BTC/USDT", "1m"), data);
+        eng.handle_command(
+            client_id,
+            ClientCmd::Replay {
+                action: "step".into(),
+                steps: Some(2),
+                speed: None,
+                step_ms: None,
+                timestamp_ms: None,
+                request_id: None,
+            },
+            data,
+        );
+        let entry = eng.sessions[&client_id].ex.last_price_for("BTC/USDT").unwrap();
+        eng.handle_command(
+            client_id,
+            ClientCmd::PlaceOrder {
+                symbol: "BTC/USDT".into(),
+                side: "buy".into(),
+                order_type: "market".into(),
+                quantity: 0.001,
+                price: None,
+                stop_price: None,
+                stop_loss_price: Some(entry * 0.99),
+                time_in_force: "GTC".into(),
+                post_only: false,
+                reduce_only: false,
+                request_id: None,
+            },
+            data,
+        );
+        entry
+    }
+
+    #[test]
+    fn stop_loss_is_armed_and_fires_against_replay_price() {
+        let (tx, _rx) = broadcast::channel::<String>(128);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+        let entry = place_protected_market_entry(&mut eng, 9, data);
+        let s = eng.sessions.get_mut(&9).unwrap();
+        let orders = s.ex.fetch_open_orders(Some("BTC/USDT"));
+        assert_eq!(orders.len(), 1, "the filled entry should have one protective stop");
+        assert_eq!(orders[0]["type"], "stop");
+        assert_eq!(orders[0]["side"], "sell");
+        assert_eq!(orders[0]["reduceOnly"], true);
+        assert!(orders[0]["triggerPrice"].as_f64().unwrap() < entry);
+
+        let stop = orders[0]["triggerPrice"].as_f64().unwrap();
+        let timestamp = s.ex.now() + chrono::Duration::minutes(1);
+        s.ex.apply_price(
+            &simccxt_core::Symbol::parse("BTC/USDT").unwrap(),
+            stop * 0.99,
+            timestamp,
+        );
+        let events = fresh_fill_events(s);
+        assert!(events.iter().any(|event| event["type"] == "trade"));
+        assert!(s.ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
+        assert!(s.ex.spot_basis("BTC/USDT").0 < 1e-10);
+    }
+
+    #[test]
+    fn closing_position_cancels_its_protective_stop() {
+        let (tx, _rx) = broadcast::channel::<String>(128);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+        place_protected_market_entry(&mut eng, 10, data);
+        assert_eq!(eng.sessions[&10].ex.fetch_open_orders(Some("BTC/USDT")).len(), 1);
+        eng.handle_command(
+            10,
+            ClientCmd::ClosePosition {
+                symbol: "BTC/USDT".into(),
+                quantity: None,
+                request_id: None,
+            },
+            data,
+        );
+        let session = &eng.sessions[&10];
+        assert!(session.ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
+        assert!(session.ex.account_snapshot()["positions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delayed_limit_fill_arms_its_stop_only_after_entry() {
+        let (tx, _rx) = broadcast::channel::<String>(128);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+        eng.handle_command(11, subscribe_cmd("BTC/USDT", "1m"), data);
+        eng.handle_command(11, replay_cmd("step"), data);
+        eng.handle_command(11, replay_cmd("step"), data);
+        let current = eng.sessions[&11].ex.last_price_for("BTC/USDT").unwrap();
+        let entry = current * 0.75;
+        let stop = entry * 0.95;
+        eng.handle_command(
+            11,
+            ClientCmd::PlaceOrder {
+                symbol: "BTC/USDT".into(),
+                side: "buy".into(),
+                order_type: "limit".into(),
+                quantity: 0.001,
+                price: Some(entry),
+                stop_price: None,
+                stop_loss_price: Some(stop),
+                time_in_force: "GTC".into(),
+                post_only: false,
+                reduce_only: false,
+                request_id: None,
+            },
+            data,
+        );
+        let waiting = eng.sessions[&11].ex.fetch_open_orders(Some("BTC/USDT"));
+        assert_eq!(waiting.len(), 1, "only the resting entry limit should be open");
+        assert_eq!(waiting[0]["type"], "limit");
+        assert_eq!(waiting[0]["triggerPrice"], Value::Null);
+        assert_eq!(eng.sessions[&11].pending_protections.len(), 1);
+
+        let session = eng.sessions.get_mut(&11).unwrap();
+        let timestamp = session.ex.now() + chrono::Duration::minutes(1);
+        session.ex.apply_price(
+            &simccxt_core::Symbol::parse("BTC/USDT").unwrap(),
+            entry * 0.99,
+            timestamp,
+        );
+        let events = fresh_fill_events(session);
+        assert!(events.iter().any(|event| event["type"] == "trade"));
+        let orders = session.ex.fetch_open_orders(Some("BTC/USDT"));
+        assert_eq!(orders.len(), 1, "the stop should be created after the limit fills");
+        assert_eq!(orders[0]["triggerPrice"], stop);
+    }
+
+    #[test]
+    fn triggered_entry_arms_protection_using_its_conditional_id() {
+        let (tx, _rx) = broadcast::channel::<String>(128);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+        eng.handle_command(12, subscribe_cmd("BTC/USDT", "1m"), data);
+        eng.handle_command(12, replay_cmd("step"), data);
+        eng.handle_command(12, replay_cmd("step"), data);
+        let current = eng.sessions[&12].ex.last_price_for("BTC/USDT").unwrap();
+        let trigger = current * 1.01;
+        let stop = current * 0.99;
+        eng.handle_command(
+            12,
+            ClientCmd::PlaceOrder {
+                symbol: "BTC/USDT".into(),
+                side: "buy".into(),
+                order_type: "stop".into(),
+                quantity: 0.001,
+                price: None,
+                stop_price: Some(trigger),
+                stop_loss_price: Some(stop),
+                time_in_force: "GTC".into(),
+                post_only: false,
+                reduce_only: false,
+                request_id: None,
+            },
+            data,
+        );
+        assert_eq!(eng.sessions[&12].pending_protections.len(), 1);
+        let session = eng.sessions.get_mut(&12).unwrap();
+        let timestamp = session.ex.now() + chrono::Duration::minutes(1);
+        session.ex.apply_price(
+            &simccxt_core::Symbol::parse("BTC/USDT").unwrap(),
+            trigger * 1.01,
+            timestamp,
+        );
+        let events = fresh_fill_events(session);
+        assert!(events.iter().any(|event| event["type"] == "trade"));
+        let orders = session.ex.fetch_open_orders(Some("BTC/USDT"));
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0]["type"], "stop");
+        assert_eq!(orders[0]["triggerPrice"], stop);
     }
 
     #[test]
@@ -1487,12 +1833,16 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["nick"], "A");
         assert_eq!(rows[0]["risk"], 10.0);
+        assert_eq!(rows[0]["capital"], 1000.0);
 
         eng.handle_command(1, challenge_cmd(false, None), data);
         assert!(!eng.sessions[&1].in_challenge);
         let boards = board_messages(&mut rx);
         assert_eq!(boards.len(), 1);
         assert!(boards[0]["board"].as_array().unwrap().is_empty());
+        eng.handle_command(1, challenge_cmd(true, Some(20.0)), data);
+        assert!(!eng.sessions[&1].in_challenge, "risk cannot be changed after a round starts");
+        assert_eq!(eng.sessions[&1].risk_usdt, 10.0);
     }
 
     #[test]
@@ -1528,6 +1878,7 @@ mod tests {
                 quantity: 0.001,
                 price: None,
                 stop_price: None,
+                stop_loss_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,
