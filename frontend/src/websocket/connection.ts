@@ -1,4 +1,4 @@
-import type { ClientMessage, ServerMessage } from "../types/protocol";
+import type { ClientMessage, ExchangeId, ServerMessage } from "../types/protocol";
 import { parseServerMessage } from "../types/protocol";
 import { getState, store } from "../state/store";
 
@@ -16,6 +16,21 @@ export function wsUrl(): string {
 }
 
 export type Route = (m: ServerMessage) => void;
+
+export function subscribeSim(
+  symbol: string,
+  timeframe: string,
+  exchange: ExchangeId,
+): void {
+  const range = getState().replayWindow;
+  sendSim({
+    type: "subscribe",
+    symbol,
+    timeframe,
+    exchange,
+    ...range,
+  });
+}
 
 /** Silence longer than this (with a live socket) means the link is dead. */
 const WATCHDOG_MS = 25000;
@@ -54,6 +69,7 @@ class Connection {
         symbol: getState().symbol,
         timeframe: getState().timeframe,
         exchange: getState().exchange,
+        ...getState().replayWindow,
       });
     }
     this.startWatchdog();

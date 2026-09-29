@@ -3,7 +3,7 @@ import { Chart } from "./Chart";
 import { ChartCriteriaPicker } from "./ChartCriteriaPicker";
 import { CHART_TIMEFRAMES, MiniChart } from "./MiniChart";
 import { useSim } from "../state/store";
-import { sendSim } from "../websocket/connection";
+import { subscribeSim } from "../websocket/connection";
 
 type PanelId = "top" | "hour" | "day";
 type Timeframes = Record<Exclude<PanelId, "top">, string>;
@@ -65,7 +65,7 @@ export function ChartWorkspace(): JSX.Element {
   const [maximized, setMaximized] = useState<PanelId | null>(null);
 
   const setMainTimeframe = (next: string): void => {
-    sendSim({ type: "subscribe", symbol, timeframe: next, exchange });
+    subscribeSim(symbol, next, exchange);
   };
   const setMiniTimeframe = (panel: Exclude<PanelId, "top">, next: string): void => {
     const value = { ...miniTimeframes, [panel]: next };

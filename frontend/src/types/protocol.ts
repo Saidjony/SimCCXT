@@ -71,6 +71,12 @@ export interface ReplayState {
   total: number;
 }
 
+export interface ReplayWindow {
+  start_ms: number;
+  reveal_start_ms: number;
+  end_ms: number;
+}
+
 export interface ChallengeEntry {
   nick: string;
   risk: number;
@@ -82,7 +88,16 @@ export interface ChallengeEntry {
 // --- frontend -> Rust ---
 
 export type ClientMessage =
-  | { type: "subscribe"; symbol: string; timeframe: string; exchange?: ExchangeId; request_id?: string }
+  | {
+      type: "subscribe";
+      symbol: string;
+      timeframe: string;
+      exchange?: ExchangeId;
+      start_ms?: number;
+      reveal_start_ms?: number;
+      end_ms?: number;
+      request_id?: string;
+    }
   | {
       type: "place_order";
       symbol: string;
@@ -133,6 +148,7 @@ export type ServerMessage =
       request_id?: string;
     }
   | { type: "candle"; to?: number; symbol: string; timeframe: string; exchange?: ExchangeId; candle: CandleRow; is_new: boolean }
+  | { type: "oi_update"; to?: number; samples: Array<[number, number]> }
   | { type: "market_update"; to?: number; symbol: string; last: number; timestamp: number }
   | { type: "account_update"; to?: number; account: AccountSnapshot }
   | { type: "order_update"; to?: number; order: OrderLine; request_id?: string }
@@ -164,6 +180,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "welcome":
     case "snapshot":
     case "candle":
+    case "oi_update":
     case "market_update":
     case "account_update":
     case "order_update":

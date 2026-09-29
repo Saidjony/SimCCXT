@@ -8,7 +8,7 @@ import { ChallengeCard } from "../components/ChallengeCard";
 import { OrderPanel } from "../components/OrderPanel";
 import { BottomTerminal } from "../components/Panels";
 import type { ExchangeId } from "../types/protocol";
-import { sendSim } from "../websocket/connection";
+import { subscribeSim } from "../websocket/connection";
 import { store } from "../state/store";
 
 /** Connection + data-age badge: "connected · data 2s ago" vs "connecting…". */
@@ -55,7 +55,7 @@ export function TradingTerminal(): JSX.Element {
             onChange={(event) => {
               const next = event.target.value as ExchangeId;
               store.setExchange(next);
-              sendSim({ type: "subscribe", symbol, timeframe, exchange: next });
+              subscribeSim(symbol, timeframe, next);
             }}
           >
             <option value="binance">Binance</option>

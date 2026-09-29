@@ -7,6 +7,7 @@ import type {
   FillLine,
   OrderLine,
   ReplayState,
+  ReplayWindow,
 } from "../types/protocol";
 import { applyCandleDelta } from "../types/protocol";
 import { CRITERIA } from "../trade/criteria";
@@ -63,6 +64,7 @@ function persistExchange(exchange: ExchangeId): void {
 const WATCHLIST_KEY = "simccxt.watchlist.v1";
 const EXCHANGE_KEY = "simccxt.exchange.v1";
 const EXCHANGE_IDS: ExchangeId[] = ["binance", "bybit", "okx"];
+const REPLAY_WINDOW_KEY = "simccxt.replay-window.v1";
 const DEFAULT_WATCHLIST: CoinEntry[] = [
   { symbol: "BTC/USDT", flagged: false },
   { symbol: "ETH/USDT", flagged: false },
@@ -70,6 +72,41 @@ const DEFAULT_WATCHLIST: CoinEntry[] = [
   { symbol: "XRP/USDT", flagged: false },
 ];
 const SYMBOL_RE = /^[A-Z0-9]{2,12}\/[A-Z0-9]{2,12}$/;
+
+function defaultReplayWindow(): ReplayWindow {
+  const end = Date.now();
+  const day = 24 * 60 * 60_000;
+  return { start_ms: end - 3 * day, reveal_start_ms: end - 2 * day, end_ms: end };
+}
+
+function loadReplayWindow(): ReplayWindow {
+  const fallback = defaultReplayWindow();
+  try {
+    const raw = window.localStorage.getItem(REPLAY_WINDOW_KEY);
+    if (raw) {
+      const value: unknown = JSON.parse(raw);
+      if (value && typeof value === "object") {
+        const saved = value as Partial<ReplayWindow>;
+        if (
+          Number.isFinite(saved.start_ms) &&
+          Number.isFinite(saved.reveal_start_ms) &&
+          Number.isFinite(saved.end_ms) &&
+          saved.start_ms! < saved.reveal_start_ms! &&
+          saved.reveal_start_ms! <= saved.end_ms!
+        ) {
+          return {
+            start_ms: saved.start_ms!,
+            reveal_start_ms: saved.reveal_start_ms!,
+            end_ms: saved.end_ms!,
+          };
+        }
+      }
+    }
+  } catch {
+    // Keep the default range when local storage is unavailable.
+  }
+  return fallback;
+}
 
 /** Normalize user input to BASE/QUOTE; null when the format is wrong. */
 export function normalizeSymbol(raw: string): string | null {
@@ -284,6 +321,7 @@ export interface SimState {
   fills: FillLine[];
   lastOrder: OrderLine | null;
   replay: ReplayState;
+  replayWindow: ReplayWindow;
   error: string | null;
   drawings: Drawing[];
   tool: Tool;
@@ -350,6 +388,7 @@ let state: SimState = {
   fills: [],
   lastOrder: null,
   replay: initialReplay,
+  replayWindow: loadReplayWindow(),
   error: null,
   drawings: [],
   tool: "none",
@@ -461,6 +500,14 @@ export const store = {
       lastPrice: candle[4],
     });
   },
+  applyOi(samples: Array<[number, number]>): void {
+    if (!samples.length) return;
+    const byTime = new Map(state.oi);
+    for (const [time, value] of samples) {
+      if (Number.isFinite(time) && Number.isFinite(value)) byTime.set(time, value);
+    }
+    set({ oi: [...byTime.entries()].sort((a, b) => a[0] - b[0]) });
+  },
   applyMarket(last: number): void {
     set({ lastPrice: last });
   },
@@ -469,6 +516,21 @@ export const store = {
   },
   applyReplay(replay: ReplayState): void {
     set({ replay });
+  },
+  setReplayWindow(replayWindow: ReplayWindow): void {
+    if (
+      !Number.isFinite(replayWindow.start_ms) ||
+      !Number.isFinite(replayWindow.reveal_start_ms) ||
+      !Number.isFinite(replayWindow.end_ms) ||
+      replayWindow.start_ms >= replayWindow.reveal_start_ms ||
+      replayWindow.reveal_start_ms > replayWindow.end_ms
+    ) return;
+    set({ replayWindow });
+    try {
+      window.localStorage.setItem(REPLAY_WINDOW_KEY, JSON.stringify(replayWindow));
+    } catch {
+      // Keep the selected interval for this page load.
+    }
   },
   applyOrder(order: OrderLine): void {
     set({ lastOrder: order, error: null });
