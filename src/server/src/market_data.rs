@@ -24,6 +24,7 @@ const DOWNLOAD_BARS: usize = 5_000;
 const KLINES_PAGE: u32 = 1_000;
 /// How many open-interest points to keep (coarser grid than klines).
 const OI_POINTS: usize = 1_500;
+const MAX_OI_HISTORY_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 /// Binance OI-history page cap.
 const OI_PAGE: u32 = 500;
 /// Politeness pause between download pages (Binance rate limit).
@@ -305,6 +306,11 @@ fn oi_period(tf: &str) -> Option<&'static str> {
     }
 }
 
+fn oi_points(period: &str) -> usize {
+    let step_ms = tf_step_ms(period) as i64;
+    ((MAX_OI_HISTORY_MS / step_ms) as usize).min(OI_POINTS)
+}
+
 fn oi_file(symbol: &str, period: &str) -> String {
     format!(
         "{}_oi_{}.csv",
@@ -458,7 +464,7 @@ pub(super) fn ensure_oi(
     }
     if allow_net {
         log!("[engine] {symbol} OI@{period}: no cache, downloading…");
-        match download_oi(symbol, tf, OI_POINTS) {
+        match download_oi(symbol, tf, oi_points(period)) {
             Ok(rows) => {
                 if let Err(e) = save_pairs_csv(&path, &rows) {
                     log!("[engine] {symbol} OI@{period}: cache write failed: {e}");
@@ -657,6 +663,14 @@ mod tests {
         assert_eq!(oi_period("15m"), Some("15m"));
         assert_eq!(oi_period("1h"), Some("1h"));
         assert_eq!(oi_period("7m"), None);
+    }
+
+    #[test]
+    fn oi_points_stay_within_binances_history_window() {
+        assert_eq!(oi_points("1h"), 720);
+        assert_eq!(oi_points("15m"), OI_POINTS);
+        assert_eq!(oi_points("5m"), OI_POINTS);
+        assert!(oi_points("1h") as i64 * tf_step_ms("1h") as i64 <= MAX_OI_HISTORY_MS);
     }
 
     #[test]

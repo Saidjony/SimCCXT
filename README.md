@@ -122,14 +122,18 @@ chart with two line series on opposite scales: OI on the right, cumulative
 volume delta on the left; the time axis syncs both ways with the main chart.
 Toggle with the `OI` / `CVD` buttons (persisted per browser; the pane hides
 when both are off). OI comes in the snapshot (`oi` + `oi_period`) as static
-context — never replayed; CVD is computed client-side over the loaded series
-and follows every tick. Empty OI when the perp is missing or futures are
-unreachable.
+context — sparse OI samples are projected onto the candle timestamps, and both
+panels sync by visible time range (not bar index), including after timeframe
+changes. CVD is computed client-side over the loaded series and follows every
+tick. The chart displays when OI is unavailable or outside the visible range.
+Binance OI history is limited to 30 days; for a 1h grid, at most 720
+points are requested.
 
 **Volume profile** (right side of the chart). Fixed-range horizontal volume
-over the VISIBLE bars: 24 levels, POC flagged with its price. Recomputed on
-every pan/zoom/data tick, so it always matches the bars on screen; clicks
-pass through to the chart.
+over the VISIBLE bars: 64 price levels, POC flagged with its price. Recomputed
+on pan/zoom/data changes and positioned through the chart's current price
+scale, so it tracks both visible bars and price-axis changes; clicks pass
+through to the chart.
 
 **Coin list** (top card of the right panel, collapsible via the header).
 Add coins (`BASE/QUOTE` input, Enter or `+`), remove them (`×`), flag them

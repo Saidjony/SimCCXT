@@ -6,11 +6,13 @@ import {
   barWord,
   calcQty,
   countBars,
+  alignOiToCandles,
   cumulativeDelta,
   formatRuler,
   invertTime,
   positionBands,
   positionDirection,
+  profileBarLayout,
   riskReward,
   rulerStats,
   snapTime,
@@ -126,6 +128,59 @@ describe("cumulativeDelta", () => {
 
   it("is empty without bars", () => {
     assert.deepEqual(cumulativeDelta([]), []);
+  });
+});
+
+describe("alignOiToCandles", () => {
+  const candles = [
+    [1000, 10, 11, 9, 10, 1],
+    [2000, 10, 11, 9, 11, 1],
+    [3000, 11, 12, 10, 11, 1],
+    [4000, 11, 12, 10, 12, 1],
+  ] as Array<[number, number, number, number, number, number]>;
+
+  it("projects coarse OI samples onto candle timestamps without looking ahead", () => {
+    assert.deepEqual(
+      alignOiToCandles(candles, [[1500, 20], [3500, 30]]),
+      [[2000, 20], [3000, 20], [4000, 30]],
+    );
+  });
+
+  it("returns no OI before its first sample or when the ranges do not overlap", () => {
+    assert.deepEqual(alignOiToCandles(candles, [[5000, 20]]), []);
+    assert.deepEqual(alignOiToCandles(candles, []), []);
+  });
+});
+
+describe("profileBarLayout", () => {
+  it("anchors profile rows to the active price scale coordinates", () => {
+    const prices = [3, 2, 1];
+    const first = profileBarLayout(prices, (p) => 100 - p * 10);
+    const zoomed = profileBarLayout(prices, (p) => 200 - p * 20);
+    assert.deepEqual(first, [
+      { top: 65, height: 10 },
+      { top: 75, height: 10 },
+      { top: 85, height: 10 },
+    ]);
+    assert.deepEqual(zoomed, [
+      { top: 130, height: 20 },
+      { top: 150, height: 20 },
+      { top: 170, height: 20 },
+    ]);
+  });
+
+  it("skips prices that the chart cannot project", () => {
+    const layout = profileBarLayout([3, 2, 1], (p) => p === 2 ? null : p * 10);
+    assert.ok(layout[0]);
+    assert.equal(layout[1], null);
+    assert.ok(layout[2]);
+  });
+
+  it("clips levels outside the visible price plot", () => {
+    assert.deepEqual(
+      profileBarLayout([3, 2, 1], (p) => 100 - p * 10, 60),
+      [null, null, null],
+    );
   });
 });
 
