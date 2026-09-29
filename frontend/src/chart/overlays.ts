@@ -171,6 +171,20 @@ export function calcQty(riskUsdt: number, entry: number, sl: number): number | n
 
 export type OhlcRow = [number, number, number, number, number, number];
 
+/** Map an arbitrary drawing timestamp onto the nearest candle in this pane. */
+export function nearestCandleTime(times: number[], timestamp: number): number | null {
+  if (times.length === 0 || !Number.isFinite(timestamp)) return null;
+  let lo = 0;
+  let hi = times.length - 1;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (times[mid] < timestamp) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo > 0 && timestamp - times[lo - 1] <= times[lo] - timestamp) lo -= 1;
+  return times[lo];
+}
+
 /** Align sparse OI samples to candle timestamps using the last known value. */
 export function alignOiToCandles(
   rows: OhlcRow[],

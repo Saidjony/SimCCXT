@@ -10,6 +10,7 @@ import {
   cumulativeDelta,
   formatRuler,
   invertTime,
+  nearestCandleTime,
   positionBands,
   positionDirection,
   profileBarLayout,
@@ -112,6 +113,17 @@ describe("calcQty", () => {
     assert.equal(barWord(1), "бар");
     assert.equal(barWord(3), "бара");
     assert.equal(barWord(5), "баров");
+  });
+});
+
+describe("nearestCandleTime", () => {
+  it("projects drawing times onto each timeframe's nearest bar", () => {
+    const hourly = [0, 3_600_000, 7_200_000];
+    assert.equal(nearestCandleTime(hourly, 3_600_000), 3_600_000);
+    assert.equal(nearestCandleTime(hourly, 5_100_000), 3_600_000);
+    assert.equal(nearestCandleTime(hourly, 5_500_000), 7_200_000);
+    assert.equal(nearestCandleTime(hourly, -1), 0);
+    assert.equal(nearestCandleTime([], 100), null);
   });
 });
 

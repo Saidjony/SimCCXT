@@ -3,8 +3,6 @@ import { sendSim } from "../websocket/useSimSocket";
 import { getState, normalizeSymbol, store, useSim } from "../state/store";
 import type { CoinEntry } from "../state/store";
 
-const TIMEFRAMES = ["1m", "5m", "15m", "1h"];
-
 /** Outline/filled flag: the "pinned" marker for a watchlist coin. */
 function FlagIcon({ filled }: { filled: boolean }): JSX.Element {
   return (
@@ -139,16 +137,6 @@ export function CoinList(): JSX.Element {
         title={collapsed ? "развернуть" : "свернуть"}
       >
         <h4><span className="chev">{collapsed ? "▸" : "▾"}</span> Рынок</h4>
-        <select
-          className="tf-select"
-          value={timeframe}
-          onClick={(e) => e.stopPropagation()}
-          onChange={(e) => sendSim({ type: "subscribe", symbol, timeframe: e.target.value })}
-        >
-          {TIMEFRAMES.map((t) => (
-            <option key={t} value={t}>{t}</option>
-          ))}
-        </select>
       </div>
       {!collapsed && (
       <>

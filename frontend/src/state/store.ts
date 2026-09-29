@@ -95,6 +95,7 @@ function persistWatchlist(list: CoinEntry[]): void {
 // ---------------------------------------------------------------------------
 
 const CRITERIA_KEY = "simccxt.criteria.v1";
+const CHART_CRITERIA_KEY = "simccxt.chart-criteria.v1";
 const CRITERION_IDS = new Set(CRITERIA.map((c) => c.id));
 
 function loadCriteria(): string[] {
@@ -123,6 +124,37 @@ function persistCriteria(list: string[]): void {
     window.localStorage.setItem(CRITERIA_KEY, JSON.stringify(list));
   } catch {
     // storage unavailable: selection still works for this page load
+  }
+}
+
+function loadChartCriteria(): Record<string, string[]> {
+  const validList = (value: unknown): string[] => {
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (id): id is string => typeof id === "string" && CRITERION_IDS.has(id),
+    );
+  };
+  try {
+    const raw = window.localStorage.getItem(CHART_CRITERIA_KEY);
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return Object.fromEntries(
+          Object.entries(parsed).map(([key, value]) => [key, validList(value)]),
+        );
+      }
+    }
+  } catch {
+    // Private mode or corrupt data: use the legacy top-chart selection.
+  }
+  return { top: loadCriteria() };
+}
+
+function persistChartCriteria(criteria: Record<string, string[]>): void {
+  try {
+    window.localStorage.setItem(CHART_CRITERIA_KEY, JSON.stringify(criteria));
+  } catch {
+    // Selection still works for this page load when storage is unavailable.
   }
 }
 
@@ -211,7 +243,8 @@ export interface SimState {
   status: "connecting" | "open" | "closed";
   clientId: number | null;
   symbol: string;
-  timeframe: string;  candles: CandleRow[];
+  timeframe: string;
+  candles: CandleRow[];
   /** Bumped on every candle change; chart applies setData/update incrementally. */
   candlesVersion: number;
   /** True when the chart must replace the whole series (new snapshot). */
@@ -235,6 +268,8 @@ export interface SimState {
   watchlist: CoinEntry[];
   /** Setup checklist: selected criterion ids → chips on the chart overlay. */
   criteria: string[];
+  /** Independent checklist selection for each chart panel. */
+  chartCriteria: Record<string, string[]>;
   /** Challenge display nick ("" = use the server-assigned random one). */
   nick: string;
   /** Effective nick from the last login_ok (random or override). */
@@ -275,7 +310,7 @@ let state: SimState = {
   status: "connecting",
   clientId: null,
   symbol: "BTC/USDT",
-  timeframe: "1m",
+  timeframe: "5m",
   candles: [],
   candlesVersion: 0,
   fullReset: false,
@@ -293,6 +328,7 @@ let state: SimState = {
   fixedRiskUsdt: 10,
   watchlist: loadWatchlist(),
   criteria: loadCriteria(),
+  chartCriteria: loadChartCriteria(),
   nick: loadUser().name,
   serverNick: "",
   inChallenge: loadUser().inChallenge,
@@ -437,6 +473,22 @@ export const store = {
       set({ criteria: [] });
       persistCriteria([]);
     }
+  },
+  toggleChartCriterion(panel: string, id: string): void {
+    if (!CRITERION_IDS.has(id)) return;
+    const current = state.chartCriteria[panel] ?? [];
+    const selected = current.includes(id)
+      ? current.filter((criterion) => criterion !== id)
+      : [...current, id];
+    const chartCriteria = { ...state.chartCriteria, [panel]: selected };
+    set({ chartCriteria });
+    persistChartCriteria(chartCriteria);
+  },
+  clearChartCriteria(panel: string): void {
+    if (!state.chartCriteria[panel]?.length) return;
+    const chartCriteria = { ...state.chartCriteria, [panel]: [] };
+    set({ chartCriteria });
+    persistChartCriteria(chartCriteria);
   },
   /** Display nick for the challenge ("" = server-assigned random nick). */
   setNick(name: string): void {

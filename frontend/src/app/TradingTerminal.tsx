@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
 import { useSimSocket } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
-import { Chart } from "../chart/Chart";
+import { ChartWorkspace } from "../chart/ChartWorkspace";
 import { OrderPanel } from "../components/OrderPanel";
 import { ReplayControls } from "../components/ReplayControls";
 import { CoinList } from "../components/CoinList";
-import { CriteriaCard } from "../components/CriteriaCard";
 import { ChallengeCard } from "../components/ChallengeCard";
 import { BottomTerminal } from "../components/Panels";
 
@@ -48,11 +47,10 @@ export function TradingTerminal(): JSX.Element {
       </header>
       <div className="toprow">
         <main className="main">
-          <Chart />
+          <ChartWorkspace />
         </main>
         <aside className="side">
           <CoinList />
-          <CriteriaCard />
           <ChallengeCard />
           <ReplayControls />
           <OrderPanel />

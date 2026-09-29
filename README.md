@@ -99,13 +99,12 @@ Terminal side:
 ```
 frontend/src/app          TradingTerminal + App bootstrap
 frontend/src/components   CoinList (right-panel watchlist: add/remove/flag +
-                          timeframe), CriteriaCard (30 setup checkboxes),
                           ChallengeCard (nick + opt-in leaderboard), ReplayControls,
                           OrderPanel (deal ticket), Panels (full-width
                           Account/Positions/Orders/Trades tabs)
 frontend/src/trade        criteria catalogue (30 ids + short overlay labels)
-frontend/src/chart        Bar chart (setData once, update per tick), DrawBar
-                          (icon toolbar), HTML-overlaid drawings, ghost preview
+frontend/src/chart        three-panel timeframe workspace, market charts,
+                          DrawBar (icon toolbar), HTML-overlaid drawings
 frontend/src/websocket    singleton connection (reconnect, watchdog), router
 frontend/src/state        tiny external store (React state/context level, no Redux)
 frontend/src/types        explicit WebSocket protocol types (no `any`)
@@ -114,10 +113,17 @@ frontend/test             pure protocol/math tests (bun test / npm test)
 
 ## Terminal features
 
-**Chart.** OHLC bars + volume (Lightweight Charts). Snapshot → `setData()`,
-ticks → `update()`; crosshair, zoom, pan and fills markers stay local.
+**Chart workspace.** Three charts: the main chart occupies the upper half,
+with two independent charts side by side below. Defaults are 5m, 1h and 1d;
+each chart has its own timeframe and criteria selection. The lower charts have
+independent market-data feeds. Drag the dividers to resize the panels and the
+main chart's indicator pane; layout sizes persist in the browser. Drawings are
+projected onto each chart's nearest candle and price scale. Expand any chart to
+fill the workspace and restore the three-panel layout with the same control.
+The main chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and
+fills markers.
 
-**Open interest + CVD** (pane under the chart, TradingView-style). A separate
+**Open interest + CVD** (pane under the main chart, TradingView-style). A separate
 chart with two line series on opposite scales: OI on the right, cumulative
 volume delta on the left; the time axis syncs both ways with the main chart.
 Toggle with the `OI` / `CVD` buttons (persisted per browser; the pane hides
@@ -138,10 +144,10 @@ through to the chart.
 **Coin list** (top card of the right panel, collapsible via the header).
 Add coins (`BASE/QUOTE` input, Enter or `+`), remove them (`×`), flag them
 (flag icon → the coin moves into the pinned "флаг" group above the rest).
-Clicking a row switches the session's series in Rust; removing the active coin
-jumps to the next one. The list and its collapsed state persist per browser
-(localStorage); the timeframe picker and the live price of the active coin
-live in the same card.
+Clicking a row switches the main chart's series in Rust; removing the active
+coin jumps to the next one. The list and its collapsed state persist per
+browser (localStorage). Each chart's criteria checklist is independent and
+persists per browser.
 
 **Drawings** (icon toolbar, top-right inside the chart; all local, never trade
 signals; drag to move with bar magnet, right-click / `Del` to delete,
