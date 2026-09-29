@@ -5,6 +5,7 @@ import { ChartWorkspace } from "../chart/ChartWorkspace";
 import { ReplayControls } from "../components/ReplayControls";
 import { CoinList } from "../components/CoinList";
 import { ChallengeCard } from "../components/ChallengeCard";
+import { OrderPanel } from "../components/OrderPanel";
 import { BottomTerminal } from "../components/Panels";
 import type { ExchangeId } from "../types/protocol";
 import { sendSim } from "../websocket/connection";
@@ -64,6 +65,7 @@ export function TradingTerminal(): JSX.Element {
         </label>
         <ConnBadge />
         {serverNick && <span className="nick-badge">вы: {serverNick}</span>}
+        <ReplayControls />
         {error && <span className="err">{error}</span>}
       </header>
       <div className="toprow">
@@ -73,7 +75,7 @@ export function TradingTerminal(): JSX.Element {
         <aside className="side">
           <CoinList />
           <ChallengeCard />
-          <ReplayControls />
+          <OrderPanel />
         </aside>
       </div>
       <div className="bottom">
