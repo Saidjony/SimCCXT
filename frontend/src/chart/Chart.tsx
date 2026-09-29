@@ -38,6 +38,15 @@ function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
 }
 
+function loadOiPaneHeight(): number {
+  try {
+    const saved = Number(window.localStorage.getItem("simccxt.oi-pane-height"));
+    return Number.isFinite(saved) && saved >= 72 ? saved : 120;
+  } catch {
+    return 120;
+  }
+}
+
 function timeToMs(t: Time): number | null {
   if (typeof t === "number") return t * 1000;
   if (typeof t === "string") {
@@ -81,7 +90,7 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
  * Every drawing is an HTML overlay: uniform drag, right-click delete,
  * live ghost preview while placing.
  */
-export function Chart(): JSX.Element {
+export function Chart({ panelId = "top" }: { panelId?: string }): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
@@ -109,6 +118,8 @@ export function Chart(): JSX.Element {
   const suppressClickRef = useRef(false);
   const versionRef = useRef(0);
   const [follow, setFollow] = useState(true);
+  const [oiPaneHeight, setOiPaneHeight] = useState(loadOiPaneHeight);
+  const oiPaneHeightRef = useRef(oiPaneHeight);
   const followRef = useRef(true);
   const [hover, setHover] = useState<HoverBar | null>(null);
   const [ruler, setRuler] = useState<RulerState | null>(null);
@@ -124,7 +135,7 @@ export function Chart(): JSX.Element {
   const symbol = useSim((s) => s.symbol);
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
-  const criteria = useSim((s) => s.criteria);
+  const criteria = useSim((s) => s.chartCriteria[panelId] ?? []);
   const oiVisible = useSim((s) => s.oiVisible);
   const cvdVisible = useSim((s) => s.cvdVisible);
   const oiPeriod = useSim((s) => s.oiPeriod);
@@ -476,7 +487,27 @@ export function Chart(): JSX.Element {
     >
       <div ref={containerRef} className="chart" />
       {(oiVisible || cvdVisible) && (
-        <div ref={oiWrapRef} className="oi-wrap">
+        <div
+          ref={oiWrapRef}
+          className="oi-wrap"
+          style={{ flexBasis: oiPaneHeight, height: oiPaneHeight }}
+        >
+          <div
+            className="oi-resize-handle"
+            role="separator"
+            aria-label="Изменить высоту панели индикаторов"
+            aria-orientation="horizontal"
+            aria-valuemin={72}
+            aria-valuemax={Math.round((containerRef.current?.parentElement?.clientHeight ?? 600) * 0.45)}
+            aria-valuenow={Math.round(oiPaneHeight)}
+            onPointerDown={startOiPaneResize}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowUp") updateOiPaneHeight(oiPaneHeight + 8);
+              if (event.key === "ArrowDown") updateOiPaneHeight(oiPaneHeight - 8);
+            }}
+            tabIndex={0}
+            title="Перетащите, чтобы изменить высоту индикаторов"
+          />
           <div className="oi-label">
             {[
               oiVisible ? oiLabel : "",
@@ -570,6 +601,39 @@ export function Chart(): JSX.Element {
   function yToPrice(y: number): number | null {
     const v = barsRef.current?.coordinateToPrice(y);
     return typeof v === "number" ? v : null;
+  }
+
+  function startOiPaneResize(event: React.PointerEvent<HTMLDivElement>): void {
+    event.preventDefault();
+    const startY = event.clientY;
+    const initialHeight = oiPaneHeight;
+    const chartHeight = containerRef.current?.parentElement?.clientHeight ?? 600;
+    const move = (pointer: PointerEvent): void => {
+      updateOiPaneHeight(initialHeight + startY - pointer.clientY, chartHeight, false);
+    };
+    const stop = (): void => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      persistOiPaneHeight(oiPaneHeightRef.current);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop, { once: true });
+  }
+
+  function updateOiPaneHeight(requested: number, chartHeight?: number, persist = true): void {
+    const maxHeight = (chartHeight ?? containerRef.current?.parentElement?.clientHeight ?? 600) * 0.45;
+    const height = Math.max(72, Math.min(maxHeight, requested));
+    oiPaneHeightRef.current = height;
+    setOiPaneHeight(height);
+    if (persist) persistOiPaneHeight(height);
+  }
+
+  function persistOiPaneHeight(height: number): void {
+    try {
+      window.localStorage.setItem("simccxt.oi-pane-height", String(height));
+    } catch {
+      // Keep the resized panel for this page load.
+    }
   }
 
   function alignPriceScales(main: IChartApi, indicators: IChartApi): void {

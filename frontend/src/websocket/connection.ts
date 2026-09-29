@@ -2,7 +2,7 @@ import type { ClientMessage, ServerMessage } from "../types/protocol";
 import { parseServerMessage } from "../types/protocol";
 import { getState, store } from "../state/store";
 
-function wsUrl(): string {
+export function wsUrl(): string {
   const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
   if (env && env["VITE_WS_URL"]) return env["VITE_WS_URL"] as string;
   // Local dev/preview (vite serves the page, Rust serves WS :9001):
