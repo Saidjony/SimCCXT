@@ -40,7 +40,9 @@ use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use simccxt_exchange::{CreateOrderParams, Exchange};
-use crate::market_data::{ensure_oi, ensure_series, tf_step_ms};
+use crate::market_data::{
+    apply_series_window, ensure_oi, ensure_series, ensure_series_window, tf_step_ms, SeriesRequest,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
@@ -121,6 +123,9 @@ enum ClientCmd {
         timeframe: String,
         #[serde(default = "default_exchange")]
         exchange: String,
+        start_ms: Option<i64>,
+        reveal_start_ms: Option<i64>,
+        end_ms: Option<i64>,
         request_id: Option<String>,
     },
     PlaceOrder {
@@ -221,6 +226,16 @@ struct Session {
     risk_usdt: f64,    // fixed risk per trade, sent by the frontend on join
     oi: Vec<(i64, f64)>, // open-interest history (ts_ms, USDT value), context only
     oi_period: String, // OI grid actually loaded ("5m", "" when none)
+    oi_fed: usize,
+    range_start_ms: i64,
+    reveal_start_ms: i64,
+    range_end_ms: i64,
+}
+
+struct RequestedWindow {
+    start_ms: Option<i64>,
+    reveal_start_ms: Option<i64>,
+    end_ms: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +391,7 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "candles": rows,
         "account": s.ex.account_snapshot(),
         "replay": replay_json(s),
-        "oi": s.oi,
+        "oi": s.oi.iter().filter(|(ts, _)| *ts <= s.ex.now_ms()).collect::<Vec<_>>(),
         "oi_period": s.oi_period,
         "request_id": request_id,
     })
@@ -405,6 +420,14 @@ fn delta_events(s: &mut Session) -> Vec<Value> {
         }));
     }
     s.fed = live.len();
+    let oi_end = s.oi.partition_point(|(ts, _)| *ts <= s.ex.now_ms());
+    if oi_end > s.oi_fed {
+        ev.push(json!({
+            "type": "oi_update",
+            "samples": s.oi[s.oi_fed..oi_end],
+        }));
+        s.oi_fed = oi_end;
+    }
     let last = live.last().map(|r| r[4]).unwrap_or(0.0);
     ev.push(json!({
         "type": "market_update",
@@ -450,6 +473,10 @@ fn new_session(nick: String) -> Session {
         risk_usdt: 0.0,
         oi: Vec::new(),
         oi_period: String::new(),
+        oi_fed: 0,
+        range_start_ms: 0,
+        reveal_start_ms: 0,
+        range_end_ms: 0,
     }
 }
 
@@ -459,10 +486,17 @@ fn use_series(
     symbol: String,
     timeframe: String,
     exchange: String,
+    window: RequestedWindow,
     data_dir: &Path,
     allow_net: bool,
 ) -> Result<String, String> {
-    let reload = exchange != s.exchange || symbol != s.symbol || timeframe != s.timeframe;
+    let RequestedWindow { start_ms, reveal_start_ms, end_ms } = window;
+    let reload = exchange != s.exchange
+        || symbol != s.symbol
+        || timeframe != s.timeframe
+        || start_ms.is_some_and(|value| value != s.range_start_ms)
+        || reveal_start_ms.is_some_and(|value| value != s.reveal_start_ms)
+        || end_ms.is_some_and(|value| value != s.range_end_ms);
     ensure_series(
         &mut s.ex,
         &exchange,
@@ -473,18 +507,50 @@ fn use_series(
         reload,
     )?;
     let step_ms = tf_step_ms(&timeframe);
-    let rows = s.ex.fetch_ohlcv(&symbol, &timeframe, None, None);
     ensure_oi(&mut s.oi, &mut s.oi_period, &exchange, &symbol, &timeframe, data_dir, allow_net);
+    let rows = s.ex.fetch_ohlcv(&symbol, &timeframe, None, None);
+    let last_ms = rows.last().map(|row| row[0] as i64).unwrap_or(0);
+    let start_ms = start_ms.unwrap_or_else(|| {
+        rows.first().map(|row| row[0] as i64).unwrap_or(last_ms)
+    });
+    let reveal_start_ms = reveal_start_ms.unwrap_or_else(|| {
+        start_ms.saturating_add((step_ms as i64).saturating_mul(20))
+    });
+    let end_ms = end_ms.unwrap_or(last_ms);
+    ensure_series_window(
+        &mut s.ex,
+        SeriesRequest {
+            exchange: &exchange,
+            symbol: &symbol,
+            timeframe: &timeframe,
+            data_dir,
+            allow_net,
+            force_reload: reload,
+            start_ms,
+            end_ms,
+        },
+    )?;
+    let reset_ms = apply_series_window(
+        &mut s.ex,
+        &symbol,
+        &timeframe,
+        start_ms,
+        reveal_start_ms,
+        end_ms,
+    )?;
+    s.oi.retain(|(ts, _)| *ts >= start_ms && *ts <= end_ms);
     s.symbol = symbol;
     s.timeframe = timeframe;
     s.exchange = exchange;
     s.step_ms = step_ms;
+    s.range_start_ms = start_ms;
+    s.reveal_start_ms = reveal_start_ms;
+    s.range_end_ms = end_ms;
     s.ex.set_step_ms(s.step_ms);
-    if let Some(first) = rows.first() {
-        let ts = DateTime::from_timestamp_millis(first[0] as i64).unwrap_or_else(Utc::now);
-        s.ex.reset(ts);
-    }
+    let ts = DateTime::from_timestamp_millis(reset_ms).unwrap_or_else(Utc::now);
+    s.ex.reset(ts);
     s.ex.resume();
+    s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= reset_ms);
     s.fed = 0;
     s.fills_seen = s.ex.fetch_fills(None, None).len();
     s.last_step = std::time::Instant::now();
@@ -594,11 +660,24 @@ impl Engine {
                         "type": "challenge_ok", "joined": false, "request_id": request_id }));
                 }
             }
-            ClientCmd::Subscribe { symbol, timeframe, exchange, request_id } => {
+            ClientCmd::Subscribe {
+                symbol, timeframe, exchange, start_ms, reveal_start_ms, end_ms, request_id,
+            } => {
                 let allow_net = self.allow_net;
                 let s = self.session(to);
-                let result = if s.symbol.is_empty() || symbol != s.symbol || timeframe != s.timeframe || exchange != s.exchange {
-                    use_series(s, symbol, timeframe, exchange, data_dir, allow_net).map(Some)
+                let window_changed = start_ms.is_some_and(|value| value != s.range_start_ms)
+                    || reveal_start_ms.is_some_and(|value| value != s.reveal_start_ms)
+                    || end_ms.is_some_and(|value| value != s.range_end_ms);
+                let result = if s.symbol.is_empty() || symbol != s.symbol || timeframe != s.timeframe || exchange != s.exchange || window_changed {
+                    use_series(
+                        s,
+                        symbol,
+                        timeframe,
+                        exchange,
+                        RequestedWindow { start_ms, reveal_start_ms, end_ms },
+                        data_dir,
+                        allow_net,
+                    ).map(Some)
                 } else {
                     Ok(None)
                 };
@@ -734,12 +813,17 @@ impl Engine {
                         }
                         "reset" => {
                             let rows = s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None);
-                            let ts_ms = timestamp_ms.unwrap_or(
-                                rows.first().map(|r| r[0] as i64).unwrap_or_else(|| s.ex.now_ms()),
-                            );
+                            let ts_ms = timestamp_ms.unwrap_or_else(|| {
+                                rows.iter()
+                                    .find(|row| (row[0] as i64) >= s.reveal_start_ms)
+                                    .map(|row| row[0] as i64 - s.step_ms as i64)
+                                    .or_else(|| rows.first().map(|row| row[0] as i64))
+                                    .unwrap_or_else(|| s.ex.now_ms())
+                            });
                             if let Some(ts) = DateTime::from_timestamp_millis(ts_ms) {
                                 s.ex.reset(ts);
                             }
+                            s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ts_ms);
                             // Sync the cursor to the new clock (the client follows
                             // up with subscribe -> full snapshot). Broadcasting
                             // every live bar as deltas here would be a burst of
@@ -1118,6 +1202,23 @@ mod tests {
     }
 
     #[test]
+    fn client_cmd_subscribe_parses_replay_window() {
+        let cmd: ClientCmd = serde_json::from_str(
+            r#"{"type":"subscribe","symbol":"BTC/USDT","timeframe":"5m",
+                "start_ms":1000,"reveal_start_ms":2000,"end_ms":3000}"#,
+        )
+        .unwrap();
+        match cmd {
+            ClientCmd::Subscribe { start_ms, reveal_start_ms, end_ms, .. } => {
+                assert_eq!(start_ms, Some(1000));
+                assert_eq!(reveal_start_ms, Some(2000));
+                assert_eq!(end_ms, Some(3000));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn client_cmd_unknown_type_rejected() {
         let r = serde_json::from_str::<ClientCmd>(r#"{"type":"mousemove","x":1}"#);
         assert!(r.is_err());
@@ -1149,6 +1250,9 @@ mod tests {
             symbol: symbol.into(),
             timeframe: timeframe.into(),
             exchange: default_exchange(),
+            start_ms: None,
+            reveal_start_ms: None,
+            end_ms: None,
             request_id: None,
         }
     }

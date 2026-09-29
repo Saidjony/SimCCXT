@@ -33,6 +33,7 @@ export function MiniChart({
 }: Props): JSX.Element {
   const symbol = useSim((s) => s.symbol);
   const exchange = useSim((s) => s.exchange);
+  const replayWindow = useSim((s) => s.replayWindow);
   const replayNow = useSim((s) => s.replay.now_ms);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -169,14 +170,14 @@ export function MiniChart({
         const message = parseServerMessage(String(event.data));
         if (!message) return;
         if (message.type === "welcome") {
-          socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange }));
+          socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange, ...replayWindow }));
           const now = replayNowRef.current;
           lastSyncedBucketRef.current = Math.floor(now / timeframeMs(timeframe));
           lastMainTimeframeRef.current = mainTimeframe;
           if (now > 0) {
             socket?.send(JSON.stringify({ type: "replay", action: "reset", timestamp_ms: now }));
             socket?.send(JSON.stringify({ type: "replay", action: "pause" }));
-            socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange }));
+            socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange, ...replayWindow }));
           }
         } else if (message.type === "snapshot") {
           if (message.symbol !== symbol || message.timeframe !== timeframe ||
@@ -213,7 +214,7 @@ export function MiniChart({
       }
       socketRef.current = null;
     };
-  }, [symbol, timeframe, exchange]);
+  }, [symbol, timeframe, exchange, replayWindow.start_ms, replayWindow.reveal_start_ms, replayWindow.end_ms]);
 
   useEffect(() => {
     if (replayNow <= 0) return;
@@ -226,8 +227,17 @@ export function MiniChart({
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: "replay", action: "reset", timestamp_ms: replayNow }));
     socket.send(JSON.stringify({ type: "replay", action: "pause" }));
-    socket.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange }));
-  }, [replayNow, symbol, timeframe, mainTimeframe, exchange]);
+    socket.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange, ...replayWindow }));
+  }, [
+    replayNow,
+    symbol,
+    timeframe,
+    mainTimeframe,
+    exchange,
+    replayWindow.start_ms,
+    replayWindow.reveal_start_ms,
+    replayWindow.end_ms,
+  ]);
 
   const selectedCriteria = useSim((s) => s.chartCriteria[timeframe] ?? []);
   void viewTick;

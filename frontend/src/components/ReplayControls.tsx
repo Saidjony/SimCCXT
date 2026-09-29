@@ -1,11 +1,55 @@
-import { sendSim } from "../websocket/useSimSocket";
-import { useSim } from "../state/store";
+import { useEffect, useState } from "react";
+import { getState, store, useSim } from "../state/store";
+import { sendSim, subscribeSim } from "../websocket/connection";
+import type { FormEvent } from "react";
 import { formatTs } from "../types/protocol";
+
+function toLocalInput(ms: number): string {
+  const date = new Date(ms);
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+  return date.toISOString().slice(0, 16);
+}
 
 /** Replay transport: Rust owns the clock, the UI only sends commands. */
 export function ReplayControls(): JSX.Element {
   const replay = useSim((s) => s.replay);
+  const replayWindow = useSim((s) => s.replayWindow);
+  const timeframe = useSim((s) => s.timeframe);
+  const [draft, setDraft] = useState({
+    start: toLocalInput(replayWindow.start_ms),
+    reveal: toLocalInput(replayWindow.reveal_start_ms),
+    end: toLocalInput(replayWindow.end_ms),
+  });
+  const [rangeError, setRangeError] = useState("");
   const pct = replay.total > 0 ? Math.round((replay.fed / replay.total) * 100) : 0;
+
+  useEffect(() => {
+    setDraft({
+      start: toLocalInput(replayWindow.start_ms),
+      reveal: toLocalInput(replayWindow.reveal_start_ms),
+      end: toLocalInput(replayWindow.end_ms),
+    });
+  }, [replayWindow.start_ms, replayWindow.reveal_start_ms, replayWindow.end_ms]);
+
+  const applyWindow = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    const start = Date.parse(draft.start);
+    const reveal = Date.parse(draft.reveal);
+    const end = Date.parse(draft.end);
+    if (![start, reveal, end].every(Number.isFinite) || start >= reveal || reveal > end) {
+      setRangeError("Порядок дат: начало < начало реплея ≤ конец.");
+      return;
+    }
+    if (end > Date.now()) {
+      setRangeError("Конец диапазона не может быть в будущем.");
+      return;
+    }
+    const nextRange = { start_ms: start, reveal_start_ms: reveal, end_ms: end };
+    store.setReplayWindow(nextRange);
+    setRangeError("");
+    const current = getState();
+    subscribeSim(current.symbol, current.timeframe, current.exchange);
+  };
 
   return (
     <div className="replay-compact" aria-label="Replay controls">
@@ -45,6 +89,42 @@ export function ReplayControls(): JSX.Element {
           ))}
         </select>
       </label>
+      <details className="replay-window">
+        <summary aria-label="Настроить даты реплея" title="Диапазон дат для всех таймфреймов">Даты</summary>
+        <form className="replay-window-menu" onSubmit={applyWindow}>
+          <strong>Даты истории · {timeframe}</strong>
+          <label>
+            Начало видимой истории
+            <input
+              type="datetime-local"
+              value={draft.start}
+              onChange={(event) => setDraft((value) => ({ ...value, start: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Конец видимых / начало пошаговых
+            <input
+              type="datetime-local"
+              value={draft.reveal}
+              onChange={(event) => setDraft((value) => ({ ...value, reveal: event.target.value }))}
+              required
+            />
+          </label>
+          <label>
+            Конец истории
+            <input
+              type="datetime-local"
+              value={draft.end}
+              onChange={(event) => setDraft((value) => ({ ...value, end: event.target.value }))}
+              required
+            />
+          </label>
+          <small className="lbl">Диапазон общий для всех графиков и загружается отдельно для их таймфреймов.</small>
+          {rangeError && <span className="err">{rangeError}</span>}
+          <button className="btn b-acc" type="submit">Применить ко всем графикам</button>
+        </form>
+      </details>
       <span className="replay-state" title={formatTs(replay.now_ms)}>
         {replay.paused ? "Пауза" : "Идёт"}{replay.done ? " · конец" : ""}
       </span>
@@ -57,7 +137,7 @@ export function ReplayControls(): JSX.Element {
           <span><kbd>Home</kbd> сброс реплея</span>
           <span><kbd>Esc</kbd> отменить рисунок</span>
           <span><kbd>Delete</kbd> удалить выбранный рисунок</span>
-          <small>Работают, когда фокус не в поле ввода или кнопке.</small>
+          <small>Работают, когда фокус не в поле ввода, кнопке или меню.</small>
         </div>
       </details>
     </div>

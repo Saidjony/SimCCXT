@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { sendSim } from "../websocket/useSimSocket";
 import { getState, normalizeSymbol, store, useSim } from "../state/store";
 import type { CoinEntry } from "../state/store";
+import { subscribeSim } from "../websocket/connection";
 
 /** Outline/filled flag: the "pinned" marker for a watchlist coin. */
 function FlagIcon({ filled }: { filled: boolean }): JSX.Element {
@@ -87,7 +87,7 @@ export function CoinList(): JSX.Element {
 
   const switchTo = (sym: string): void => {
     if (sym === symbol) return;
-    sendSim({ type: "subscribe", symbol: sym, timeframe, exchange });
+    subscribeSim(sym, timeframe, exchange);
   };
 
   const remove = (sym: string): void => {
@@ -97,12 +97,7 @@ export function CoinList(): JSX.Element {
     if (wasActive) {
       const next = getState().watchlist[0];
       if (next) {
-        sendSim({
-          type: "subscribe",
-          symbol: next.symbol,
-          timeframe: getState().timeframe,
-          exchange: getState().exchange,
-        });
+        subscribeSim(next.symbol, getState().timeframe, getState().exchange);
       }
     }
   };

@@ -125,11 +125,10 @@ The price scale is reset to auto-fit when new timeframe data arrives. The main
 chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and fills markers.
 
 **Open interest + CVD** are separate resizable charts below the price chart.
-OI uses an independent fitted time range so its shorter history stays visible;
-CVD follows the main chart's candle range. Toggle either with the `OI` / `CVD`
-buttons. CVD is computed client-side over the loaded series and follows every
-tick. If a venue does not expose open-interest history, that pane reports that
-there is no OI data.
+Both indicators synchronize to the main chart by timestamp. OI is revealed
+incrementally with replay candles; CVD is computed client-side over the visible
+series. Toggle either with the `OI` / `CVD` buttons. If a venue does not expose
+open-interest history, that pane reports that there is no OI data.
 
 **Volume profile** (right side of the chart). Fixed-range horizontal volume
 over the VISIBLE bars: 64 price levels, POC flagged with its price. Recomputed
@@ -151,8 +150,16 @@ coin jumps to the next one. The list and its collapsed state persist per
 browser (localStorage).
 
 **Account, positions, orders and trades** are in the full-width terminal below
-the charts; scroll down to view them. The paper-trading order form is also
-available as a bottom-terminal tab.
+the charts; scroll down to view them. The paper-trading order form is in the
+right panel under the collapsible Challenge card.
+
+**Replay date window** is configured from the compact controls in the top bar.
+Choose the first visible-history date, the boundary after which bars reveal
+one-by-one, and the last date (defaults to now). The same absolute range is
+loaded independently for each chart's timeframe and exchange. Date ranges are
+cached separately; a request is limited to 100,000 bars per chart.
+`Space` toggles play/pause, `→` steps one bar, `Home` resets to the reveal
+boundary, `Esc` cancels drawing, and `Delete` removes the selected drawing.
 
 **Drawings** (icon toolbar, top-right inside the chart; all local, never trade
 signals; drag to move with bar magnet, right-click / `Del` to delete,
@@ -181,8 +188,9 @@ assigns a random nick per session (`Быстрый-Бык-42`), typing your own 
 it. The «участвовать» checkbox opts in: the session's nick + risk + PnL + R
 appear on the shared board every participant sees (broadcast without `to`).
 R = (realized + unrealized) / fixed risk, sorted desc; the board refreshes on
-join/leave/disconnect/every fill and lives in server memory only. Nick and the
-opt-in persist per browser and restore on connect.
+join/leave/disconnect/fills, so unrealized PnL can be stale while a position is
+open. It lives in server memory only. Nick and the opt-in persist per browser
+and restore on connect.
 
 **Deal ticket** (`Сделка` card). Everything in USDT, no base-asset quantities:
 capital + fixed risk per trade, entry-type dropdown (Рынок/Лимит/Стоп) with

@@ -13,11 +13,23 @@ use simccxt_exchange::Exchange;
 
 /// How many klines to pull when a series is missing from cache and memory.
 const DOWNLOAD_BARS: usize = 5_000;
+const MAX_WINDOW_BARS: usize = 100_000;
 const OHLCV_PAGE: usize = 1_000;
 /// How many open-interest points to keep (coarser grid than klines).
 const OI_POINTS: usize = 1_500;
 const MAX_OI_HISTORY_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const OI_PAGE: usize = 500;
+
+pub(super) struct SeriesRequest<'a> {
+    pub exchange: &'a str,
+    pub symbol: &'a str,
+    pub timeframe: &'a str,
+    pub data_dir: &'a Path,
+    pub allow_net: bool,
+    pub force_reload: bool,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
 
 /// Step size per timeframe.
 pub(super) fn tf_step_ms(tf: &str) -> u64 {
@@ -169,12 +181,32 @@ fn oi_row(row: &Value) -> Option<(i64, f64)> {
 /// instantiated only for this download; replay and order execution remain in
 /// the simulator's Exchange.
 fn download_series(exchange_id: &str, symbol: &str, tf: &str, bars: usize) -> Result<Vec<OHLCV>, String> {
+    let end_ms = Utc::now().timestamp_millis();
+    let start_ms = end_ms - (bars as i64) * tf_step_ms(tf) as i64;
+    download_series_window(exchange_id, symbol, tf, start_ms, end_ms)
+}
+
+fn download_series_window(
+    exchange_id: &str,
+    symbol: &str,
+    tf: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<OHLCV>, String> {
     if !["1s", "1m", "5m", "15m", "1h", "4h", "1d"].contains(&tf) {
         return Err(format!("unsupported timeframe {tf}"));
     }
+    if start_ms >= end_ms {
+        return Err("market-data range start must be before its end".into());
+    }
     let step = tf_step_ms(tf) as i64;
-    let end_ms = Utc::now().timestamp_millis();
-    let mut cursor = end_ms - (bars as i64) * step;
+    let bars = ((end_ms - start_ms) / step + 1) as usize;
+    if bars > MAX_WINDOW_BARS {
+        return Err(format!(
+            "requested range exceeds {MAX_WINDOW_BARS} bars at {tf}; narrow the dates"
+        ));
+    }
+    let mut cursor = start_ms;
     let mut exchange = ccxt_exchange(exchange_id)?;
     let runtime = ccxt_runtime()?;
     runtime.block_on(async {
@@ -215,9 +247,12 @@ fn download_series(exchange_id: &str, symbol: &str, tf: &str, bars: usize) -> Re
                 let Some(low) = ccxt_number(&fields[3]) else { continue };
                 let Some(close) = ccxt_number(&fields[4]) else { continue };
                 let Some(volume) = ccxt_number(&fields[5]) else { continue };
-                candles.push(OHLCV::new(dt, open, high, low, close, volume));
+                if ms >= start_ms && ms <= end_ms {
+                    candles.push(OHLCV::new(dt, open, high, low, close, volume));
+                }
                 last_time = Some(ms);
             }
+
             let Some(last_time) = last_time else { break };
             if last_time < cursor {
                 break;
@@ -231,6 +266,62 @@ fn download_series(exchange_id: &str, symbol: &str, tf: &str, bars: usize) -> Re
         }
         Ok(candles)
     })
+}
+
+fn window_file(exchange: &str, symbol: &str, tf: &str, start_ms: i64, end_ms: i64) -> String {
+    let base = binance_file(symbol, tf).trim_end_matches(".csv").to_string();
+    format!("{exchange}_{base}_{start_ms}_{end_ms}.csv")
+}
+
+/// Load enough history for the requested window, fetching and caching an
+/// exchange-specific range when the normal recent-history cache is too short.
+pub(super) fn ensure_series_window(
+    ex: &mut Exchange,
+    request: SeriesRequest<'_>,
+) -> Result<(), String> {
+    let SeriesRequest {
+        exchange,
+        symbol,
+        timeframe,
+        data_dir,
+        allow_net,
+        force_reload,
+        start_ms,
+        end_ms,
+    } = request;
+    ensure_series(ex, exchange, symbol, timeframe, data_dir, allow_net, force_reload)?;
+    let rows = ex.fetch_ohlcv(symbol, timeframe, None, None);
+    let step = tf_step_ms(timeframe) as i64;
+    let covered = rows.first().is_some_and(|row| row[0] as i64 <= start_ms + step)
+        && rows.last().is_some_and(|row| row[0] as i64 + step >= end_ms);
+    if covered {
+        return Ok(());
+    }
+    if !allow_net {
+        return Err(format!(
+            "{exchange} {symbol} {timeframe}: requested dates are outside loaded history; enable network access or narrow the range"
+        ));
+    }
+    let path = data_dir.join(window_file(exchange, symbol, timeframe, start_ms, end_ms));
+    let candles = if let Some(candles) = load_csv(&path) {
+        candles
+    } else {
+        let candles = download_series_window(exchange, symbol, timeframe, start_ms, end_ms)?;
+        save_csv(&path, &candles)?;
+        candles
+    };
+    if candles.is_empty() {
+        return Err(format!("{exchange} {symbol} {timeframe}: no candles in requested date range"));
+    }
+    if let Ok(sym) = Symbol::parse(symbol) {
+        ex.add_market(&sym, MarketKind::Spot);
+    }
+    ex.load_candles(symbol, timeframe, candles);
+    log!(
+        "[engine] {exchange} {symbol} {timeframe}: range loaded and cached ({})",
+        path.display()
+    );
+    Ok(())
 }
 
 /// OI history grid per chart timeframe (use 5m for the 1m candle interval).
@@ -494,6 +585,48 @@ pub(super) fn ensure_series(
     Ok(())
 }
 
+/// Restrict an already loaded series to a user-selected replay interval.
+/// Returns the final historical candle shown before step-by-step playback.
+pub(super) fn apply_series_window(
+    ex: &mut Exchange,
+    symbol: &str,
+    tf: &str,
+    start_ms: i64,
+    reveal_ms: i64,
+    end_ms: i64,
+) -> Result<i64, String> {
+    if start_ms >= reveal_ms || reveal_ms > end_ms {
+        return Err("replay range must satisfy start < reveal start <= end".into());
+    }
+    let rows = ex.fetch_ohlcv(symbol, tf, None, None);
+    let selected: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            let ts = row[0] as i64;
+            ts >= start_ms && ts <= end_ms
+        })
+        .collect();
+    let Some(first) = selected.first() else {
+        return Err(format!(
+            "no {symbol} {tf} candles in selected date range; choose dates within loaded history"
+        ));
+    };
+    let Some(last_visible) = selected.iter().rev().find(|row| (row[0] as i64) < reveal_ms) else {
+        return Err("replay start must leave at least one visible historical candle".into());
+    };
+    let first_ms = first[0] as i64;
+    let last_visible_ms = last_visible[0] as i64;
+    let candles = selected
+        .into_iter()
+        .filter_map(|row| {
+            let timestamp = chrono::DateTime::from_timestamp_millis(row[0] as i64)?;
+            Some(OHLCV::new(timestamp, row[1], row[2], row[3], row[4], row[5]))
+        })
+        .collect();
+    ex.load_candles(symbol, tf, candles);
+    Ok(last_visible_ms.max(first_ms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +718,37 @@ mod tests {
             "openInterest": "56029.63800000",
         }));
         assert_eq!(oi_row(&row), Some((1_790_679_600_000, 56_029.638)));
+    }
+
+    #[test]
+    fn series_window_keeps_visible_history_and_replay_tail() {
+        let mut ex = Exchange::default();
+        let candles = (1..=5)
+            .map(|minute| {
+                let timestamp = DateTime::from_timestamp_millis(minute * 60_000).unwrap();
+                OHLCV::new(timestamp, 1.0, 2.0, 0.5, 1.5, 10.0)
+            })
+            .collect();
+        ex.load_candles("BTC/USDT", "1m", candles);
+
+        let reset_ms = apply_series_window(
+            &mut ex,
+            "BTC/USDT",
+            "1m",
+            60_000,
+            180_000,
+            240_000,
+        )
+        .unwrap();
+
+        assert_eq!(reset_ms, 120_000);
+        assert_eq!(
+            ex.fetch_ohlcv("BTC/USDT", "1m", None, None)
+                .iter()
+                .map(|row| row[0] as i64)
+                .collect::<Vec<_>>(),
+            vec![60_000, 120_000, 180_000, 240_000]
+        );
     }
 
     #[test]

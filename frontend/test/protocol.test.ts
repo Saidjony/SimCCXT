@@ -63,6 +63,16 @@ describe("parseServerMessage", () => {
       assert.equal(board.board[0].r, 2);
     }
   });
+
+  it("accepts incremental open-interest updates", () => {
+    const message = parseServerMessage(
+      '{"type":"oi_update","to":7,"samples":[[2000,6.25]]}',
+    );
+    assert.equal(message?.type, "oi_update");
+    if (message?.type === "oi_update") {
+      assert.deepEqual(message.samples, [[2000, 6.25]]);
+    }
+  });
 });
 
 describe("applyCandleDelta", () => {

@@ -14,7 +14,7 @@ import type {
 } from "lightweight-charts";
 import type { CandleRow } from "../types/protocol";
 import { getState, store, useSim } from "../state/store";
-import { sendSim } from "../websocket/connection";
+import { sendSim, subscribeSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import {
@@ -140,6 +140,8 @@ export function Chart(): JSX.Element {
   const oiVisible = useSim((s) => s.oiVisible);
   const cvdVisible = useSim((s) => s.cvdVisible);
   const oiPeriod = useSim((s) => s.oiPeriod);
+  const oiData = useSim((s) => s.oi);
+  const replayNow = useSim((s) => s.replay.now_ms);
   const toolRef = useRef(tool);
   toolRef.current = tool;
   const marketData = getState();
@@ -328,9 +330,9 @@ export function Chart(): JSX.Element {
     } finally {
       syncingRef.current = false;
     }
-    if (cvdChartRef.current) {
-      syncCvdToMain();
-      scheduleCvdSync();
+    if (oiChartRef.current || cvdChartRef.current) {
+      syncIndicatorsToMain();
+      scheduleIndicatorSync();
     }
     setViewTick((n) => n + 1);
   }, [version]);
@@ -357,11 +359,11 @@ export function Chart(): JSX.Element {
     }
   }, [fills]);
 
-  // OI gets its own fitted time axis so its shorter history is always visible.
-  // CVD remains tied to the main chart's candle range.
+  // Indicators share the main chart's visible time range.
   useEffect(() => {
     const observers: ResizeObserver[] = [];
     const main = chartRef.current;
+    let oiRangeListener: (() => void) | null = null;
     let cvdRangeListener: (() => void) | null = null;
     let mainRangeListener: (() => void) | null = null;
 
@@ -377,12 +379,16 @@ export function Chart(): JSX.Element {
       oiChartRef.current = chart;
       oiSeriesRef.current = line;
       pushOi(line, getState().oi);
-      chart.timeScale().fitContent();
       const observer = new ResizeObserver(() => {
         chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+        scheduleIndicatorSync();
       });
       observer.observe(el);
       observers.push(observer);
+      oiRangeListener = (): void => {
+        if (!syncingRef.current) syncMainFromIndicator(chart);
+      };
+      chart.timeScale().subscribeVisibleLogicalRangeChange(oiRangeListener);
     } else {
       oiChartRef.current = null;
       oiSeriesRef.current = null;
@@ -401,31 +407,16 @@ export function Chart(): JSX.Element {
       cvdChartRef.current = chart;
       cvdSeriesRef.current = line;
       pushCvd(line, getState().candles);
-      syncCvdToMain();
+      syncIndicatorsToMain();
       const observer = new ResizeObserver(() => {
         chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-        scheduleCvdSync();
+        scheduleIndicatorSync();
       });
       observer.observe(el);
       observers.push(observer);
-      mainRangeListener = (): void => {
-        if (syncingRef.current) return;
-        syncCvdToMain();
-      };
       cvdRangeListener = (): void => {
-        if (syncingRef.current || !main) return;
-        const range = chart.timeScale().getVisibleLogicalRange();
-        if (!range) return;
-        syncingRef.current = true;
-        try {
-          main.timeScale().setVisibleLogicalRange(range);
-        } catch {
-          // Main and CVD share candle timestamps; a transient empty range is ignored.
-        } finally {
-          syncingRef.current = false;
-        }
+        if (!syncingRef.current) syncMainFromIndicator(chart);
       };
-      main?.timeScale().subscribeVisibleLogicalRangeChange(mainRangeListener);
       chart.timeScale().subscribeVisibleLogicalRangeChange(cvdRangeListener);
     } else {
       cvdChartRef.current = null;
@@ -433,9 +424,19 @@ export function Chart(): JSX.Element {
       main?.priceScale("left").applyOptions({ visible: false, minimumWidth: 0 });
       main?.priceScale("right").applyOptions({ minimumWidth: 0 });
     }
+    if (main && (oiChartRef.current || cvdChartRef.current)) {
+      mainRangeListener = (): void => {
+        if (!syncingRef.current) syncIndicatorsToMain();
+      };
+      main.timeScale().subscribeVisibleLogicalRangeChange(mainRangeListener);
+      syncIndicatorsToMain();
+    }
 
     return () => {
       if (mainRangeListener) main?.timeScale().unsubscribeVisibleLogicalRangeChange(mainRangeListener);
+      if (oiRangeListener && oiChartRef.current) {
+        oiChartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(oiRangeListener);
+      }
       if (cvdRangeListener && cvdChartRef.current) {
         cvdChartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(cvdRangeListener);
       }
@@ -449,6 +450,13 @@ export function Chart(): JSX.Element {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oiVisible, cvdVisible]);
+
+  useEffect(() => {
+    const line = oiSeriesRef.current;
+    if (!line) return;
+    pushOi(line, oiData.filter(([timestamp]) => timestamp <= replayNow));
+    scheduleIndicatorSync();
+  }, [oiData, replayNow]);
 
   // Toggle a bottom-pane series without rebuilding the chart.
   return (
@@ -691,33 +699,49 @@ export function Chart(): JSX.Element {
     }
   }
 
-  function scheduleCvdSync(): void {
+  function scheduleIndicatorSync(): void {
     if (scaleSyncRafRef.current) {
       window.cancelAnimationFrame(scaleSyncRafRef.current);
     }
     scaleSyncRafRef.current = window.requestAnimationFrame(() => {
       scaleSyncRafRef.current = window.requestAnimationFrame(() => {
         scaleSyncRafRef.current = 0;
-        syncCvdToMain();
+        syncIndicatorsToMain();
         setViewTick((n) => n + 1);
       });
     });
   }
 
-  /** Keep the CVD candle index aligned with the main chart. */
-  function syncCvdToMain(): void {
+  /** Align indicator axes by timestamps; sparse OI has unrelated logical indices. */
+  function syncIndicatorsToMain(): void {
     const main = chartRef.current;
-    const cvd = cvdChartRef.current;
-    if (!main || !cvd) return;
-    const r = main.timeScale().getVisibleLogicalRange();
-    if (!r) return;
+    if (!main) return;
+    const range = main.timeScale().getVisibleRange();
+    if (!range) return;
     syncingRef.current = true;
     try {
-      alignPriceScales(main, cvd);
-      const alignedRange = main.timeScale().getVisibleLogicalRange();
-      if (alignedRange) cvd.timeScale().setVisibleLogicalRange(alignedRange);
+      if (cvdChartRef.current) {
+        alignPriceScales(main, cvdChartRef.current);
+        cvdChartRef.current.timeScale().setVisibleRange(range);
+      }
+      if (oiChartRef.current) oiChartRef.current.timeScale().setVisibleRange(range);
     } catch {
-      /* The CVD pane can briefly be empty while a snapshot is applied. */
+      // A chart can briefly have no visible range while a snapshot is applied.
+    } finally {
+      syncingRef.current = false;
+    }
+  }
+
+  function syncMainFromIndicator(indicator: IChartApi): void {
+    const main = chartRef.current;
+    const range = indicator.timeScale().getVisibleRange();
+    if (!main || !range) return;
+    syncingRef.current = true;
+    try {
+      main.timeScale().setVisibleRange(range);
+      syncIndicatorsToMain();
+    } catch {
+      // A chart can briefly have no visible range while data is being replaced.
     } finally {
       syncingRef.current = false;
     }
@@ -812,7 +836,7 @@ export function Chart(): JSX.Element {
   function replayFrom(ms: number): void {
     const s = getState();
     sendSim({ type: "replay", action: "reset", timestamp_ms: ms });
-    sendSim({ type: "subscribe", symbol: s.symbol, timeframe: s.timeframe, exchange: s.exchange });
+    subscribeSim(s.symbol, s.timeframe, s.exchange);
   }
 
   // ---- drag existing drawings ----
