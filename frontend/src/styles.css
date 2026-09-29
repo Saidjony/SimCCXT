@@ -310,10 +310,9 @@ td, th { padding: 3px 4px; }
  * Pointer-events none: panning/placement clicks pass through to the chart. */
 .vp-profile {
   position: absolute; z-index: 4; pointer-events: none;
-  top: 0; bottom: 26px; right: 66px; width: 120px;
-  display: flex; flex-direction: column; justify-content: stretch;
+  top: 0; bottom: 0; right: 66px; width: 150px;
 }
-.vp-row { position: relative; width: 100%; }
+.vp-row { position: absolute; right: 0; width: 100%; min-height: 1px; }
 .vp-bar {
   position: absolute; right: 0; top: 1px; bottom: 1px;
   background: rgba(74, 158, 196, 0.35); border-radius: 2px 0 0 2px;

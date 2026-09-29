@@ -18,12 +18,14 @@ import { sendSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import {
+  alignOiToCandles,
   countBars,
   cumulativeDelta,
   formatRuler,
   invertTime,
   positionBands,
   positionDirection,
+  profileBarLayout,
   riskReward,
   rulerStats,
   snapTime,
@@ -62,6 +64,7 @@ interface RulerState {
 }
 
 const RULER_FADE_MS = 4000;
+const VOLUME_PROFILE_LEVELS = 64;
 
 const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
   ray: "клик — луч-уровень от этой точки · drag — двигать",
@@ -89,6 +92,7 @@ export function Chart(): JSX.Element {
   const cvdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   /** Guard against ping-pong when syncing the two time scales. */
   const syncingRef = useRef(false);
+  const scaleSyncRafRef = useRef(0);
   const pendingRef = useRef<Pt[]>([]);
   const previewRef = useRef<Pt | null>(null);
   const rafRef = useRef(0);
@@ -126,6 +130,21 @@ export function Chart(): JSX.Element {
   const oiPeriod = useSim((s) => s.oiPeriod);
   const toolRef = useRef(tool);
   toolRef.current = tool;
+  const marketData = getState();
+  const visibleRange = chartRef.current?.timeScale().getVisibleRange();
+  const visibleFromMs = visibleRange ? timeToMs(visibleRange.from) : null;
+  const visibleToMs = visibleRange ? timeToMs(visibleRange.to) : null;
+  const oiOverlapsVisibleRange =
+    marketData.oi.length > 0 &&
+    visibleFromMs !== null &&
+    visibleToMs !== null &&
+    marketData.oi[0][0] <= visibleToMs &&
+    marketData.oi[marketData.oi.length - 1][0] >= visibleFromMs;
+  const oiLabel = marketData.oi.length === 0
+    ? "OI · нет данных"
+    : oiOverlapsVisibleRange
+      ? "OI · " + (oiPeriod || "доступно")
+      : "OI · вне видимой области";
 
   // Create the chart once.
   useEffect(() => {
@@ -167,6 +186,16 @@ export function Chart(): JSX.Element {
       setViewTick((n) => n + 1);
     });
     ro.observe(el);
+    let priceScaleRaf = 0;
+    const onPriceScaleMove = (event: PointerEvent): void => {
+      const x = event.clientX - el.getBoundingClientRect().left;
+      if (x < el.clientWidth - 72 || priceScaleRaf) return;
+      priceScaleRaf = window.requestAnimationFrame(() => {
+        priceScaleRaf = 0;
+        setViewTick((n) => n + 1);
+      });
+    };
+    el.addEventListener("pointermove", onPriceScaleMove);
     const bump = (): void => setViewTick((n) => n + 1);
     chart.timeScale().subscribeVisibleLogicalRangeChange(bump);
 
@@ -238,9 +267,15 @@ export function Chart(): JSX.Element {
     return () => {
       window.clearTimeout(rulerTimer.current);
       if (rafRef.current) window.cancelAnimationFrame(rafRef.current);
+      if (priceScaleRaf) window.cancelAnimationFrame(priceScaleRaf);
       window.removeEventListener("keydown", onKey);
+      el.removeEventListener("pointermove", onPriceScaleMove);
       ro.disconnect();
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(bump);
+      if (scaleSyncRafRef.current) {
+        window.cancelAnimationFrame(scaleSyncRafRef.current);
+        scaleSyncRafRef.current = 0;
+      }
       chart.remove();
       chartRef.current = null;
       barsRef.current = null;
@@ -264,17 +299,25 @@ export function Chart(): JSX.Element {
     if (version === versionRef.current) return;
     versionRef.current = version;
     const s = getState();
-    pushBars(chart, bars, volume, s.candles, s.fullReset);
-    store.consumedReset();
-    if (followRef.current) chart.timeScale().scrollToRealTime();
-    // OI is static per snapshot: replace the whole line, then re-sync ranges.
-    // CVD follows every tick (cheap full recompute over the loaded series).
-    if (s.fullReset && oiSeriesRef.current && oiChartRef.current) {
-      pushOi(oiSeriesRef.current, s.oi);
-      syncOiToMain();
+    syncingRef.current = true;
+    try {
+      pushBars(chart, bars, volume, s.candles, s.fullReset);
+      store.consumedReset();
+      if (followRef.current) chart.timeScale().scrollToRealTime();
+      // OI samples are sparse, so project them onto the candle grid. Keep the
+      // pane's dates aligned after snapshots and incremental candle updates.
+      if (oiSeriesRef.current && oiChartRef.current) {
+        pushOi(oiSeriesRef.current, s.oi, s.candles);
+      }
+      if (cvdSeriesRef.current) {
+        pushCvd(cvdSeriesRef.current, s.candles);
+      }
+    } finally {
+      syncingRef.current = false;
     }
-    if (cvdSeriesRef.current) {
-      pushCvd(cvdSeriesRef.current, s.candles);
+    if (oiChartRef.current) {
+      syncOiToMain();
+      scheduleOiSync();
     }
     setViewTick((n) => n + 1);
   }, [version]);
@@ -302,13 +345,16 @@ export function Chart(): JSX.Element {
   }, [fills]);
 
   // Open-interest + CVD pane (TradingView-style subchart below the main
-  // chart): its own chart instance, OI on the right scale, CVD on the left,
-  // time scale synced both ways. Pane lives while either series is on.
+  // chart): its own chart instance, OI on the right scale, CVD on the left.
+  // Both series use candle timestamps so logical ranges stay identical.
   useEffect(() => {
     if (!oiVisible && !cvdVisible) {
       oiChartRef.current = null;
       oiSeriesRef.current = null;
       cvdSeriesRef.current = null;
+      const main = chartRef.current;
+      main?.priceScale("left").applyOptions({ visible: false, minimumWidth: 0 });
+      main?.priceScale("right").applyOptions({ minimumWidth: 0 });
       return;
     }
     const el = oiWrapRef.current;
@@ -346,35 +392,39 @@ export function Chart(): JSX.Element {
     oiChartRef.current = oic;
     oiSeriesRef.current = line;
     cvdSeriesRef.current = cvd;
-    pushOi(line, getState().oi);
+    pushOi(line, getState().oi, getState().candles);
     pushCvd(cvd, getState().candles);
     line.applyOptions({ visible: getState().oiVisible });
     cvd.applyOptions({ visible: getState().cvdVisible });
     syncOiToMain();
+    scheduleOiSync();
     const ro = new ResizeObserver(() => {
       oic.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+      if (chartRef.current) {
+        syncOiToMain();
+        scheduleOiSync();
+      }
     });
     ro.observe(el);
     const main = chartRef.current;
-    const onMainRange = (r: unknown): void => {
-      if (!r || syncingRef.current) return;
-      syncingRef.current = true;
-      try {
-        oic.timeScale().setVisibleLogicalRange(r as never);
-      } catch {
-        /* empty OI series: nothing to fit */
-      }
-      syncingRef.current = false;
+    const onMainRange = (): void => {
+      if (syncingRef.current || !main) return;
+      syncOiToMain();
+      scheduleOiSync();
     };
-    const onOiRange = (r: unknown): void => {
-      if (!r || syncingRef.current || !main) return;
+    const onOiRange = (): void => {
+      if (syncingRef.current || !main) return;
       syncingRef.current = true;
       try {
-        main.timeScale().setVisibleLogicalRange(r as never);
+        alignPriceScales(main, oic);
+        const range = oic.timeScale().getVisibleLogicalRange();
+        if (range) main.timeScale().setVisibleLogicalRange(range);
       } catch {
-        /* out of data range: ignore */
+        /* The range may be outside the currently loaded candle history. */
+      } finally {
+        syncingRef.current = false;
       }
-      syncingRef.current = false;
+      scheduleOiSync();
     };
     main?.timeScale().subscribeVisibleLogicalRangeChange(onMainRange);
     oic.timeScale().subscribeVisibleLogicalRangeChange(onOiRange);
@@ -429,7 +479,7 @@ export function Chart(): JSX.Element {
         <div ref={oiWrapRef} className="oi-wrap">
           <div className="oi-label">
             {[
-              oiVisible ? (oiPeriod ? "OI · " + oiPeriod : "OI") : "",
+              oiVisible ? oiLabel : "",
               cvdVisible ? "CVD" : "",
             ].filter(Boolean).join(" + ")}
           </div>
@@ -522,6 +572,56 @@ export function Chart(): JSX.Element {
     return typeof v === "number" ? v : null;
   }
 
+  function alignPriceScales(main: IChartApi, indicators: IChartApi): void {
+    const leftWidth = Math.max(
+      main.priceScale("left").width(),
+      indicators.priceScale("left").width(),
+    );
+    const rightWidth = Math.max(
+      main.priceScale("right").width(),
+      indicators.priceScale("right").width(),
+    );
+    const mainLeft = main.priceScale("left");
+    const indicatorLeft = indicators.priceScale("left");
+    const mainRight = main.priceScale("right");
+    const indicatorRight = indicators.priceScale("right");
+    if (
+      !mainLeft.options().visible ||
+      mainLeft.options().minimumWidth !== leftWidth ||
+      mainLeft.options().ticksVisible ||
+      mainLeft.options().borderVisible
+    ) {
+      mainLeft.applyOptions({
+        visible: true,
+        ticksVisible: false,
+        borderVisible: false,
+        minimumWidth: leftWidth,
+      });
+    }
+    if (indicatorLeft.options().minimumWidth !== leftWidth) {
+      indicatorLeft.applyOptions({ minimumWidth: leftWidth });
+    }
+    if (mainRight.options().minimumWidth !== rightWidth) {
+      mainRight.applyOptions({ minimumWidth: rightWidth });
+    }
+    if (indicatorRight.options().minimumWidth !== rightWidth) {
+      indicatorRight.applyOptions({ minimumWidth: rightWidth });
+    }
+  }
+
+  function scheduleOiSync(): void {
+    if (scaleSyncRafRef.current) {
+      window.cancelAnimationFrame(scaleSyncRafRef.current);
+    }
+    scaleSyncRafRef.current = window.requestAnimationFrame(() => {
+      scaleSyncRafRef.current = window.requestAnimationFrame(() => {
+        scaleSyncRafRef.current = 0;
+        syncOiToMain();
+        setViewTick((n) => n + 1);
+      });
+    });
+  }
+
   /** Fit the OI pane to the main chart's visible range (guarded by callers). */
   function syncOiToMain(): void {
     const main = chartRef.current;
@@ -531,11 +631,14 @@ export function Chart(): JSX.Element {
     if (!r) return;
     syncingRef.current = true;
     try {
-      oic.timeScale().setVisibleLogicalRange(r);
+      alignPriceScales(main, oic);
+      const alignedRange = main.timeScale().getVisibleLogicalRange();
+      if (alignedRange) oic.timeScale().setVisibleLogicalRange(alignedRange);
     } catch {
-      /* empty OI series: nothing to fit */
+      /* An empty OI and CVD pane has no time range to synchronize. */
+    } finally {
+      syncingRef.current = false;
     }
-    syncingRef.current = false;
   }
 
   function pointFromEvent(e: React.MouseEvent): Pt | null {
@@ -763,27 +866,40 @@ export function Chart(): JSX.Element {
       rows,
       range ? range.from : 0,
       range ? range.to : rows.length - 1,
-      24,
+      VOLUME_PROFILE_LEVELS,
     );
     if (!levels.length || poc === null) return null;
     const maxV = levels.reduce((m, r) => Math.max(m, r.volume), 0);
     if (!(maxV > 0)) return null;
+    const layout = profileBarLayout(
+      levels.map((level) => level.price),
+      (price) => barsRef.current?.priceToCoordinate(price) ?? null,
+      containerRef.current?.clientHeight,
+    );
     return (
-      <div key="vp" className="vp-profile">
-        {levels.map((r, i) => (
-          <div
-            key={i}
-            className={"vp-row" + (r.poc ? " poc" : "")}
-            style={{ height: (100 / levels.length).toFixed(3) + "%" }}
-          >
-            <div className="vp-bar" style={{ width: ((r.volume / maxV) * 100).toFixed(1) + "%" }} />
-            {r.poc && (
-              <div className="vp-poc">
-                {r.price.toLocaleString("en-US", { maximumFractionDigits: 1 })}
-              </div>
-            )}
-          </div>
-        ))}
+      <div
+        key="vp"
+        className="vp-profile"
+        style={{ right: chartRef.current?.priceScale("right").width() ?? 66 }}
+      >
+        {levels.map((r, i) => {
+          const barPosition = layout[i];
+          if (!barPosition) return null;
+          return (
+            <div
+              key={i}
+              className={"vp-row" + (r.poc ? " poc" : "")}
+              style={{ top: barPosition.top, height: barPosition.height }}
+            >
+              <div className="vp-bar" style={{ width: ((r.volume / maxV) * 100).toFixed(1) + "%" }} />
+              {r.poc && (
+                <div className="vp-poc">
+                  {r.price.toLocaleString("en-US", { maximumFractionDigits: 1 })}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     );
   }
@@ -947,8 +1063,13 @@ export function Chart(): JSX.Element {
   }
 }
 
-function pushOi(line: ISeriesApi<"Line">, rows: Array<[number, number]>): void {
-  line.setData(rows.map(([ms, v]) => ({ time: toTime(ms), value: v })));
+function pushOi(
+  line: ISeriesApi<"Line">,
+  samples: Array<[number, number]>,
+  candles: CandleRow[],
+): void {
+  const aligned = alignOiToCandles(candles, samples);
+  line.setData(aligned.map(([ms, v]) => ({ time: toTime(ms), value: v })));
 }
 
 function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[]): void {

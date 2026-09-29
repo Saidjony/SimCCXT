@@ -171,6 +171,57 @@ export function calcQty(riskUsdt: number, entry: number, sl: number): number | n
 
 export type OhlcRow = [number, number, number, number, number, number];
 
+/** Align sparse OI samples to candle timestamps using the last known value. */
+export function alignOiToCandles(
+  rows: OhlcRow[],
+  samples: Array<[number, number]>,
+): Array<[number, number]> {
+  const ordered = samples
+    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value))
+    .slice()
+    .sort((a, b) => a[0] - b[0]);
+  const out: Array<[number, number]> = [];
+  let sampleIndex = 0;
+  let current: number | null = null;
+  for (const row of rows) {
+    while (sampleIndex < ordered.length && ordered[sampleIndex][0] <= row[0]) {
+      current = ordered[sampleIndex][1];
+      sampleIndex += 1;
+    }
+    if (current !== null) out.push([row[0], current]);
+  }
+  return out;
+}
+
+export interface ProfileBarPosition {
+  top: number;
+  height: number;
+}
+
+/** Project each volume level through the chart's current price scale. */
+export function profileBarLayout(
+  prices: number[],
+  toY: (price: number) => number | null,
+  plotHeight?: number,
+): Array<ProfileBarPosition | null> {
+  const ys = prices.map(toY);
+  return ys.map((y, i) => {
+    if (y === null || !Number.isFinite(y)) return null;
+    const maxY = plotHeight === undefined ? Infinity : Math.max(0, plotHeight - 26);
+    if (y < 0 || y > maxY) return null;
+    const previous = ys[i - 1];
+    const next = ys[i + 1];
+    const gaps = [
+      previous !== undefined && previous !== null ? Math.abs(y - previous) : 0,
+      next !== undefined && next !== null ? Math.abs(next - y) : 0,
+    ].filter((gap) => gap > 0 && Number.isFinite(gap));
+    const height = gaps.length ? gaps.reduce((sum, gap) => sum + gap, 0) / gaps.length : 1;
+    const top = Math.max(0, y - height / 2);
+    const bottom = Math.min(maxY, y + height / 2);
+    return bottom > top ? { top, height: bottom - top } : null;
+  });
+}
+
 /**
  * Cumulative volume delta over the whole series: +volume on up bars
  * (close >= open), -volume on down bars. Recomputed per tick; 10k bars
