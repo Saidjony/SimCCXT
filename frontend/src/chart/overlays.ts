@@ -1,12 +1,57 @@
 // Pure overlay math for chart drawings (no DOM, no chart API).
 // Pixel mapping (timeToCoordinate/priceToCoordinate) lives in Chart.tsx;
 // everything here is unit-tested in test/overlays.test.ts.
+import type { FillLine } from "../types/protocol";
 
 export interface PxBox {
   left: number;
   top: number;
   width: number;
   height: number;
+}
+
+export interface TradeLink {
+  entryTimestamp: number;
+  entryPrice: number;
+  exitTimestamp: number;
+  exitPrice: number;
+  direction: Direction;
+}
+
+/** Pair opposing fills FIFO into closed position legs, including partial exits and reversals. */
+export function pairTradeFills(fills: FillLine[], symbol: string): TradeLink[] {
+  const chronological = fills
+    .filter((fill) => fill.symbol === symbol)
+    .slice()
+    .reverse()
+    .sort((a, b) => a.timestamp - b.timestamp);
+  const lots: Array<{ remaining: number; timestamp: number; price: number; direction: 1 | -1 }> = [];
+  const links: TradeLink[] = [];
+  for (const fill of chronological) {
+    let remaining = fill.amount;
+    const direction = fill.side === "buy" ? 1 : -1;
+    while (remaining > 1e-10 && lots.length > 0 && lots[0].direction !== direction) {
+      const lot = lots[0];
+      const closed = Math.min(remaining, lot.remaining);
+      links.push({
+        entryTimestamp: lot.timestamp,
+        entryPrice: lot.price,
+        exitTimestamp: fill.timestamp,
+        exitPrice: fill.price,
+        direction: lot.direction > 0 ? "long" : "short",
+      });
+      lot.remaining -= closed;
+      remaining -= closed;
+      if (lot.remaining <= 1e-10) lots.shift();
+    }
+    if (remaining > 1e-10) lots.push({
+      remaining,
+      timestamp: fill.timestamp,
+      price: fill.price,
+      direction,
+    });
+  }
+  return links;
 }
 
 /** Normalize two pixel corners into a box (handles any click order). */

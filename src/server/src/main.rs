@@ -1613,10 +1613,16 @@ mod tests {
 
         let stop = orders[0]["triggerPrice"].as_f64().unwrap();
         let timestamp = s.ex.now() + chrono::Duration::minutes(1);
-        s.ex.apply_price(
+        s.ex.apply_candle(
             &simccxt_core::Symbol::parse("BTC/USDT").unwrap(),
-            stop * 0.99,
-            timestamp,
+            &simccxt_core::OHLCV::new(
+                timestamp,
+                entry,
+                entry * 1.01,
+                stop * 0.99,
+                entry,
+                10.0,
+            ),
         );
         let events = fresh_fill_events(s);
         assert!(events.iter().any(|event| event["type"] == "trade"));

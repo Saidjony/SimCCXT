@@ -11,6 +11,7 @@ import {
   formatRuler,
   invertTime,
   nearestCandleTime,
+  pairTradeFills,
   positionBands,
   positionDirection,
   profileBarLayout,
@@ -20,6 +21,7 @@ import {
   toBox,
   volumeProfile,
 } from "../src/chart/overlays.ts";
+import type { FillLine } from "../src/types/protocol.ts";
 
 describe("toBox", () => {
   it("normalizes any click order", () => {
@@ -32,6 +34,47 @@ describe("position tool", () => {
   it("detects direction by stop side", () => {
     assert.equal(positionDirection(100, 90), "long");
     assert.equal(positionDirection(100, 110), "short");
+  });
+
+  describe("trade fill pairing", () => {
+    const fill = (side: string, amount: number, price: number, timestamp: number): FillLine => ({
+      id: `${side}-${timestamp}-${price}`,
+      symbol: "BTC/USDT",
+      side,
+      type: "market",
+      price,
+      amount,
+      cost: amount * price,
+      fee: 0,
+      orderId: `${timestamp}`,
+      timestamp,
+      datetime: "",
+      maker: false,
+    });
+
+    it("connects an entry to partial exits using FIFO lots", () => {
+      const links = pairTradeFills([
+        fill("sell", 0.4, 110, 3),
+        fill("sell", 0.6, 105, 2),
+        fill("buy", 1, 100, 1),
+      ], "BTC/USDT");
+      assert.deepEqual(links, [
+        { entryTimestamp: 1, entryPrice: 100, exitTimestamp: 2, exitPrice: 105, direction: "long" },
+        { entryTimestamp: 1, entryPrice: 100, exitTimestamp: 3, exitPrice: 110, direction: "long" },
+      ]);
+    });
+
+    it("starts a new opposite position after a reversal", () => {
+      const links = pairTradeFills([
+        fill("sell", 1.5, 90, 2),
+        fill("buy", 1, 100, 1),
+        fill("buy", 0.5, 80, 3),
+      ], "BTC/USDT");
+      assert.deepEqual(links, [
+        { entryTimestamp: 1, entryPrice: 100, exitTimestamp: 2, exitPrice: 90, direction: "long" },
+        { entryTimestamp: 2, entryPrice: 90, exitTimestamp: 3, exitPrice: 80, direction: "short" },
+      ]);
+    });
   });
 
   it("computes reward/risk", () => {

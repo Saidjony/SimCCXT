@@ -25,6 +25,7 @@ import {
   nearestCandleTime,
   positionBands,
   positionDirection,
+  pairTradeFills,
   profileBarLayout,
   riskReward,
   rulerStats,
@@ -419,6 +420,7 @@ export function Chart(): JSX.Element {
     const chronological = fills
       .filter((fill) => fill.symbol === symbol)
       .slice()
+      .reverse()
       .sort((a, b) => a.timestamp - b.timestamp);
     for (const f of chronological) {
       const signedFill = f.side === "buy" ? f.amount : -f.amount;
@@ -619,6 +621,41 @@ export function Chart(): JSX.Element {
         className="execution-lines"
         style={{ height: containerRef.current?.clientHeight ?? 0 }}
       >
+        <svg
+          className="trade-links"
+          width="100%"
+          height={containerRef.current?.clientHeight ?? 0}
+          aria-hidden="true"
+        >
+          {pairTradeFills(fills, symbol).map((link, index) => {
+            const times = candleTimesRef.current;
+            const entryTime = nearestCandleTime(times, link.entryTimestamp);
+            const exitTime = nearestCandleTime(times, link.exitTimestamp);
+            if (entryTime === null || exitTime === null) return null;
+            const x1 = xFor(entryTime);
+            const y1 = yFor(link.entryPrice);
+            const x2 = xFor(exitTime);
+            const y2 = yFor(link.exitPrice);
+            if (x1 === null || y1 === null || x2 === null || y2 === null) return null;
+            const color = link.direction === "long" ? "#3d9a50" : "#d46666";
+            return (
+              <g key={`${link.entryTimestamp}-${link.exitTimestamp}-${index}`}>
+                <line
+                  x1={x1}
+                  y1={y1}
+                  x2={x2}
+                  y2={y2}
+                  stroke={color}
+                  strokeWidth="2"
+                  strokeDasharray="5 3"
+                  opacity="0.9"
+                />
+                <circle cx={x1} cy={y1} r="3" fill={color} />
+                <circle cx={x2} cy={y2} r="3" fill={color} />
+              </g>
+            );
+          })}
+        </svg>
         {account?.positions.filter((position) => position.symbol === symbol).map((position) => {
           const y = yFor(position.entryPrice);
           return y === null ? null : (
@@ -872,9 +909,15 @@ export function Chart(): JSX.Element {
     try {
       if (cvdChartRef.current) {
         alignPriceScales(main, cvdChartRef.current);
-        cvdChartRef.current.timeScale().setVisibleRange(range);
+        const cvdRange = cvdChartRef.current.timeScale().getVisibleRange();
+        if (!sameTimeRange(cvdRange, range)) {
+          cvdChartRef.current.timeScale().setVisibleRange(range);
+        }
       }
-      if (oiChartRef.current) oiChartRef.current.timeScale().setVisibleRange(range);
+      if (oiChartRef.current) {
+        const oiRange = oiChartRef.current.timeScale().getVisibleRange();
+        if (!sameTimeRange(oiRange, range)) oiChartRef.current.timeScale().setVisibleRange(range);
+      }
     } catch {
       // A chart can briefly have no visible range while a snapshot is applied.
     } finally {
@@ -885,7 +928,7 @@ export function Chart(): JSX.Element {
   function syncMainFromIndicator(indicator: IChartApi): void {
     const main = chartRef.current;
     const range = indicator.timeScale().getVisibleRange();
-    if (!main || !range) return;
+    if (!main || !range || sameTimeRange(main.timeScale().getVisibleRange(), range)) return;
     syncingRef.current = true;
     try {
       main.timeScale().setVisibleRange(range);
@@ -895,6 +938,19 @@ export function Chart(): JSX.Element {
     } finally {
       syncingRef.current = false;
     }
+  }
+
+  function sameTimeRange(
+    a: { from: Time; to: Time } | null,
+    b: { from: Time; to: Time } | null,
+  ): boolean {
+    if (!a || !b) return false;
+    const aFrom = timeToMs(a.from);
+    const aTo = timeToMs(a.to);
+    const bFrom = timeToMs(b.from);
+    const bTo = timeToMs(b.to);
+    return aFrom !== null && aTo !== null && bFrom !== null && bTo !== null &&
+      aFrom === bFrom && aTo === bTo;
   }
 
   function pointFromEvent(e: React.MouseEvent): Pt | null {

@@ -127,7 +127,8 @@ chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and fills markers
 **Open interest + CVD** are separate resizable charts below the price chart.
 Both indicators synchronize to the main chart by timestamp. OI is revealed
 incrementally with replay candles; CVD is computed client-side over the visible
-series. Toggle either with the `OI` / `CVD` buttons. If a venue does not expose
+series. Pan and zoom remain available on the main chart while either pane is
+visible. Toggle either with the `OI` / `CVD` buttons. If a venue does not expose
 open-interest history, that pane reports that there is no OI data.
 
 **Volume profile** (right side of the chart). Fixed-range horizontal volume
@@ -153,8 +154,8 @@ browser (localStorage).
 the charts; scroll down to view them. The account tab includes selected
 criteria grouped by symbol and timeframe. Order/trade tables include trigger,
 execution, fee, maker/taker and timestamp details. Filled entries and exits
-are labeled on the chart; active entry and stop prices are drawn as horizontal
-levels. The paper-trading order form is in the right panel under the
+are labeled and connected on the chart; active entry and stop prices are drawn
+as horizontal levels. The paper-trading order form is in the right panel under the
 collapsible Challenge card.
 
 **Replay date window** is configured from the compact controls in the top bar.
@@ -203,7 +204,9 @@ preview line (`≈ qty · риск $`). Size = `risk / |entry − stop|`; entry 
 blocked without a stop or when it is on the wrong side of the entry. A
 protective reduce-only stop is armed after each entry fill (including delayed
 limit/trigger fills), canceled when the position is closed, and can be canceled
-from Orders. Positions and fills include detailed risk/execution data.
+from Orders. Replay evaluates stop and limit triggers against candle ranges,
+using low-before-high for bullish candles and high-before-low for bearish ones.
+Positions and fills include detailed risk/execution data.
 
 Legacy Python side (optional, not the app):
 
