@@ -35,6 +35,8 @@ import {
 } from "./overlays";
 import { DrawBar } from "./DrawBar";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
+import { followLatest, sameVisibleRange, syncRangeToTargets } from "./rangeSync";
+import type { VisibleRange } from "./rangeSync";
 
 function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
@@ -113,6 +115,7 @@ export function Chart(): JSX.Element {
   const cvdWrapRef = useRef<HTMLDivElement | null>(null);
   const oiChartRef = useRef<IChartApi | null>(null);
   const cvdChartRef = useRef<IChartApi | null>(null);
+  const syncedIndicatorRangeRef = useRef<VisibleRange<Time> | null>(null);
   const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const cvdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   /** Guard against ping-pong when syncing the two time scales. */
@@ -390,11 +393,10 @@ export function Chart(): JSX.Element {
       pushBars(chart, bars, volume, s.candles, s.fullReset);
       store.consumedReset();
       if (s.fullReset) chart.priceScale("right").applyOptions({ autoScale: true });
-      if (followRef.current) chart.timeScale().scrollToRealTime();
+      followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
       // OI has its own time axis; CVD remains aligned to the candle range.
       if (s.fullReset && oiSeriesRef.current && oiChartRef.current) {
         pushOi(oiSeriesRef.current, s.oi);
-        oiChartRef.current.timeScale().fitContent();
       }
       if (cvdSeriesRef.current) {
         cvdValuesRef.current = cumulativeDelta(s.candles);
@@ -403,10 +405,7 @@ export function Chart(): JSX.Element {
     } finally {
       syncingRef.current = false;
     }
-    if (oiChartRef.current || cvdChartRef.current) {
-      syncIndicatorsToMain();
-      scheduleIndicatorSync();
-    }
+    syncIndicatorsToMain();
     setViewTick((n) => n + 1);
   }, [version]);
 
@@ -465,11 +464,10 @@ export function Chart(): JSX.Element {
   useEffect(() => {
     const observers: ResizeObserver[] = [];
     const main = chartRef.current;
-    let oiRangeListener: (() => void) | null = null;
-    let cvdRangeListener: (() => void) | null = null;
     let mainRangeListener: (() => void) | null = null;
     let oiCrosshairMove: ((param: MouseEventParams) => void) | null = null;
     let cvdCrosshairMove: ((param: MouseEventParams) => void) | null = null;
+    syncedIndicatorRangeRef.current = null;
 
     if (oiVisible && oiWrapRef.current) {
       const el = oiWrapRef.current;
@@ -489,10 +487,6 @@ export function Chart(): JSX.Element {
       });
       observer.observe(el);
       observers.push(observer);
-      oiRangeListener = (): void => {
-        if (!syncingRef.current) syncMainFromIndicator(chart);
-      };
-      chart.timeScale().subscribeVisibleLogicalRangeChange(oiRangeListener);
       oiCrosshairMove = (param: MouseEventParams): void => {
         if (applyingCrosshairRef.current) return;
         const timestamp = param.time === undefined ? null : timeToMs(param.time);
@@ -528,10 +522,6 @@ export function Chart(): JSX.Element {
       });
       observer.observe(el);
       observers.push(observer);
-      cvdRangeListener = (): void => {
-        if (!syncingRef.current) syncMainFromIndicator(chart);
-      };
-      chart.timeScale().subscribeVisibleLogicalRangeChange(cvdRangeListener);
       cvdCrosshairMove = (param: MouseEventParams): void => {
         if (applyingCrosshairRef.current) return;
         const timestamp = param.time === undefined ? null : timeToMs(param.time);
@@ -557,14 +547,8 @@ export function Chart(): JSX.Element {
 
     return () => {
       if (mainRangeListener) main?.timeScale().unsubscribeVisibleLogicalRangeChange(mainRangeListener);
-      if (oiRangeListener && oiChartRef.current) {
-        oiChartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(oiRangeListener);
-      }
       if (oiCrosshairMove && oiChartRef.current) {
         oiChartRef.current.unsubscribeCrosshairMove(oiCrosshairMove);
-      }
-      if (cvdRangeListener && cvdChartRef.current) {
-        cvdChartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(cvdRangeListener);
       }
       if (cvdCrosshairMove && cvdChartRef.current) {
         cvdChartRef.current.unsubscribeCrosshairMove(cvdCrosshairMove);
@@ -576,6 +560,7 @@ export function Chart(): JSX.Element {
       cvdChartRef.current = null;
       oiSeriesRef.current = null;
       cvdSeriesRef.current = null;
+      syncedIndicatorRangeRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oiVisible, cvdVisible]);
@@ -769,7 +754,8 @@ export function Chart(): JSX.Element {
             const v = !followRef.current;
             followRef.current = v;
             setFollow(v);
-            if (v) chartRef.current?.timeScale().scrollToRealTime();
+            const chart = chartRef.current;
+            if (chart) followLatest(v, () => chart.timeScale().scrollToRealTime());
           }}
         >
           Follow: {follow ? "ON" : "OFF"}
@@ -891,11 +877,9 @@ export function Chart(): JSX.Element {
       window.cancelAnimationFrame(scaleSyncRafRef.current);
     }
     scaleSyncRafRef.current = window.requestAnimationFrame(() => {
-      scaleSyncRafRef.current = window.requestAnimationFrame(() => {
-        scaleSyncRafRef.current = 0;
-        syncIndicatorsToMain();
-        setViewTick((n) => n + 1);
-      });
+      scaleSyncRafRef.current = 0;
+      syncIndicatorsToMain();
+      setViewTick((n) => n + 1);
     });
   }
 
@@ -907,50 +891,30 @@ export function Chart(): JSX.Element {
     if (!range) return;
     syncingRef.current = true;
     try {
+      if (cvdChartRef.current) alignPriceScales(main, cvdChartRef.current);
+      if (sameVisibleRange(syncedIndicatorRangeRef.current, range, timeToMs)) return;
+      const targets = [];
       if (cvdChartRef.current) {
-        alignPriceScales(main, cvdChartRef.current);
-        const cvdRange = cvdChartRef.current.timeScale().getVisibleRange();
-        if (!sameTimeRange(cvdRange, range)) {
-          cvdChartRef.current.timeScale().setVisibleRange(range);
-        }
+        targets.push({
+          getRange: () => cvdChartRef.current?.timeScale().getVisibleRange() ?? null,
+          setRange: (visibleRange: typeof range) =>
+            cvdChartRef.current?.timeScale().setVisibleRange(visibleRange),
+        });
       }
       if (oiChartRef.current) {
-        const oiRange = oiChartRef.current.timeScale().getVisibleRange();
-        if (!sameTimeRange(oiRange, range)) oiChartRef.current.timeScale().setVisibleRange(range);
+        targets.push({
+          getRange: () => oiChartRef.current?.timeScale().getVisibleRange() ?? null,
+          setRange: (visibleRange: typeof range) =>
+            oiChartRef.current?.timeScale().setVisibleRange(visibleRange),
+        });
       }
+      syncRangeToTargets(range, targets, timeToMs);
+      syncedIndicatorRangeRef.current = range;
     } catch {
       // A chart can briefly have no visible range while a snapshot is applied.
     } finally {
       syncingRef.current = false;
     }
-  }
-
-  function syncMainFromIndicator(indicator: IChartApi): void {
-    const main = chartRef.current;
-    const range = indicator.timeScale().getVisibleRange();
-    if (!main || !range || sameTimeRange(main.timeScale().getVisibleRange(), range)) return;
-    syncingRef.current = true;
-    try {
-      main.timeScale().setVisibleRange(range);
-      syncIndicatorsToMain();
-    } catch {
-      // A chart can briefly have no visible range while data is being replaced.
-    } finally {
-      syncingRef.current = false;
-    }
-  }
-
-  function sameTimeRange(
-    a: { from: Time; to: Time } | null,
-    b: { from: Time; to: Time } | null,
-  ): boolean {
-    if (!a || !b) return false;
-    const aFrom = timeToMs(a.from);
-    const aTo = timeToMs(a.to);
-    const bFrom = timeToMs(b.from);
-    const bTo = timeToMs(b.to);
-    return aFrom !== null && aTo !== null && bFrom !== null && bTo !== null &&
-      aFrom === bFrom && aTo === bTo;
   }
 
   function pointFromEvent(e: React.MouseEvent): Pt | null {
@@ -1391,6 +1355,8 @@ function indicatorChartOptions(el: HTMLDivElement, cvd: boolean) {
     crosshair: { mode: CrosshairMode.Normal },
     rightPriceScale: { borderColor: "#222c3b" },
     leftPriceScale: { visible: cvd, borderColor: "#222c3b" },
+    handleScroll: false,
+    handleScale: false,
     timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
   };
 }

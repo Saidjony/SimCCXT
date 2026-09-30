@@ -22,11 +22,67 @@ import {
   volumeProfile,
 } from "../src/chart/overlays.ts";
 import type { FillLine } from "../src/types/protocol.ts";
+import {
+  followLatest,
+  sameVisibleRange,
+  syncRangeToTargets,
+} from "../src/chart/rangeSync.ts";
 
 describe("toBox", () => {
   it("normalizes any click order", () => {
     assert.deepEqual(toBox(10, 20, 30, 5), { left: 10, top: 5, width: 20, height: 15 });
     assert.deepEqual(toBox(30, 5, 10, 20), { left: 10, top: 5, width: 20, height: 15 });
+  });
+});
+
+describe("indicator range synchronization", () => {
+  it("copies main chart range to indicators without changing the source", () => {
+    const mainRange = { from: 100, to: 200 };
+    let oiRange = { from: 90, to: 190 };
+    let cvdRange = { from: 80, to: 180 };
+    let oiUpdates = 0;
+    let cvdUpdates = 0;
+    syncRangeToTargets(mainRange, [
+      { getRange: () => oiRange, setRange: (range) => { oiRange = range; oiUpdates += 1; } },
+      { getRange: () => cvdRange, setRange: (range) => { cvdRange = range; cvdUpdates += 1; } },
+    ], (time) => time);
+
+    assert.deepEqual(mainRange, { from: 100, to: 200 });
+    assert.deepEqual(oiRange, mainRange);
+    assert.deepEqual(cvdRange, mainRange);
+    assert.equal(oiUpdates, 1);
+    assert.equal(cvdUpdates, 1);
+  });
+
+  it("does not repeatedly apply an unchanged range or resync equal indicators", () => {
+    const range = { from: 100, to: 200 };
+    assert.equal(sameVisibleRange(range, { from: 100, to: 200 }, (time) => time), true);
+    let updates = 0;
+    const target = { getRange: () => range, setRange: () => { updates += 1; } };
+    syncRangeToTargets(range, [target], (time) => time);
+    syncRangeToTargets(range, [target], (time) => time);
+    assert.equal(updates, 0);
+  });
+
+  it("keeps following the main range when an indicator clamps its own range", () => {
+    const mainRange = { from: 100, to: 200 };
+    let applied: { from: number; to: number } | null = null;
+    syncRangeToTargets(mainRange, [{
+      getRange: () => ({ from: 150, to: 200 }),
+      setRange: (range) => { applied = range; },
+    }], (time) => time);
+    assert.deepEqual(applied, mainRange);
+    assert.deepEqual(mainRange, { from: 100, to: 200 });
+  });
+});
+
+describe("follow mode", () => {
+  it("scrolls to latest only when follow is enabled", () => {
+    let scrolls = 0;
+    followLatest(false, () => { scrolls += 1; });
+    assert.equal(scrolls, 0);
+    followLatest(true, () => { scrolls += 1; });
+    assert.equal(scrolls, 1);
   });
 });
 

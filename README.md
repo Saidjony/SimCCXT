@@ -125,11 +125,14 @@ The price scale is reset to auto-fit when new timeframe data arrives. The main
 chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and fills markers.
 
 **Open interest + CVD** are separate resizable charts below the price chart.
-Both indicators synchronize to the main chart by timestamp. OI is revealed
+The main chart owns the visible time range; OI and CVD follow it by timestamp,
+so indicator updates cannot push or jitter the main chart. OI is revealed
 incrementally with replay candles; CVD is computed client-side over the visible
 series. Pan and zoom remain available on the main chart while either pane is
-visible. Toggle either with the `OI` / `CVD` buttons. If a venue does not expose
-open-interest history, that pane reports that there is no OI data.
+visible. `Follow: ON` scrolls to the newest bar as replay advances; `OFF`
+preserves the manually selected view. Toggle indicators with the `OI` / `CVD`
+buttons. If a venue does not expose open-interest history, that pane reports
+that there is no OI data.
 
 **Volume profile** (right side of the chart). Fixed-range horizontal volume
 over the VISIBLE bars: 64 price levels, POC flagged with its price. Recomputed
