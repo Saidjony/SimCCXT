@@ -201,8 +201,9 @@ persist per browser and restore on connect.
 capital + fixed risk per trade, entry-type dropdown (Рынок/Лимит/Стоп) with
 conditional price/trigger fields, always-required stop-loss, BUY/SELL, one
 preview line (`≈ qty · риск $`). Size = `risk / |entry − stop|`; entry is
-blocked without a stop or when it is on the wrong side of the entry. A
-protective reduce-only stop is armed after each entry fill (including delayed
+blocked without a stop or when it is on the wrong side of the entry. Paper
+trades use linear positions, so BUY and SELL can open long and short positions.
+A protective reduce-only stop is armed after each entry fill (including delayed
 limit/trigger fills), canceled when the position is closed, and can be canceled
 from Orders. Replay evaluates stop and limit triggers against candle ranges,
 using low-before-high for bullish candles and high-before-low for bearish ones.

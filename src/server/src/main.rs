@@ -477,7 +477,13 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
                 && *entry_side != side
         }) {
             let (_, protected_side, _) = s.active_protections.remove(index);
-            if protected_side == "buy" && s.ex.spot_basis(&symbol).0 <= f64::EPSILON {
+            let position_is_open = s.ex.account_snapshot()["positions"]
+                .as_array()
+                .is_some_and(|positions| positions.iter().any(|position| {
+                    position["symbol"] == symbol
+                        && position["qty"].as_f64().unwrap_or(0.0).abs() > f64::EPSILON
+                }));
+            if !position_is_open {
                 let mut rest = Vec::new();
                 for (active_symbol, active_side, active_id) in s.active_protections.drain(..) {
                     if active_symbol == symbol && active_side == protected_side {
@@ -1627,7 +1633,57 @@ mod tests {
         let events = fresh_fill_events(s);
         assert!(events.iter().any(|event| event["type"] == "trade"));
         assert!(s.ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
-        assert!(s.ex.spot_basis("BTC/USDT").0 < 1e-10);
+        assert!(s.ex.account_snapshot()["positions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sell_entry_opens_short_and_its_stop_closes_the_position() {
+        let (tx, _rx) = broadcast::channel::<String>(128);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+        eng.handle_command(13, subscribe_cmd("BTC/USDT", "1m"), data);
+        eng.handle_command(13, replay_cmd("step"), data);
+        eng.handle_command(13, replay_cmd("step"), data);
+        let entry = eng.sessions[&13].ex.last_price_for("BTC/USDT").unwrap();
+        let stop = entry * 1.01;
+        eng.handle_command(
+            13,
+            ClientCmd::PlaceOrder {
+                symbol: "BTC/USDT".into(),
+                side: "sell".into(),
+                order_type: "market".into(),
+                quantity: 0.001,
+                price: None,
+                stop_price: None,
+                stop_loss_price: Some(stop),
+                time_in_force: "GTC".into(),
+                post_only: false,
+                reduce_only: false,
+                request_id: None,
+            },
+            data,
+        );
+
+        let session = eng.sessions.get_mut(&13).unwrap();
+        let account = session.ex.account_snapshot();
+        let position = &account["positions"][0];
+        assert_eq!(position["side"], "short");
+        let orders = session.ex.fetch_open_orders(Some("BTC/USDT"));
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0]["side"], "buy");
+        assert_eq!(orders[0]["reduceOnly"], true);
+
+        let timestamp = session.ex.now() + chrono::Duration::minutes(1);
+        session.ex.apply_candle(
+            &simccxt_core::Symbol::parse("BTC/USDT").unwrap(),
+            &simccxt_core::OHLCV::new(timestamp, entry, stop * 1.01, entry * 0.99, entry, 10.0),
+        );
+        let events = fresh_fill_events(session);
+        assert!(events.iter().any(|event| {
+            event["type"] == "trade" && event["fill"]["side"] == "buy"
+        }));
+        assert!(session.ex.account_snapshot()["positions"].as_array().unwrap().is_empty());
+        assert!(session.ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
     }
 
     #[test]

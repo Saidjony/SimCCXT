@@ -258,10 +258,11 @@ impl Exchange {
         self.broker.update_midpoint(&symbol.symbol, price, 1e12);
         // mark-to-market + stop / take-profit triggers + resting limit sweeps
         let executed = self.broker.on_price_update(symbol, price, timestamp);
+        let is_spot = self.broker.market_kind(&symbol.symbol) == Some(MarketKind::Spot);
         // Track spot cost basis for orders triggered inside the broker (e.g. a
         // stop that filled on this bar), so spot positions show up in snapshots.
         for order in executed {
-            if order.filled > 0.0 {
+            if is_spot && order.filled > 0.0 {
                 self.track_spot_cost(symbol, order.side, order.filled, order.average_price);
             }
         }
@@ -269,7 +270,7 @@ impl Exchange {
         // sweep they would hang open forever: nothing else re-matches them.
         let swept = self.broker.sweep_resting(symbol, price, timestamp);
         for (order, new_filled) in swept {
-            if new_filled > 0.0 {
+            if is_spot && new_filled > 0.0 {
                 let avg = if order.filled > 0.0 { order.average_price } else { price };
                 self.track_spot_cost(symbol, order.side, new_filled, avg);
             }
@@ -898,7 +899,7 @@ impl Exchange {
         // Track spot cost basis for every immediate fill (market AND
         // marketable limit orders) so the UI can show a spot position + PnL.
         // Later sweep fills are tracked separately with their own delta.
-        if order.filled > 0.0 {
+        if self.broker.market_kind(&symbol.symbol) == Some(MarketKind::Spot) && order.filled > 0.0 {
             let avg = if order.average_price > 0.0 { order.average_price } else { price.unwrap_or(0.0) };
             self.track_spot_cost(&symbol, side, order.filled, avg);
         }

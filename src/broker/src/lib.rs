@@ -205,6 +205,9 @@ impl Broker {
 
     /// Register a market for a symbol.
     pub fn add_market(&mut self, symbol: &Symbol, kind: MarketKind, timestamp: DateTime<Utc>) {
+        if self.market_kinds.get(&symbol.symbol) == Some(&kind) {
+            return;
+        }
         self.market_kinds.insert(symbol.symbol.clone(), kind);
         self.engines.insert(
             symbol.symbol.clone(),
@@ -1048,6 +1051,20 @@ mod tests {
         let canceled = b.cancel_order("BTC/USDT", &order.id).unwrap();
         assert_eq!(canceled.status, OrderStatus::Canceled);
         assert!(b.conditional_orders(Some("BTC/USDT")).is_empty());
+    }
+
+    #[test]
+    fn registering_existing_market_preserves_protective_orders() {
+        let mut b = spot_broker();
+        let mut request = BrokerOrderRequest::market(btc(), Side::Sell, 1.0);
+        request.order_type = OrderType::Stop;
+        request.stop_price = Some(90.0);
+        let stop = b.submit_order(request, ts()).unwrap();
+
+        b.add_market(&btc(), MarketKind::Spot, ts());
+
+        assert_eq!(b.conditional_orders(Some("BTC/USDT")).len(), 1);
+        assert!(b.cancel_order("BTC/USDT", &stop.id).is_ok());
     }
 
     #[test]
