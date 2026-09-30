@@ -314,7 +314,7 @@ pub(super) fn ensure_series_window(
         return Err(format!("{exchange} {symbol} {timeframe}: no candles in requested date range"));
     }
     if let Ok(sym) = Symbol::parse(symbol) {
-        ex.add_market(&sym, MarketKind::Spot);
+        ex.add_market(&sym, MarketKind::Linear);
     }
     ex.load_candles(symbol, timeframe, candles);
     log!(
@@ -543,7 +543,7 @@ pub(super) fn ensure_series(
     if let Some(candles) = load_csv(&path) {
         let n = candles.len();
         if let Ok(sym) = Symbol::parse(symbol) {
-            ex.add_market(&sym, MarketKind::Spot);
+            ex.add_market(&sym, MarketKind::Linear);
         }
         ex.load_candles(symbol, tf, candles);
         log!(
@@ -561,7 +561,7 @@ pub(super) fn ensure_series(
                     log!("[engine] {symbol} {tf}: cache write failed: {e}");
                 }
                 if let Ok(sym) = Symbol::parse(symbol) {
-                    ex.add_market(&sym, MarketKind::Spot);
+                    ex.add_market(&sym, MarketKind::Linear);
                 }
                 ex.load_candles(symbol, tf, candles);
                 log!(
@@ -575,7 +575,7 @@ pub(super) fn ensure_series(
     }
     let candles = synthetic(symbol, tf, 2000);
     if let Ok(sym) = Symbol::parse(symbol) {
-        ex.add_market(&sym, MarketKind::Spot);
+        ex.add_market(&sym, MarketKind::Linear);
     }
     ex.load_candles(symbol, tf, candles);
     log!(

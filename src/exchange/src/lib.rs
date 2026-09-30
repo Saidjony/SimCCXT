@@ -258,10 +258,11 @@ impl Exchange {
         self.broker.update_midpoint(&symbol.symbol, price, 1e12);
         // mark-to-market + stop / take-profit triggers + resting limit sweeps
         let executed = self.broker.on_price_update(symbol, price, timestamp);
+        let is_spot = self.broker.market_kind(&symbol.symbol) == Some(MarketKind::Spot);
         // Track spot cost basis for orders triggered inside the broker (e.g. a
         // stop that filled on this bar), so spot positions show up in snapshots.
         for order in executed {
-            if order.filled > 0.0 {
+            if is_spot && order.filled > 0.0 {
                 self.track_spot_cost(symbol, order.side, order.filled, order.average_price);
             }
         }
@@ -269,11 +270,24 @@ impl Exchange {
         // sweep they would hang open forever: nothing else re-matches them.
         let swept = self.broker.sweep_resting(symbol, price, timestamp);
         for (order, new_filled) in swept {
-            if new_filled > 0.0 {
+            if is_spot && new_filled > 0.0 {
                 let avg = if order.filled > 0.0 { order.average_price } else { price };
                 self.track_spot_cost(symbol, order.side, new_filled, avg);
             }
             self.publish_order_events(&order);
+        }
+    }
+
+    /// Replay a candle as a deterministic OHLC path so intrabar triggers work.
+    /// For bullish bars the low is visited first; bearish bars visit the high first.
+    pub fn apply_candle(&mut self, symbol: &Symbol, candle: &OHLCV) {
+        let path = if candle.close >= candle.open {
+            [candle.open, candle.low, candle.high, candle.close]
+        } else {
+            [candle.open, candle.high, candle.low, candle.close]
+        };
+        for price in path {
+            self.apply_price(symbol, price, candle.timestamp);
         }
     }
 
@@ -299,7 +313,7 @@ impl Exchange {
                     continue;
                 }
                 let sym = Symbol::parse(&symbol).unwrap();
-                self.apply_price(&sym, c.close, c.timestamp);
+                self.apply_candle(&sym, &c);
                 self.replayed.insert((symbol.clone(), timeframe.clone()), Some(c.timestamp));
                 fed += 1;
             }
@@ -885,7 +899,7 @@ impl Exchange {
         // Track spot cost basis for every immediate fill (market AND
         // marketable limit orders) so the UI can show a spot position + PnL.
         // Later sweep fills are tracked separately with their own delta.
-        if order.filled > 0.0 {
+        if self.broker.market_kind(&symbol.symbol) == Some(MarketKind::Spot) && order.filled > 0.0 {
             let avg = if order.average_price > 0.0 { order.average_price } else { price.unwrap_or(0.0) };
             self.track_spot_cost(&symbol, side, order.filled, avg);
         }
@@ -1291,6 +1305,43 @@ mod tests {
     }
 
     #[test]
+    fn protective_stop_triggers_on_intrabar_low_when_close_recovers() {
+        let symbol = Symbol::parse("BTC/USDT").unwrap();
+        let mut ex = Exchange::default();
+        ex.add_market(&symbol, MarketKind::Spot);
+        ex.deposit("USDT", 100_000.0);
+        ex.load_candles(
+            "BTC/USDT",
+            "1s",
+            vec![
+                OHLCV::new(ts(1_000), 100.0, 101.0, 99.0, 100.0, 10.0),
+                OHLCV::new(ts(2_000), 100.0, 105.0, 85.0, 100.0, 10.0),
+            ],
+        );
+        ex.set_step_ms(1_000);
+        ex.reset(ts(0));
+        ex.resume();
+        ex.step();
+        ex.create_order("BTC/USDT", "market", "buy", 1.0, None, CreateOrderParams::new()).unwrap();
+        ex.create_order(
+            "BTC/USDT",
+            "stop",
+            "sell",
+            1.0,
+            None,
+            CreateOrderParams::new().stop_price(90.0).reduce_only(true),
+        )
+        .unwrap();
+
+        ex.step();
+
+        let fills = ex.fetch_fills(None, None);
+        assert_eq!(fills.len(), 2, "the stop must fire on the candle low: {fills:?}");
+        assert_eq!(fills[0]["side"], "sell");
+        assert!(ex.account_snapshot()["positions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_fetch_funding_rate_default_zero() {
         let ex = Exchange::default();
         let rate = ex.fetch_funding_rate("BTC/USDT");
@@ -1320,7 +1371,11 @@ mod tests {
         ex.load_candles(
             "BTC/USDT",
             "1s",
-            vec![candle(1_000, 100.0), candle(2_000, 95.0), candle(3_000, 90.0)],
+            vec![
+                OHLCV::new(ts(1_000), 100.0, 101.0, 99.0, 100.0, 10.0),
+                OHLCV::new(ts(2_000), 100.0, 101.0, 94.0, 95.0, 10.0),
+                OHLCV::new(ts(3_000), 95.0, 96.0, 90.0, 90.0, 10.0),
+            ],
         );
         ex.set_step_ms(1000);
         ex.reset(ts(0)); // before the first bar: each step feeds exactly one bar
