@@ -6,16 +6,11 @@ simccxt is NOT a traditional backtesting framework. It is a *virtual exchange* t
 implements the CCXT interface, so a strategy cannot tell whether it is connected to
 Binance, Bybit, OKX, or the simulator.
 
-```python
-import ccxt
-exchange = ccxt.binance()
-```
-
 is replaceable with
 
-```python
-import simccxt
-exchange = simccxt.binance(...)
+```rust
+use simccxt::Exchange;
+let exchange = Exchange::new();
 ```
 
 without changing strategy logic.

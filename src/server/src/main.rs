@@ -650,9 +650,12 @@ fn use_series(
     s.reveal_start_ms = reveal_start_ms;
     s.range_end_ms = end_ms;
     s.ex.set_step_ms(s.step_ms);
+    let was_paused = s.ex.is_paused();
     let ts = DateTime::from_timestamp_millis(reset_ms).unwrap_or_else(Utc::now);
     s.ex.reset(ts);
-    s.ex.resume();
+    if !was_paused {
+        s.ex.resume();
+    }
     s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= reset_ms);
     s.fed = 0;
     s.fills_seen = s.ex.fetch_fills(None, None).len();
@@ -873,6 +876,7 @@ impl Engine {
                                 board_push |= s.in_challenge
                                     && fill_events.iter().any(|event| event["type"] == "trade");
                                 evs.extend(fill_events);
+                                evs.push(account_json(s));
                             }
                             Err(e) => evs.push(error_json(format!("place_order: {e}"), request_id)),
                         }
@@ -938,6 +942,15 @@ impl Engine {
                         }
                     }
                     s.active_protections = active;
+                    // Cancel any broker-level conditional orders (e.g. TP/SL) for this symbol.
+                    let broker_conditional_ids: Vec<String> = s.ex.broker_mut()
+                        .conditional_orders(Some(&symbol))
+                        .iter()
+                        .map(|c| format!("conditional_{}", c.id))
+                        .collect();
+                    for cond_id in broker_conditional_ids {
+                        let _ = s.ex.cancel_order(&cond_id, &symbol);
+                    }
                     match s.ex.create_order(
                         &symbol, "market", side, q, None,
                         CreateOrderParams::new().reduce_only(true),
@@ -1014,6 +1027,7 @@ impl Engine {
                             s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
                             s.last_step = std::time::Instant::now();
                             evs.push(account_json(s));
+                            evs.push(replay_json(s));
                         }
                         "set_speed" => {
                             if let Some(v) = speed {

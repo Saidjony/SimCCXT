@@ -8,6 +8,7 @@ import {
   countBars,
   alignOiToCandles,
   cumulativeDelta,
+  formatCompactUsdt,
   formatRuler,
   invertTime,
   nearestCandleTime,
@@ -223,6 +224,16 @@ describe("nearestCandleTime", () => {
     assert.equal(nearestCandleTime(hourly, 5_500_000), 7_200_000);
     assert.equal(nearestCandleTime(hourly, -1), 0);
     assert.equal(nearestCandleTime([], 100), null);
+  });
+});
+
+describe("formatCompactUsdt", () => {
+  it("shortens billions/millions/thousands", () => {
+    assert.equal(formatCompactUsdt(8813493358.81), "8.81B");
+    assert.equal(formatCompactUsdt(463650000), "463.65M");
+    assert.equal(formatCompactUsdt(12500), "12.5K");
+    assert.equal(formatCompactUsdt(999), "999");
+    assert.equal(formatCompactUsdt(Number.NaN), "—");
   });
 });
 

@@ -398,6 +398,8 @@ let state: SimState = {
   replay: initialReplay,
   replayWindow: loadReplayWindow(),
   error: null,
+  // Pre-load all watchlist symbols for all timeframes (background).
+  bgLoaded: false,
   drawings: [],
   tool: "none",
   selectedId: null,

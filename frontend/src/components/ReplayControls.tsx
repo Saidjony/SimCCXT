@@ -89,8 +89,8 @@ export function ReplayControls(): JSX.Element {
           ))}
         </select>
       </label>
-      <details className="replay-window">
-        <summary aria-label="Настроить даты реплея" title="Диапазон дат для всех таймфреймов">Даты</summary>
+      <details className="replay-window" open>
+        <summary aria-label="Настроить даты реплея" title="Диапазон дат для всех таймфреймов (O)">Даты</summary>
         <form className="replay-window-menu" onSubmit={applyWindow}>
           <strong>Даты истории · {timeframe}</strong>
           <label>
@@ -128,8 +128,8 @@ export function ReplayControls(): JSX.Element {
       <span className="replay-state" title={formatTs(replay.now_ms)}>
         {replay.paused ? "Пауза" : "Идёт"}{replay.done ? " · конец" : ""}
       </span>
-      <details className="shortcut-help">
-        <summary aria-label="Показать горячие клавиши" title="Горячие клавиши">⌨</summary>
+      <details className="shortcut-help" open>
+        <summary aria-label="Показать горячие клавиши" title="Горячие клавиши (H)">⌨</summary>
         <div className="shortcut-menu">
           <strong>Горячие клавиши</strong>
           <span><kbd>Space</kbd> запуск / пауза</span>

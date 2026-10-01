@@ -451,7 +451,7 @@ fn download_oi(exchange_id: &str, symbol: &str, tf: &str, points: usize) -> Resu
 /// fallback when no cache file exists. Never silent: the source is logged.
 fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
     let step = tf_step_ms(tf) as i64;
-    let start = 1_704_067_200_000i64; // 2024-01-01T00:00:00Z
+    let start = (Utc::now().timestamp_millis() - (n as i64) * step) as i64;
     let mut state: u64 =
         0x9E37_79B9_7F4A_7C15 ^ (symbol.len() as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     let mut next = move || {

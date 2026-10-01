@@ -497,8 +497,9 @@ impl Exchange {
             let mark = self.last_price_for(&sym).unwrap_or(0.0);
             eq += qty * mark;
         }
-        // Unrealized PnL of linear positions.
+        // Unrealized PnL of linear positions + realized PnL from closed positions.
         eq += self.broker.portfolio().unrealized_pnl();
+        eq += self.broker.portfolio().realized_pnl();
         eq
     }
 

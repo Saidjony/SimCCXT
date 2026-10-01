@@ -25,6 +25,8 @@ pub struct Portfolio {
     margin_mode: MarginMode,
     leverage: HashMap<String, f64>,
     default_leverage: f64,
+    /// Cumulative realized PnL from fully-closed positions (not lost on retain).
+    realized_pnl_total: f64,
 }
 
 impl Default for Portfolio {
@@ -34,6 +36,7 @@ impl Default for Portfolio {
             margin_mode: MarginMode::Cross,
             leverage: HashMap::new(),
             default_leverage: 1.0,
+            realized_pnl_total: 0.0,
         }
     }
 }
@@ -119,6 +122,12 @@ impl Portfolio {
                     pos.qty -= close_qty;
                     pos.realized_pnl += realized;
                     let remaining = amount - close_qty;
+                    // If the position is fully closed, sink its realized PnL to the
+                    // persistent total so it is not lost when retain removes it.
+                    if pos.qty == 0.0 && remaining == 0.0 {
+                        self.realized_pnl_total += pos.realized_pnl;
+                        pos.realized_pnl = 0.0;
+                    }
                     if pos.qty == 0.0 && remaining > 0.0 {
                         pos.side = PositionSide::Long;
                         pos.qty = remaining;
@@ -151,6 +160,12 @@ impl Portfolio {
                     pos.qty -= close_qty;
                     pos.realized_pnl += realized;
                     let remaining = amount - close_qty;
+                    // If the position is fully closed, sink its realized PnL to the
+                    // persistent total so it is not lost when retain removes it.
+                    if pos.qty == 0.0 && remaining == 0.0 {
+                        self.realized_pnl_total += pos.realized_pnl;
+                        pos.realized_pnl = 0.0;
+                    }
                     if pos.qty == 0.0 && remaining > 0.0 {
                         pos.side = PositionSide::Short;
                         pos.qty = remaining;
@@ -176,7 +191,7 @@ impl Portfolio {
 
     /// Total realized PnL across all positions.
     pub fn realized_pnl(&self) -> f64 {
-        self.positions.values().map(|p| p.realized_pnl).sum()
+        self.realized_pnl_total + self.positions.values().map(|p| p.realized_pnl).sum::<f64>()
     }
 
     /// Positions that are currently liquidatable.

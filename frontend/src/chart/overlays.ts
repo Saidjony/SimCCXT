@@ -203,6 +203,22 @@ export function invertTime(
 }
 
 /**
+ * Compact money for axis labels: 8813493358.81 -> "8.81B".
+ * Keeps the OI price axis narrow (shorter than price labels) so the
+ * width-equalizing sync always converges on the main chart's stable width
+ * instead of chasing the OI axis as data arrives.
+ */
+export function formatCompactUsdt(v: number): string {
+  if (!Number.isFinite(v)) return "—";
+  const sign = v < 0 ? "-" : "";
+  const a = Math.abs(v);
+  if (a >= 1e9) return `${sign}${(a / 1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `${sign}${(a / 1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `${sign}${(a / 1e3).toFixed(1)}K`;
+  return `${sign}${a.toFixed(0)}`;
+}
+
+/**
  * Risk-based size: qty = riskUsdt / |entry - sl|.
  * Null when inputs are unusable (missing/degenerate stop) — entry is blocked.
  */

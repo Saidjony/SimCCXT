@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ColorType,
   CrosshairMode,
+  LineStyle,
   createChart,
 } from "lightweight-charts";
 import type {
@@ -20,6 +21,7 @@ import { criterionLabel } from "../trade/criteria";
 import {
   countBars,
   cumulativeDelta,
+  formatCompactUsdt,
   formatRuler,
   invertTime,
   nearestCandleTime,
@@ -35,8 +37,8 @@ import {
 } from "./overlays";
 import { DrawBar } from "./DrawBar";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
-import { followLatest, sameVisibleRange, syncRangeToTargets } from "./rangeSync";
-import type { VisibleRange } from "./rangeSync";
+import type { SharedCrosshair } from "./crosshairSync";
+import { followLatest } from "./rangeSync";
 
 function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
@@ -109,13 +111,17 @@ export function Chart(): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const applyingCrosshairRef = useRef(false);
+  /** Hover coalesced while a programmatic sync is in flight (flushed on reset). */
+  const pendingPublishRef = useRef<{ position: SharedCrosshair | null; source: string } | null>(null);
+  /** Timestamp of the last applied shared cursor (drop same-T replays). */
+  const lastAppliedRef = useRef<number | null>(null);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const oiWrapRef = useRef<HTMLDivElement | null>(null);
   const cvdWrapRef = useRef<HTMLDivElement | null>(null);
   const oiChartRef = useRef<IChartApi | null>(null);
   const cvdChartRef = useRef<IChartApi | null>(null);
-  const syncedIndicatorRangeRef = useRef<VisibleRange<Time> | null>(null);
+  const syncedStateRef = useRef<string | null>(null);
   const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const cvdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   /** Guard against ping-pong when syncing the two time scales. */
@@ -186,50 +192,74 @@ export function Chart(): JSX.Element {
         vertLines: { color: "#1b2330" },
         horzLines: { color: "#1b2330" },
       },
-      crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: "#222c3b" },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: { style: LineStyle.Dashed },
+      },
+      // FIXED right-axis floor on every pane (not measured): identical
+      // gutters from birth, so the same timestamp always lands on the same
+      // x. Measured content stays below the floor (prices ~72px, OI compact
+      // labels ~50px, CVD ~60px), so it never clips — and there is no
+      // read-measure-apply race to chase as data arrives. No left gutter:
+      // every pane stretches to the left edge.
+      rightPriceScale: { borderColor: "#222c3b", minimumWidth: 96 },
+      leftPriceScale: { visible: false },
       timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
     });
-    const onSharedCrosshair: Parameters<typeof subscribeCrosshair>[0] = ({ position, source }) => {
-      if (source === "main") return;
+    const onSharedCrosshair: Parameters<typeof subscribeCrosshair>[0] = ({ position }) => {
       if (!position) {
+        lastAppliedRef.current = null;
         chart.clearCrosshairPosition();
         if (oiChartRef.current) oiChartRef.current.clearCrosshairPosition();
         if (cvdChartRef.current) cvdChartRef.current.clearCrosshairPosition();
         return;
       }
-      const mainTimestamp = nearestCandleTime(candleTimesRef.current, position.timestamp);
-      if (mainTimestamp === null) {
+      // ONE shared time cursor for every pane: snap to the main candle grid
+      // so the main chart, OI and CVD all draw their vertical line at the
+      // same x (previously OI used its own 5m-grid time — hence the spread).
+      const sharedTimestamp = nearestCandleTime(candleTimesRef.current, position.timestamp);
+      if (sharedTimestamp === null) {
+        lastAppliedRef.current = null;
         chart.clearCrosshairPosition();
         return;
       }
+      lastAppliedRef.current = sharedTimestamp;
+      const time = toTime(sharedTimestamp);
       const candleRows = getState().candles;
-      const candleIndex = lastAtOrBefore(candleRows, mainTimestamp, (row) => row[0]);
-      const crosshairPrice = position.price ?? candleRows[candleIndex]?.[4];
-      if (crosshairPrice === undefined) return;
-      const time = toTime(mainTimestamp);
+      const candleIndex = lastAtOrBefore(candleRows, sharedTimestamp, (row) => row[0]);
+      const candleClose = candleIndex >= 0 ? candleRows[candleIndex][4] : undefined;
+      const crosshairPrice = position.price ?? candleClose;
       applyingCrosshairRef.current = true;
-      chart.setCrosshairPosition(crosshairPrice, time, bars);
-      if (position.price === undefined) {
-        publishCrosshair({ timestamp: mainTimestamp, price: crosshairPrice }, "main");
+      if (crosshairPrice !== undefined) {
+        chart.setCrosshairPosition(crosshairPrice, time, bars);
+      } else {
+        chart.clearCrosshairPosition();
       }
       const oiRows = getState().oi;
-      const oiIndex = lastAtOrBefore(oiRows, position.timestamp, (row) => row[0]);
-      const oiValue = oiIndex >= 0 ? oiRows[oiIndex][1] : null;
+      const oiIndex = lastAtOrBefore(oiRows, sharedTimestamp, (row) => row[0]);
       if (oiChartRef.current && oiSeriesRef.current) {
-        if (oiIndex >= 0 && oiValue !== null) {
-          oiChartRef.current.setCrosshairPosition(oiValue, toTime(oiRows[oiIndex][0]), oiSeriesRef.current);
+        if (oiIndex >= 0) {
+          oiChartRef.current.setCrosshairPosition(oiRows[oiIndex][1], time, oiSeriesRef.current);
         }
         else oiChartRef.current.clearCrosshairPosition();
       }
-      const candles = candleRows;
       if (cvdChartRef.current && cvdSeriesRef.current) {
         const value = cvdValuesRef.current[candleIndex];
         if (candleIndex >= 0 && value !== undefined) {
           cvdChartRef.current.setCrosshairPosition(value, time, cvdSeriesRef.current);
         } else cvdChartRef.current.clearCrosshairPosition();
       }
-      window.requestAnimationFrame(() => { applyingCrosshairRef.current = false; });
+      window.requestAnimationFrame(() => {
+        applyingCrosshairRef.current = false;
+        // Flush the hover coalesced during the sync (otherwise the panes
+        // freeze one step behind the cursor when it stops moving).
+        const pending = pendingPublishRef.current;
+        pendingPublishRef.current = null;
+        const pendingTs = pending?.position?.timestamp ?? null;
+        if (pending && pendingTs !== lastAppliedRef.current) {
+          publishCrosshair(pending.position, pending.source);
+        }
+      });
     };
     const bars = chart.addBarSeries({
       upColor: "#3d9a50",
@@ -294,8 +324,9 @@ export function Chart(): JSX.Element {
     window.addEventListener("keydown", onKey);
 
     // Hover readout + ghost-preview mouse tracking (local, no roundtrip).
+    // Stays live even during a programmatic sync: only the bus publish is
+    // coalesced (see pendingPublishRef), never the readout itself.
     chart.subscribeCrosshairMove((param: MouseEventParams) => {
-      if (applyingCrosshairRef.current) return;
       const data = param.seriesData?.get(bars) as
         | { open?: number; high?: number; low?: number; close?: number }
         | undefined;
@@ -312,10 +343,13 @@ export function Chart(): JSX.Element {
       }
       const price = param.point ? bars.coordinateToPrice(param.point.y) : null;
       const timestamp = param.time === undefined ? null : timeToMs(param.time);
-      if (price !== null && timestamp !== null && Number.isFinite(timestamp)) {
-        publishCrosshair({ timestamp, price }, "main");
+      const position = price !== null && timestamp !== null && Number.isFinite(timestamp)
+        ? { timestamp, price }
+        : null;
+      if (applyingCrosshairRef.current) {
+        pendingPublishRef.current = { position, source: "main" };
       } else {
-        publishCrosshair(null, "main");
+        publishCrosshair(position, "main");
       }
       // Ghost preview while placing multi-click tools.
       const active = toolRef.current;
@@ -394,9 +428,9 @@ export function Chart(): JSX.Element {
       store.consumedReset();
       if (s.fullReset) chart.priceScale("right").applyOptions({ autoScale: true });
       followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
-      // OI has its own time axis; CVD remains aligned to the candle range.
+      // OI is forward-filled onto the candle grid, so it shares the range.
       if (s.fullReset && oiSeriesRef.current && oiChartRef.current) {
-        pushOi(oiSeriesRef.current, s.oi);
+        pushOi(oiSeriesRef.current, s.oi, candleTimesRef.current);
       }
       if (cvdSeriesRef.current) {
         cvdValuesRef.current = cumulativeDelta(s.candles);
@@ -467,20 +501,21 @@ export function Chart(): JSX.Element {
     let mainRangeListener: (() => void) | null = null;
     let oiCrosshairMove: ((param: MouseEventParams) => void) | null = null;
     let cvdCrosshairMove: ((param: MouseEventParams) => void) | null = null;
-    syncedIndicatorRangeRef.current = null;
+    syncedStateRef.current = null;
 
     if (oiVisible && oiWrapRef.current) {
       const el = oiWrapRef.current;
-      const chart = createChart(el, indicatorChartOptions(el, false));
+      const chart = createChart(el, indicatorChartOptions(el));
       const line = chart.addLineSeries({
         color: "#e0af68",
         lineWidth: 2,
         priceLineVisible: false,
         crosshairMarkerVisible: true,
+        priceFormat: { type: "custom", minMove: 0.01, formatter: formatCompactUsdt },
       });
       oiChartRef.current = chart;
       oiSeriesRef.current = line;
-      pushOi(line, getState().oi);
+      pushOi(line, getState().oi, candleTimesRef.current);
       const observer = new ResizeObserver(() => {
         chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
         scheduleIndicatorSync();
@@ -488,12 +523,13 @@ export function Chart(): JSX.Element {
       observer.observe(el);
       observers.push(observer);
       oiCrosshairMove = (param: MouseEventParams): void => {
-        if (applyingCrosshairRef.current) return;
         const timestamp = param.time === undefined ? null : timeToMs(param.time);
-        publishCrosshair(
-          timestamp === null ? null : { timestamp },
-          "oi",
-        );
+        const position = timestamp === null ? null : { timestamp };
+        if (applyingCrosshairRef.current) {
+          pendingPublishRef.current = { position, source: "oi" };
+          return;
+        }
+        publishCrosshair(position, "oi");
       };
       chart.subscribeCrosshairMove(oiCrosshairMove);
     } else {
@@ -503,11 +539,11 @@ export function Chart(): JSX.Element {
 
     if (cvdVisible && cvdWrapRef.current) {
       const el = cvdWrapRef.current;
-      const chart = createChart(el, indicatorChartOptions(el, true));
+      const chart = createChart(el, indicatorChartOptions(el));
       const line = chart.addLineSeries({
         color: "#4a9ec4",
         lineWidth: 1,
-        priceScaleId: "left",
+        priceScaleId: "right",
         priceLineVisible: false,
         crosshairMarkerVisible: true,
       });
@@ -523,19 +559,20 @@ export function Chart(): JSX.Element {
       observer.observe(el);
       observers.push(observer);
       cvdCrosshairMove = (param: MouseEventParams): void => {
-        if (applyingCrosshairRef.current) return;
         const timestamp = param.time === undefined ? null : timeToMs(param.time);
-        publishCrosshair(
-          timestamp === null ? null : { timestamp },
-          "cvd",
-        );
+        const position = timestamp === null ? null : { timestamp };
+        if (applyingCrosshairRef.current) {
+          pendingPublishRef.current = { position, source: "cvd" };
+          return;
+        }
+        publishCrosshair(position, "cvd");
       };
       chart.subscribeCrosshairMove(cvdCrosshairMove);
     } else {
       cvdChartRef.current = null;
       cvdSeriesRef.current = null;
-      main?.priceScale("left").applyOptions({ visible: false, minimumWidth: 0 });
-      main?.priceScale("right").applyOptions({ minimumWidth: 0 });
+      // Creation floors stay as-is (a hidden scale would take 0px and break
+      // x-alignment with the OI pane, which keeps its spacer visible).
     }
     if (main && (oiChartRef.current || cvdChartRef.current)) {
       mainRangeListener = (): void => {
@@ -560,7 +597,7 @@ export function Chart(): JSX.Element {
       cvdChartRef.current = null;
       oiSeriesRef.current = null;
       cvdSeriesRef.current = null;
-      syncedIndicatorRangeRef.current = null;
+      syncedStateRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oiVisible, cvdVisible]);
@@ -568,7 +605,7 @@ export function Chart(): JSX.Element {
   useEffect(() => {
     const line = oiSeriesRef.current;
     if (!line) return;
-    pushOi(line, oiData.filter(([timestamp]) => timestamp <= replayNow));
+    pushOi(line, oiData.filter(([timestamp]) => timestamp <= replayNow), candleTimesRef.current);
     scheduleIndicatorSync();
   }, [oiData, replayNow]);
 
@@ -835,40 +872,41 @@ export function Chart(): JSX.Element {
     }
   }
 
-  function alignPriceScales(main: IChartApi, indicators: IChartApi): void {
-    const leftWidth = Math.max(
-      main.priceScale("left").width(),
-      indicators.priceScale("left").width(),
-    );
-    const rightWidth = Math.max(
-      main.priceScale("right").width(),
-      indicators.priceScale("right").width(),
-    );
-    const mainLeft = main.priceScale("left");
-    const indicatorLeft = indicators.priceScale("left");
-    const mainRight = main.priceScale("right");
-    const indicatorRight = indicators.priceScale("right");
-    if (
-      !mainLeft.options().visible ||
-      mainLeft.options().minimumWidth !== leftWidth ||
-      mainLeft.options().ticksVisible ||
-      mainLeft.options().borderVisible
-    ) {
-      mainLeft.applyOptions({
-        visible: true,
-        ticksVisible: false,
-        borderVisible: false,
-        minimumWidth: leftWidth,
-      });
-    }
-    if (indicatorLeft.options().minimumWidth !== leftWidth) {
-      indicatorLeft.applyOptions({ minimumWidth: leftWidth });
-    }
-    if (mainRight.options().minimumWidth !== rightWidth) {
-      mainRight.applyOptions({ minimumWidth: rightWidth });
-    }
-    if (indicatorRight.options().minimumWidth !== rightWidth) {
-      indicatorRight.applyOptions({ minimumWidth: rightWidth });
+  /** Keep the indicator panes on the main chart's clock AND pixel grid:
+   * OI is forward-filled onto the candle times, so every pane shares
+   * identical time points; fixed axis floors (set at creation) keep every
+   * pane's gutters equal, so the same timestamp lands on the same x. */
+  function syncIndicatorsToMain(): void {
+    const main = chartRef.current;
+    if (!main) return;
+    const range = main.timeScale().getVisibleRange();
+    if (!range) return;
+    syncingRef.current = true;
+    try {
+      const state = getState();
+      const oi = state.oi;
+      const candles = state.candles;
+      const key =
+        `${timeToMs(range.from) ?? "?"}:${timeToMs(range.to) ?? "?"}:` +
+        `${oi.length}:${oi[0]?.[0] ?? 0}:${oi[oi.length - 1]?.[0] ?? 0}:` +
+        `${candles.length}:${candles[0]?.[0] ?? 0}:${candles[candles.length - 1]?.[0] ?? 0}`;
+      if (syncedStateRef.current === key) return;
+      const charts: IChartApi[] = [];
+      if (cvdChartRef.current) charts.push(cvdChartRef.current);
+      if (oiChartRef.current) charts.push(oiChartRef.current);
+      let failed = false;
+      for (const c of charts) {
+        try {
+          c.timeScale().setVisibleRange(range);
+        } catch {
+          failed = true; // no mappable data yet — retried on the next push
+        }
+      }
+      if (!failed) syncedStateRef.current = key;
+    } catch {
+      // A chart can briefly have no visible range while a snapshot is applied.
+    } finally {
+      syncingRef.current = false;
     }
   }
 
@@ -881,40 +919,6 @@ export function Chart(): JSX.Element {
       syncIndicatorsToMain();
       setViewTick((n) => n + 1);
     });
-  }
-
-  /** Align indicator axes by timestamps; sparse OI has unrelated logical indices. */
-  function syncIndicatorsToMain(): void {
-    const main = chartRef.current;
-    if (!main) return;
-    const range = main.timeScale().getVisibleRange();
-    if (!range) return;
-    syncingRef.current = true;
-    try {
-      if (cvdChartRef.current) alignPriceScales(main, cvdChartRef.current);
-      if (sameVisibleRange(syncedIndicatorRangeRef.current, range, timeToMs)) return;
-      const targets = [];
-      if (cvdChartRef.current) {
-        targets.push({
-          getRange: () => cvdChartRef.current?.timeScale().getVisibleRange() ?? null,
-          setRange: (visibleRange: typeof range) =>
-            cvdChartRef.current?.timeScale().setVisibleRange(visibleRange),
-        });
-      }
-      if (oiChartRef.current) {
-        targets.push({
-          getRange: () => oiChartRef.current?.timeScale().getVisibleRange() ?? null,
-          setRange: (visibleRange: typeof range) =>
-            oiChartRef.current?.timeScale().setVisibleRange(visibleRange),
-        });
-      }
-      syncRangeToTargets(range, targets, timeToMs);
-      syncedIndicatorRangeRef.current = range;
-    } catch {
-      // A chart can briefly have no visible range while a snapshot is applied.
-    } finally {
-      syncingRef.current = false;
-    }
   }
 
   function pointFromEvent(e: React.MouseEvent): Pt | null {
@@ -1236,7 +1240,9 @@ export function Chart(): JSX.Element {
     const y2 = yFor(p2);
     if (x1 === null || x2 === null || y1 === null || y2 === null) return null;
     const b = toBox(x1, y1, x2, y2);
-    if (b.width < 2 || b.height < 2) return null;
+    // Allow very narrow horizontal spans (entry + TP on same bar) as long
+    // as the vertical span (price range) is visible.
+    if (b.height < 2) return null;
     return b;
   }
 
@@ -1339,7 +1345,7 @@ export function Chart(): JSX.Element {
   }
 }
 
-function indicatorChartOptions(el: HTMLDivElement, cvd: boolean) {
+function indicatorChartOptions(el: HTMLDivElement) {
   return {
     width: el.clientWidth,
     height: el.clientHeight,
@@ -1352,22 +1358,47 @@ function indicatorChartOptions(el: HTMLDivElement, cvd: boolean) {
       vertLines: { color: "#141b26" },
       horzLines: { color: "#141b26" },
     },
-    crosshair: { mode: CrosshairMode.Normal },
-    rightPriceScale: { borderColor: "#222c3b" },
-    leftPriceScale: { visible: cvd, borderColor: "#222c3b" },
+    crosshair: {
+      mode: CrosshairMode.Normal,
+      vertLine: { style: LineStyle.Dashed },
+    },
+    // Same fixed floor as the main chart; no left gutter on any pane.
+    rightPriceScale: { borderColor: "#222c3b", minimumWidth: 96 },
+    leftPriceScale: { visible: false },
     handleScroll: false,
     handleScale: false,
     timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
   };
 }
 
-function pushOi(line: ISeriesApi<"Line">, samples: Array<[number, number]>): void {
-  line.setData(
-    samples
-      .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value))
-      .sort((a, b) => a[0] - b[0])
-      .map(([ms, value]) => ({ time: toTime(ms), value })),
-  );
+function pushOi(
+  line: ISeriesApi<"Line">,
+  samples: Array<[number, number]>,
+  candleTimes: number[],
+): void {
+  // Forward-fill OI onto the candle grid: the OI chart then owns exactly the
+  // main chart's time points, so setCrosshairPosition(sharedTime) lands on an
+  // exact index in every pane (the lib SNAPS programmatic crosshairs to the
+  // nearest series point — a sparse OI grid would shift the line by up to
+  // half an OI step). Pre-first-sample candles hold the first value flat.
+  const clean = samples
+    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value))
+    .sort((a, b) => a[0] - b[0]);
+  if (!clean.length || !candleTimes.length) {
+    line.setData([]);
+    return;
+  }
+  const data: { time: UTCTimestamp; value: number }[] = [];
+  let k = 0;
+  let last = clean[0][1];
+  for (const t of candleTimes) {
+    while (k < clean.length && clean[k][0] <= t) {
+      last = clean[k][1];
+      k += 1;
+    }
+    data.push({ time: toTime(t), value: last });
+  }
+  line.setData(data);
 }
 
 function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[]): void {

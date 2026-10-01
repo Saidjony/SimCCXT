@@ -616,6 +616,7 @@ impl Broker {
             let avg_price = filled_notional / filled_amount;
             self.portfolio.apply_fill(symbol, side, filled_amount, avg_price);
         }
+        self.wallet.apply_fill(&symbol.quote, -fee_total);
         self.wallet.add_fee(fee_total);
     }
 
