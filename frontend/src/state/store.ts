@@ -331,6 +331,7 @@ export interface SimState {
   replay: ReplayState;
   replayWindow: ReplayWindow;
   error: string | null;
+  bgLoaded: boolean;
   drawings: Drawing[];
   tool: Tool;
   /** Selected drawing (highlight + Delete key). Null = none. */

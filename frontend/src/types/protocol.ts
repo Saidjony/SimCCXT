@@ -120,6 +120,7 @@ export type ClientMessage =
       price?: number | null;
       stop_price?: number | null;
       stop_loss_price?: number | null;
+      tp_price?: number | null;
       time_in_force?: string;
       post_only?: boolean;
       reduce_only?: boolean;

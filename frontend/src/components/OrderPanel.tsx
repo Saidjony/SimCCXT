@@ -33,6 +33,7 @@ export function OrderPanel(): JSX.Element {
   const [kind, setKind] = useState<EntryKind>("market");
   const [price, setPrice] = useState("");
   const [stop, setStop] = useState("");
+  const [tp, setTp] = useState("");
   const [tif, setTif] = useState("GTC");
   const [postOnly, setPostOnly] = useState(false);
   const error = useSim((s) => s.error);
@@ -68,6 +69,8 @@ export function OrderPanel(): JSX.Element {
     if (qty === null) return;
     msg.quantity = qty;
     msg.stop_loss_price = sl;
+    const tpVal = num(tp);
+    if (tpVal !== null) msg.tp_price = tpVal;
     sendSim(msg);
   };
 
@@ -160,6 +163,13 @@ export function OrderPanel(): JSX.Element {
           value={stop}
           onChange={(e) => setStop(e.target.value)}
           placeholder="цена стопа"
+          style={{ width: 100 }}
+        />
+        <span className="lbl">TP</span>
+        <input
+          value={tp}
+          onChange={(e) => setTp(e.target.value)}
+          placeholder="цена TP (опц.)"
           style={{ width: 100 }}
         />
       </div>
