@@ -120,6 +120,8 @@ pub struct BrokerOrderRequest {
     pub price: Option<f64>,
     /// Trigger/stop price.
     pub stop_price: Option<f64>,
+    /// Optional take-profit trigger price.
+    pub tp_price: Option<f64>,
     /// Time in force.
     pub time_in_force: TimeInForce,
     /// Reduce-only flag.
@@ -141,6 +143,7 @@ impl BrokerOrderRequest {
             time_in_force: TimeInForce::GTC,
             reduce_only: false,
             post_only: false,
+            tp_price: None,
         }
     }
 
@@ -156,6 +159,7 @@ impl BrokerOrderRequest {
             time_in_force: TimeInForce::GTC,
             reduce_only: false,
             post_only: false,
+            tp_price: None,
         }
     }
 }
@@ -324,6 +328,22 @@ impl Broker {
                 let conditional_order_id = conditional.id;
                 self.next_conditional_id += 1;
                 self.conditional.push(conditional);
+                // Optional take-profit conditional.
+                if let Some(tp) = request.tp_price {
+                    let tp_cond = ConditionalOrder {
+                        id: self.next_conditional_id,
+                        symbol: request.symbol.clone(),
+                        side: if request.side == Side::Buy { Side::Sell } else { Side::Buy },
+                        order_type: OrderType::TakeProfit,
+                        amount: request.amount,
+                        price: None,
+                        trigger_price: tp,
+                        reduce_only: true,
+                        timestamp,
+                    };
+                    self.next_conditional_id += 1;
+                    self.conditional.push(tp_cond);
+                }
                 return Ok(Order {
                     id: format!("conditional_{conditional_order_id}"),
                     symbol: request.symbol,
@@ -863,6 +883,7 @@ impl Broker {
                 amount: c.amount,
                 price: c.price,
                 stop_price: None,
+                tp_price: None,
                 time_in_force: TimeInForce::GTC,
                 reduce_only: c.reduce_only,
                 post_only: false,
@@ -1100,6 +1121,7 @@ mod tests {
                 amount: 0.5,
                 price: None,
                 stop_price: None,
+                tp_price: None,
                 time_in_force: TimeInForce::GTC,
                 reduce_only: false,
                 post_only: false,

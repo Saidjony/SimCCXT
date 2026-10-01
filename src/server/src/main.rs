@@ -145,6 +145,8 @@ enum ClientCmd {
         post_only: bool,
         #[serde(default)]
         reduce_only: bool,
+        #[serde(default)]
+        tp_price: Option<f64>,
         request_id: Option<String>,
     },
     CancelOrder { order_id: String, symbol: String, request_id: Option<String> },
@@ -341,7 +343,12 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
         let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
         let equity = snap["equity"].as_f64().unwrap_or(0.0);
         let pnl = realized + unrealized;
-        let trades = s.ex.fetch_fills(None, None).len();
+        let trades = {
+            let fills = s.ex.fetch_fills(None, None);
+            let mut ids = std::collections::HashSet::new();
+            for f in &fills { ids.insert(f["order_id"].as_str().unwrap_or("").to_string()); }
+            ids.len()
+        };
         let r = r_of(pnl, s.risk_usdt).unwrap_or(0.0);
         rows.push((r, json!({
             "nick": s.nick,
@@ -830,7 +837,7 @@ impl Engine {
             }
             ClientCmd::PlaceOrder {
                 symbol, side, order_type, quantity, price, stop_price, stop_loss_price,
-                time_in_force, post_only, reduce_only, request_id,
+                time_in_force, post_only, reduce_only, tp_price, request_id,
             } => {
                 let s = self.session(to);
                 let valid_stop = if let Some(stop) = stop_loss_price {
@@ -851,6 +858,7 @@ impl Engine {
                 } else {
                     let mut p = CreateOrderParams::new();
                         p.stop_price = stop_price;
+                        p.tp_price = tp_price;
                         p.reduce_only = reduce_only;
                         p.post_only = post_only;
                         if !time_in_force.is_empty() {

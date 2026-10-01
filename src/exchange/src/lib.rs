@@ -27,6 +27,8 @@ pub struct CreateOrderParams {
     pub reduce_only: bool,
     /// Post-only flag.
     pub post_only: bool,
+    /// Optional take-profit price.
+    pub tp_price: Option<f64>,
 }
 
 impl CreateOrderParams {
@@ -890,6 +892,7 @@ impl Exchange {
             amount,
             price,
             stop_price: params.stop_price,
+            tp_price: params.tp_price,
             time_in_force: params.time_in_force,
             reduce_only: params.reduce_only,
             post_only: params.post_only,
