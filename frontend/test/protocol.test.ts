@@ -73,6 +73,33 @@ describe("parseServerMessage", () => {
       assert.deepEqual(message.samples, [[2000, 6.25]]);
     }
   });
+
+  it("accepts background preload progress and completion", () => {
+    const queued = parseServerMessage(
+      '{"type":"preload_progress","to":7,"done":0,"total":24,"failed":0,"status":"queued","note":""}',
+    );
+    assert.equal(queued?.type, "preload_progress");
+    const step = parseServerMessage(
+      '{"type":"preload_progress","to":7,"done":1,"total":24,"failed":0,' +
+      '"symbol":"BTC/USDT","timeframe":"1h","status":"cached","note":"5000 bars from cache"}',
+    );
+    if (step?.type === "preload_progress") {
+      assert.equal(step.done, 1);
+      assert.equal(step.total, 24);
+      assert.equal(step.symbol, "BTC/USDT");
+      assert.equal(step.timeframe, "1h");
+    } else {
+      assert.fail("expected preload_progress");
+    }
+    const done = parseServerMessage(
+      '{"type":"preload_done","to":7,"done":24,"total":24,"failed":0}',
+    );
+    assert.equal(done?.type, "preload_done");
+    if (done?.type === "preload_done") {
+      assert.equal(done.done, 24);
+      assert.equal(done.failed, 0);
+    }
+  });
 });
 
 describe("applyCandleDelta", () => {

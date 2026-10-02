@@ -3,6 +3,7 @@ import { getState, store, useSim } from "../state/store";
 import { sendSim, subscribeSim } from "../websocket/connection";
 import type { FormEvent } from "react";
 import { formatTs } from "../types/protocol";
+import { Popover } from "./Popover";
 
 function toLocalInput(ms: number): string {
   const date = new Date(ms);
@@ -89,9 +90,14 @@ export function ReplayControls(): JSX.Element {
           ))}
         </select>
       </label>
-      <details className="replay-window" open>
-        <summary aria-label="Настроить даты реплея" title="Диапазон дат для всех таймфреймов (O)">Даты</summary>
-        <form className="replay-window-menu" onSubmit={applyWindow}>
+      <Popover
+        label="Даты"
+        ariaLabel="Настроить даты реплея"
+        title="Диапазон дат для всех таймфреймов"
+        panelClass="replay-window-menu"
+        width={290}
+      >
+        <form onSubmit={applyWindow}>
           <strong>Даты истории · {timeframe}</strong>
           <label>
             Начало видимой истории
@@ -124,22 +130,10 @@ export function ReplayControls(): JSX.Element {
           {rangeError && <span className="err">{rangeError}</span>}
           <button className="btn b-acc" type="submit">Применить ко всем графикам</button>
         </form>
-      </details>
+      </Popover>
       <span className="replay-state" title={formatTs(replay.now_ms)}>
         {replay.paused ? "Пауза" : "Идёт"}{replay.done ? " · конец" : ""}
       </span>
-      <details className="shortcut-help" open>
-        <summary aria-label="Показать горячие клавиши" title="Горячие клавиши (H)">⌨</summary>
-        <div className="shortcut-menu">
-          <strong>Горячие клавиши</strong>
-          <span><kbd>Space</kbd> запуск / пауза</span>
-          <span><kbd>→</kbd> следующий бар</span>
-          <span><kbd>Home</kbd> сброс реплея</span>
-          <span><kbd>Esc</kbd> отменить рисунок</span>
-          <span><kbd>Delete</kbd> удалить выбранный рисунок</span>
-          <small>Работают, когда фокус не в поле ввода, кнопке или меню.</small>
-        </div>
-      </details>
     </div>
   );
 }

@@ -139,6 +139,21 @@ export type ClientMessage =
     }
   | { type: "login"; name: string; request_id?: string }
   | { type: "challenge"; join: boolean; risk_usdt?: number; capital_usdt?: number; request_id?: string }
+  /**
+   * Background warm-up of the Rust disk caches for watchlist x timeframes, so
+   * switching a coin or a timeframe later resolves from disk instead of
+   * waiting for a download. Touches no session state; the answer is
+   * `preload_progress` events plus one `preload_done`.
+   */
+  | {
+      type: "preload";
+      symbols: string[];
+      timeframes: string[];
+      exchange?: ExchangeId;
+      start_ms?: number;
+      end_ms?: number;
+      request_id?: string;
+    }
   | { type: "ping" };
 
 // --- Rust -> frontend ---
@@ -176,6 +191,19 @@ export type ServerMessage =
   | { type: "challenge_ok"; to?: number; joined: boolean; nick?: string; request_id?: string }
   // Challenge board has NO `to`: the server broadcasts it to every socket.
   | { type: "challenge_board"; board: ChallengeEntry[] }
+  // Background market-data warm-up (see the `preload` client command).
+  | {
+      type: "preload_progress";
+      to?: number;
+      done: number;
+      total: number;
+      failed: number;
+      symbol?: string;
+      timeframe?: string;
+      status: "queued" | "cached" | "error";
+      note: string;
+    }
+  | { type: "preload_done"; to?: number; done: number; total: number; failed: number }
   | { type: "error"; to?: number; message: string; request_id?: string }
   | { type: "pong"; to?: number };
 
@@ -207,6 +235,8 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "login_ok":
     case "challenge_ok":
     case "challenge_board":
+    case "preload_progress":
+    case "preload_done":
     case "error":
     case "pong":
       return v as ServerMessage;

@@ -3,6 +3,7 @@ import { useSimSocket } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
 import { ChartWorkspace } from "../chart/ChartWorkspace";
 import { ReplayControls } from "../components/ReplayControls";
+import { TopbarTools } from "./TopbarTools";
 import { CoinList } from "../components/CoinList";
 import { ChallengeCard } from "../components/ChallengeCard";
 import { OrderPanel } from "../components/OrderPanel";
@@ -65,6 +66,7 @@ export function TradingTerminal(): JSX.Element {
         </label>
         <ConnBadge />
         {serverNick && <span className="nick-badge">вы: {serverNick}</span>}
+        <TopbarTools />
         <ReplayControls />
         {error && <span className="err">{error}</span>}
       </header>

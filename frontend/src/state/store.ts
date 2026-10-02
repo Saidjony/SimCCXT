@@ -331,6 +331,8 @@ export interface SimState {
   replay: ReplayState;
   replayWindow: ReplayWindow;
   error: string | null;
+  /** Background market-data warm-up progress for watchlist x timeframes. */
+  preload: PreloadProgress;
   bgLoaded: boolean;
   drawings: Drawing[];
   tool: Tool;
@@ -383,6 +385,32 @@ const initialReplay: ReplayState = {
   total: 0,
 };
 
+/**
+ * Progress of the background market-data warm-up (Rust fills the disk caches
+ * for the whole watchlist x every timeframe, so switching is instant). Pure UI
+ * state: it never gates anything, it only tells the user what is loading.
+ */
+export interface PreloadProgress {
+  /** A warm-up is queued or running. */
+  active: boolean;
+  /** Series finished so far (cache hit or downloaded). */
+  done: number;
+  /** Series in this warm-up batch. */
+  total: number;
+  /** Series that failed (offline, unknown pair, rate limit). */
+  failed: number;
+  /** Symbol/timeframe currently being warmed (empty between batches). */
+  current: string;
+}
+
+const initialPreload: PreloadProgress = {
+  active: false,
+  done: 0,
+  total: 0,
+  failed: 0,
+  current: "",
+};
+
 let state: SimState = {
   status: "connecting",
   clientId: null,
@@ -399,6 +427,7 @@ let state: SimState = {
   replay: initialReplay,
   replayWindow: loadReplayWindow(),
   error: null,
+  preload: initialPreload,
   // Pre-load all watchlist symbols for all timeframes (background).
   bgLoaded: false,
   drawings: [],
@@ -557,6 +586,22 @@ export const store = {
   },
   clearError(): void {
     if (state.error) set({ error: null });
+  },
+  /** A warm-up batch was accepted by Rust (progress events follow). */
+  startPreload(total: number): void {
+    set({ preload: { active: true, done: 0, total, failed: 0, current: "" } });
+  },
+  /** One `symbol@timeframe` finished (cache hit, download or failure). */
+  advancePreload(done: number, total: number, failed: number, current: string): void {
+    set({ preload: { active: true, done, total, failed, current } });
+  },
+  /** The batch finished: keep the counters visible, stop the spinner. */
+  finishPreload(done: number, total: number, failed: number): void {
+    set({ preload: { active: false, done, total, failed, current: "" } });
+  },
+  /** Warm-up was refused (offline loader, no valid pairs): show nothing. */
+  cancelPreload(): void {
+    if (state.preload.active) set({ preload: initialPreload });
   },
   setTool(tool: Tool): void {
     set({ tool });

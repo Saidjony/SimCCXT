@@ -1,4 +1,7 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
 use crate::stamp;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -6,6 +9,93 @@ use ccxt::{from_id, TypedExchange, Value};
 use simccxt_broker::MarketKind;
 use simccxt_core::{Symbol, OHLCV};
 use simccxt_exchange::Exchange;
+
+// ---------------------------------------------------------------------------
+// Network gate
+//
+// The engine thread and the background preloader share ONE CCXT network path,
+// and CCXT serializes internally. Without a gate a background warm-up of the
+// whole watchlist would freeze every user action for as long as the queue
+// lasts. This gate gives the engine strict priority: the preloader may only
+// touch the network while the engine is idle, and it re-checks between pairs,
+// so a click is never stuck behind more than the pair in flight. Cache hits
+// never take the gate at all — they are plain file reads.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// True on the preloader thread: it enters the gate as a background client.
+    static BACKGROUND_NET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Mark this thread as the background preloader (call once, at its start).
+pub(super) fn mark_background_net() {
+    BACKGROUND_NET.with(|flag| flag.set(true));
+}
+
+/// One download's exclusive access to the shared CCXT path (released on drop).
+struct NetPermit {
+    _private: (),
+}
+
+struct NetGate {
+    state: Mutex<GateState>,
+    ready: Condvar,
+}
+
+struct GateState {
+    /// A download is in flight.
+    busy: bool,
+    /// A user-facing download is queued: background work must wait for it.
+    foreground_waiting: bool,
+}
+
+static NET_GATE: NetGate = NetGate {
+    state: Mutex::new(GateState { busy: false, foreground_waiting: false }),
+    ready: Condvar::new(),
+};
+
+impl NetGate {
+    /// Block until the shared network path may be used. Background clients
+    /// additionally wait for every queued user-facing download.
+    fn acquire(&self, background: bool) -> NetPermit {
+        let waiting_since = std::time::Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if !background {
+            state.foreground_waiting = true;
+        }
+        loop {
+            let free = !state.busy && (!background || !state.foreground_waiting);
+            if free {
+                state.busy = true;
+                state.foreground_waiting = false;
+                // A user-facing download must never sit long behind the warm-up.
+                if !background && waiting_since.elapsed() > std::time::Duration::from_secs(2) {
+                    log!("[net] engine download waited {:?} for the background loader", waiting_since.elapsed());
+                }
+                return NetPermit { _private: () };
+            }
+            state = self.ready.wait(state).unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.busy = false;
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
+impl Drop for NetPermit {
+    fn drop(&mut self) {
+        NET_GATE.release();
+    }
+}
+
+/// Gate permit for the calling thread's role (engine vs preloader).
+fn net_permit() -> NetPermit {
+    NET_GATE.acquire(BACKGROUND_NET.with(|flag| flag.get()))
+}
 
 // ---------------------------------------------------------------------------
 // Market-data loading (memory → exchange-scoped disk cache → CCXT → synthetic)
@@ -143,6 +233,61 @@ fn ccxt_exchange(exchange: &str) -> Result<Box<dyn TypedExchange>, String> {
     from_id(exchange, None).ok_or_else(|| format!("CCXT exchange '{exchange}' is not enabled"))
 }
 
+/// One CCXT session per thread and exchange: instantiating the exchange and
+/// loading its markets costs seconds, so a warm-up of the whole watchlist must
+/// not repeat that for every series (nor for every page).
+struct CcxtSession {
+    exchange: Box<dyn TypedExchange>,
+    runtime: tokio::runtime::Runtime,
+    markets_loaded: bool,
+}
+
+thread_local! {
+    static CCXT_SESSIONS: RefCell<HashMap<String, CcxtSession>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Run `body` on this thread's CCXT session for `exchange_id`, creating it and
+/// loading its markets on first use. `body` is called with the session already
+/// ready and takes the net gate per request, so a queued user-facing download
+/// only ever waits for the request in flight.
+fn with_ccxt<T>(
+    exchange_id: &str,
+    body: impl FnOnce(&mut CcxtSession) -> Result<T, String>,
+) -> Result<T, String> {
+    CCXT_SESSIONS.with(|sessions| {
+        let mut sessions = sessions.borrow_mut();
+        if !sessions.contains_key(exchange_id) {
+            let exchange = {
+                // Instantiating touches CCXT's shared state: gate it too.
+                let _permit = net_permit();
+                ccxt_exchange(exchange_id)?
+            };
+            sessions.insert(
+                exchange_id.to_string(),
+                CcxtSession {
+                    exchange,
+                    runtime: ccxt_runtime()?,
+                    markets_loaded: false,
+                },
+            );
+        }
+        let session = sessions.get_mut(exchange_id).expect("inserted just above");
+        if !session.markets_loaded {
+            let CcxtSession { exchange, runtime, .. } = session;
+            let _permit = net_permit();
+            runtime.block_on(async {
+                exchange
+                    .call_raw("load_markets", vec![Value::Bool(false), Value::Null])
+                    .await
+            })
+            .map_err(|err| format!("{exchange_id}: load markets failed: {err}"))?;
+            session.markets_loaded = true;
+        }
+        body(session)
+    })
+}
+
 fn ccxt_number(value: &Value) -> Option<f64> {
     value
         .as_f64()
@@ -206,30 +351,32 @@ fn download_series_window(
             "requested range exceeds {MAX_WINDOW_BARS} bars at {tf}; narrow the dates"
         ));
     }
-    let mut cursor = start_ms;
-    let mut exchange = ccxt_exchange(exchange_id)?;
-    let runtime = ccxt_runtime()?;
-    runtime.block_on(async {
-        exchange
-            .call_raw("load_markets", vec![Value::Bool(false), Value::Null])
-            .await
-            .map_err(|err| format!("{exchange_id}: load markets failed: {err}"))?;
+    with_ccxt(exchange_id, |session| {
+        let mut cursor = start_ms;
         let mut candles = Vec::with_capacity(bars);
         while cursor <= end_ms && candles.len() < bars {
             let limit = (bars - candles.len()).min(OHLCV_PAGE);
-            let page = exchange
-                .call_raw(
-                    "fetch_ohlcv",
-                    vec![
-                        Value::from(symbol),
-                        Value::from(tf),
-                        Value::Int(cursor),
-                        Value::Int(limit as i64),
-                        Value::Null,
-                    ],
-                )
-                .await
-                .map_err(|err| format!("{exchange_id} {symbol} {tf}: {err}"))?;
+            // Gate per page, not per range: a user-facing download queued up
+            // mid-range then only waits for the page in flight.
+            let page = {
+                let _permit = net_permit();
+                let CcxtSession { exchange, runtime, .. } = &mut *session;
+                runtime.block_on(async {
+                    exchange
+                        .call_raw(
+                            "fetch_ohlcv",
+                            vec![
+                                Value::from(symbol),
+                                Value::from(tf),
+                                Value::Int(cursor),
+                                Value::Int(limit as i64),
+                                Value::Null,
+                            ],
+                        )
+                        .await
+                })
+            }
+            .map_err(|err| format!("{exchange_id} {symbol} {tf}: {err}"))?;
             let Value::Arr(rows) = page else {
                 return Err(format!("{exchange_id} returned invalid OHLCV data"));
             };
@@ -325,7 +472,8 @@ pub(super) fn ensure_series_window(
 }
 
 /// OI history grid per chart timeframe (use 5m for the 1m candle interval).
-fn oi_period(tf: &str) -> Option<&'static str> {
+/// Public so the preloader can dedupe work per grid (see preload_main).
+pub(super) fn oi_period(tf: &str) -> Option<&'static str> {
     match tf {
         "1s" | "1m" | "5m" => Some("5m"),
         "15m" => Some("15m"),
@@ -399,29 +547,30 @@ fn download_oi(exchange_id: &str, symbol: &str, tf: &str, points: usize) -> Resu
         .split_once('/')
         .map(|(base, quote)| format!("{base}/{quote}:{quote}"))
         .unwrap_or_else(|| symbol.to_string());
-    let mut exchange = ccxt_exchange(exchange_id)?;
-    let runtime = ccxt_runtime()?;
-    runtime.block_on(async {
-        exchange
-            .call_raw("load_markets", vec![Value::Bool(false), Value::Null])
-            .await
-            .map_err(|err| format!("{exchange_id}: load markets failed: {err}"))?;
+    with_ccxt(exchange_id, |session| {
         let mut out = Vec::with_capacity(points);
         while cursor < end_ms && out.len() < points {
             let limit = (points - out.len()).min(OI_PAGE);
-            let rows = exchange
-                .call_raw(
-                    "fetch_open_interest_history",
-                    vec![
-                        Value::from(swap_symbol.as_str()),
-                        Value::from(period),
-                        Value::Int(cursor),
-                        Value::Int(limit as i64),
-                        Value::Null,
-                    ],
-                )
-                .await
-                .map_err(|err| format!("{exchange_id} {swap_symbol} OI: {err}"))?;
+            // Per-request gate (see NET_GATE): never hold it across pages.
+            let rows = {
+                let _permit = net_permit();
+                let CcxtSession { exchange, runtime, .. } = &mut *session;
+                runtime.block_on(async {
+                    exchange
+                        .call_raw(
+                            "fetch_open_interest_history",
+                            vec![
+                                Value::from(swap_symbol.as_str()),
+                                Value::from(period),
+                                Value::Int(cursor),
+                                Value::Int(limit as i64),
+                                Value::Null,
+                            ],
+                        )
+                        .await
+                })
+            }
+            .map_err(|err| format!("{exchange_id} {swap_symbol} OI: {err}"))?;
             let Value::Arr(rows) = rows else {
                 return Err(format!("{exchange_id} returned invalid OI data"));
             };
@@ -451,7 +600,7 @@ fn download_oi(exchange_id: &str, symbol: &str, tf: &str, points: usize) -> Resu
 /// fallback when no cache file exists. Never silent: the source is logged.
 fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
     let step = tf_step_ms(tf) as i64;
-    let start = (Utc::now().timestamp_millis() - (n as i64) * step) as i64;
+    let start = Utc::now().timestamp_millis() - (n as i64) * step;
     let mut state: u64 =
         0x9E37_79B9_7F4A_7C15 ^ (symbol.len() as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     let mut next = move || {
@@ -476,6 +625,30 @@ fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
     out
 }
 
+/// Marker written when a venue has no open-interest history for a pair.
+/// Without it every subscribe would retry the same doomed request and pay
+/// its full timeout on the engine thread; with it the answer is instant.
+fn oi_missing_file(exchange: &str, symbol: &str, period: &str) -> String {
+    let file = format!("{}_oi_{}_none", symbol.replace('/', "").to_uppercase(), period);
+    if exchange == "binance" { file } else { format!("{exchange}_{file}") }
+}
+
+/// True when a previous attempt proved this pair has no OI history.
+pub(super) fn oi_known_missing(exchange: &str, symbol: &str, tf: &str, data_dir: &Path) -> bool {
+    let Some(period) = oi_period(tf) else { return true };
+    data_dir.join(oi_missing_file(exchange, symbol, period)).exists()
+}
+
+/// Remember that this pair has no OI history (best effort, ignore failures).
+pub(super) fn mark_oi_missing(exchange: &str, symbol: &str, tf: &str, data_dir: &Path) {
+    let Some(period) = oi_period(tf) else { return };
+    let path = data_dir.join(oi_missing_file(exchange, symbol, period));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, "no open interest history for this pair\n");
+}
+
 /// Make sure open interest for `symbol@timeframe` is loaded into the
 /// session: disk cache → CCXT download (saved to cache) → empty + log.
 /// OI is chart context, never replayed: no synthetic fallback (an invented
@@ -492,6 +665,10 @@ pub(super) fn ensure_oi(
     oi.clear();
     oi_period_out.clear();
     let Some(period) = oi_period(tf) else { return };
+    if oi_known_missing(exchange, symbol, tf, data_dir) {
+        log!("[engine] {exchange} {symbol} OI@{period}: none available (known)");
+        return;
+    }
     let path = data_dir.join(oi_file(exchange, symbol, period));
     if let Some(rows) = load_pairs_csv(&path) {
         log!(
@@ -518,7 +695,12 @@ pub(super) fn ensure_oi(
                 *oi = rows;
                 *oi_period_out = period.to_string();
             }
-            Err(e) => log!("[engine] {exchange} {symbol} OI@{period}: download failed: {e}"),
+            Err(e) => {
+                // Remember the verdict: this venue has no OI history for this
+                // pair, so later subscribes skip the doomed request entirely.
+                log!("[engine] {exchange} {symbol} OI@{period}: download failed: {e}");
+                mark_oi_missing(exchange, symbol, tf, data_dir);
+            }
         }
     }
 }
@@ -583,6 +765,99 @@ pub(super) fn ensure_series(
         path.display()
     );
     Ok(())
+}
+
+/// True when `candles` already spans `[start_ms, end_ms]` (one step of slack
+/// so the last visible bar counts as covered). Same rule as
+/// `ensure_series_window`, kept in one place.
+fn covers_range(candles: &[OHLCV], start_ms: i64, end_ms: i64, step: i64) -> bool {
+    candles.first().is_some_and(|c| c.timestamp.timestamp_millis() <= start_ms + step)
+        && candles.last().is_some_and(|c| c.timestamp.timestamp_millis() + step >= end_ms)
+}
+
+/// Warm the candle caches for one `symbol@timeframe` WITHOUT touching a
+/// session: recent history first, then the date-window cache when the replay
+/// window is not covered by it. A cache hit is just a small CSV read; a miss is
+/// downloaded through CCXT and saved exactly like a later `subscribe` would
+/// do — the only difference is that this runs off the engine thread, so the UI
+/// never waits for a download. Returns a short note for the progress event.
+pub(super) fn warm_series_cache(
+    exchange: &str,
+    symbol: &str,
+    timeframe: &str,
+    data_dir: &Path,
+    allow_net: bool,
+    window: Option<(i64, i64)>,
+) -> Result<String, String> {
+    let step = tf_step_ms(timeframe) as i64;
+    let base = data_dir.join(series_file(exchange, symbol, timeframe));
+    let mut note = match load_csv(&base) {
+        Some(candles) => format!("{} bars from cache", candles.len()),
+        None => {
+            if !allow_net {
+                return Err("no cache and downloads are disabled (--offline)".into());
+            }
+            let candles = download_series(exchange, symbol, timeframe, DOWNLOAD_BARS)?;
+            let bars = candles.len();
+            save_csv(&base, &candles).map_err(|err| format!("cache write failed: {err}"))?;
+            format!("{bars} bars downloaded")
+        }
+    };
+    if let Some((start_ms, end_ms)) = window {
+        let covered = load_csv(&base)
+            .map(|candles| covers_range(&candles, start_ms, end_ms, step))
+            .unwrap_or(false);
+        if !covered {
+            let path = data_dir.join(window_file(exchange, symbol, timeframe, start_ms, end_ms));
+            if load_csv(&path).is_none() {
+                if !allow_net {
+                    return Err("replay window is outside the cached history".into());
+                }
+                let candles =
+                    download_series_window(exchange, symbol, timeframe, start_ms, end_ms)?;
+                let bars = candles.len();
+                save_csv(&path, &candles)
+                    .map_err(|err| format!("window cache write failed: {err}"))?;
+                note = format!("{note} + {bars} bars for the date window");
+            }
+        }
+    }
+    Ok(note)
+}
+
+/// True when the OI grid for `timeframe` is already on disk (nothing to warm).
+pub(super) fn oi_cache_hit(exchange: &str, symbol: &str, timeframe: &str, data_dir: &Path) -> bool {
+    let Some(period) = oi_period(timeframe) else { return true };
+    load_pairs_csv(&data_dir.join(oi_file(exchange, symbol, period))).is_some()
+}
+
+/// Warm the open-interest cache for one `symbol@timeframe` (chart context, no
+/// synthetic fallback). Separate from the candles so the preloader can make
+/// every chart switchable first and fill OI afterwards.
+pub(super) fn warm_oi_cache(
+    exchange: &str,
+    symbol: &str,
+    timeframe: &str,
+    data_dir: &Path,
+    allow_net: bool,
+) -> Result<String, String> {
+    if oi_known_missing(exchange, symbol, timeframe, data_dir) {
+        return Err("open interest is unavailable for this pair".into());
+    }
+    let before = oi_cache_hit(exchange, symbol, timeframe, data_dir);
+    let mut oi = Vec::new();
+    let mut oi_period_out = String::new();
+    ensure_oi(&mut oi, &mut oi_period_out, exchange, symbol, timeframe, data_dir, allow_net);
+    if oi.is_empty() {
+        // No synthetic fallback for OI: an invented curve is worse than none,
+        // and a venue without OI history is a normal, non-fatal outcome.
+        return Err("open interest is unavailable for this pair".into());
+    }
+    Ok(if before {
+        format!("OI@{}: {} pts from cache", oi_period_out, oi.len())
+    } else {
+        format!("OI@{}: {} pts downloaded", oi_period_out, oi.len())
+    })
 }
 
 /// Restrict an already loaded series to a user-selected replay interval.
@@ -749,6 +1024,126 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![60_000, 120_000, 180_000, 240_000]
         );
+    }
+
+    #[test]
+    fn warm_series_cache_reports_cache_hits_and_offline_misses() {
+        let dir = std::env::temp_dir().join(format!("simccxt-warm-{}", std::process::id()));
+        let path = dir.join(series_file("binance", "BTC/USDT", "1m"));
+        let candles = (1..=3)
+            .map(|minute| {
+                let timestamp = DateTime::from_timestamp_millis(minute * 60_000).unwrap();
+                OHLCV::new(timestamp, 1.0, 2.0, 0.5, 1.5, 10.0)
+            })
+            .collect::<Vec<_>>();
+        save_csv(&path, &candles).expect("save");
+
+        // A cached pair is reported as a hit and never touches the network.
+        let note = warm_series_cache("binance", "BTC/USDT", "1m", &dir, false, None).expect("hit");
+        assert!(note.contains("from cache"), "{note}");
+        assert!(!oi_cache_hit("binance", "BTC/USDT", "1m", &dir), "no OI file yet");
+
+        // Offline + no cache: an error, not a synthetic series.
+        let error = warm_series_cache("binance", "ETH/USDT", "1m", &dir, false, None)
+            .expect_err("must fail offline");
+        assert!(error.contains("offline"), "{error}");
+
+        // A window outside the cached history is also an offline error.
+        let error = warm_series_cache(
+            "binance",
+            "BTC/USDT",
+            "1m",
+            &dir,
+            false,
+            Some((10_000_000_000, 20_000_000_000)),
+        )
+        .expect_err("window miss must fail offline");
+        assert!(error.contains("outside"), "{error}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn covers_range_matches_the_subscribe_rule() {
+        let candles = (0..3)
+            .map(|hour| {
+                let timestamp = DateTime::from_timestamp_millis(hour * 3_600_000).unwrap();
+                OHLCV::new(timestamp, 1.0, 2.0, 0.5, 1.5, 10.0)
+            })
+            .collect::<Vec<_>>();
+        let step = tf_step_ms("1h") as i64;
+        assert!(covers_range(&candles, 0, 2 * 3_600_000, step));
+        assert!(!covers_range(&candles, 5 * 3_600_000, 9 * 3_600_000, step));
+        assert!(!covers_range(&[], 0, 3_600_000, step));
+    }
+
+    #[test]
+    fn net_gate_gives_the_engine_priority_over_the_preloader() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // A background download in flight: a user-facing one must wait for it.
+        let background = NET_GATE.acquire(true);
+        let (tx, rx) = mpsc::channel();
+        let foreground = std::thread::spawn(move || {
+            let _permit = NET_GATE.acquire(false);
+            tx.send(()).ok();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "the engine must not share the network path mid-download"
+        );
+        drop(background);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the engine must run as soon as the pair in flight is done"
+        );
+        foreground.join().ok();
+
+        // A queued user-facing download also holds off new background work.
+        let held = NET_GATE.acquire(false);
+        let (tx_fg, rx_fg) = mpsc::channel();
+        let queued = std::thread::spawn(move || {
+            let _permit = NET_GATE.acquire(false);
+            tx_fg.send(()).ok();
+        });
+        std::thread::sleep(Duration::from_millis(50)); // let it reach the queue
+        let (tx_bg, rx_bg) = mpsc::channel();
+        let background = std::thread::spawn(move || {
+            let _permit = NET_GATE.acquire(true);
+            tx_bg.send(()).ok();
+        });
+        assert!(
+            rx_bg.recv_timeout(Duration::from_millis(150)).is_err(),
+            "background warm-up must yield to a queued user download"
+        );
+        drop(held);
+        assert!(rx_fg.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert!(rx_bg.recv_timeout(Duration::from_secs(5)).is_ok());
+        queued.join().ok();
+        background.join().ok();
+    }
+
+    #[test]
+    fn oi_missing_marker_short_circuits_the_download() {
+        let dir = std::env::temp_dir().join(format!("simccxt-oimissing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!oi_known_missing("binance", "BTC/USDT", "1h", &dir));
+
+        mark_oi_missing("binance", "BTC/USDT", "1h", &dir);
+        assert!(oi_known_missing("binance", "BTC/USDT", "1h", &dir));
+        // The verdict is per venue: another exchange still tries.
+        assert!(!oi_known_missing("bybit", "BTC/USDT", "1h", &dir));
+        // A different grid is unaffected.
+        assert!(!oi_known_missing("binance", "BTC/USDT", "1d", &dir));
+        // ensure_oi must return immediately, without any network attempt.
+        let mut oi = vec![(1i64, 2.0f64)];
+        let mut period = "stale".to_string();
+        ensure_oi(&mut oi, &mut period, "binance", "BTC/USDT", "1h", &dir, true);
+        assert!(oi.is_empty());
+        assert!(period.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

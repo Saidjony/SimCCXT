@@ -1,16 +1,46 @@
 import { useEffect } from "react";
 import { TradingTerminal } from "./TradingTerminal";
-import { subscribeSim } from "../websocket/connection";
-import { getState } from "../state/store";
+import { preloadSim } from "../websocket/connection";
+import { CHART_TIMEFRAMES } from "../chart/MiniChart";
+import { getState, useSim } from "../state/store";
+
+/**
+ * Background market-data loader.
+ *
+ * When the socket is open, ask Rust to warm the disk caches for the whole
+ * watchlist x every timeframe at once, so clicking any coin or any timeframe
+ * resolves from disk instead of waiting for a download. This is deliberately
+ * a `preload` and not a burst of `subscribe`s: a subscribe switches the
+ * session's live series and answers with a full snapshot, so a burst would
+ * fight the chart the user is actually looking at.
+ *
+ * Re-runs (debounced) when the socket opens, the watchlist changes or the
+ * replay date window moves — the warm-up must cover the current selection.
+ * The selectors below are what makes the component re-render on those changes.
+ */
+export function useBackgroundPreload(): void {
+  const status = useSim((s) => s.status);
+  const symbols = useSim((s) => s.watchlist.map((coin) => coin.symbol).join("|"));
+  const exchange = useSim((s) => s.exchange);
+  const startMs = useSim((s) => s.replayWindow.start_ms);
+  const endMs = useSim((s) => s.replayWindow.end_ms);
+
+  useEffect(() => {
+    if (status !== "open" || symbols.length === 0) return;
+    // Debounced: adding coins in a row must not queue one warm-up per keystroke.
+    const timer = window.setTimeout(() => {
+      const state = getState();
+      preloadSim(
+        state.watchlist.map((coin) => coin.symbol),
+        CHART_TIMEFRAMES,
+        state.exchange,
+      );
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [status, symbols, exchange, startMs, endMs]);
+}
 
 export function App(): JSX.Element {
-  useEffect(() => {
-    const ts = ["1m","5m","15m","1h","4h","1d"];
-    const list = getState().watchlist;
-    const ex = getState().exchange;
-    list.forEach((c) => {
-      ts.forEach((t) => subscribeSim(c.symbol, t, ex));
-    });
-  }, []);
+  useBackgroundPreload();
   return <TradingTerminal />;
 }

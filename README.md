@@ -36,9 +36,10 @@ seeds — every replay is reproducible.
 | Concurrency  | Deterministic single-threaded engine     |
 | Serialization| serde, serde_json                        |
 
-No Python in the runtime. No Pandas inside the engine. The optional
-`src/python-api` (PyO3) bindings exist only for legacy research scripts in
-`examples/` and are not part of the main application.
+No Python in the runtime, no Pandas inside the engine: the engine is pure Rust
+and the terminal is TypeScript. Market data is fetched by the Rust server
+through CCXT's Rust API, so the only toolchain needed is cargo plus a JS
+package manager.
 
 ## Architecture
 
@@ -61,7 +62,6 @@ src/order-engine    matching engine (market/limit, partial fills, fees, post-onl
 src/portfolio       positions, cross/isolated margin, leverage, liquidation
 src/wallet          balances, realized/unrealized PnL, fees, funding
 src/server          WebSocket API for the TypeScript terminal (thin layer, no logic)
-src/python-api      optional legacy PyO3 bindings (research scripts only)
 ```
 
 Resting limit orders fill when the market trades through them: every replayed
@@ -156,6 +156,26 @@ are labeled and connected on the chart; active entry and stop prices are drawn
 as horizontal levels. The paper-trading order form is in the right panel under the
 collapsible Challenge card.
 
+**Topbar.** Left to right: logo, venue picker, connection badge, nick, then the
+chart timeframe picker, the ⌨ hotkeys hint, the warm-up progress, the replay
+transport and the date-window button. The two popovers (hotkeys, dates) are
+fixed-positioned: the topbar is a single scrolling row, so a menu positioned
+inside it would be clipped to the bar's height and never open.
+
+**Background market-data warm-up.** On connect, and whenever the watchlist,
+venue or replay dates change, the frontend sends one `preload` command with
+every watchlist symbol × every timeframe. Rust warms the disk caches for that
+whole list on a separate thread, so clicking any coin or any timeframe later
+resolves from disk instead of waiting for a download. It is a `preload` and
+never a burst of `subscribe`s: a subscribe switches the session's live series
+and answers with a full snapshot, so a burst would fight the chart on screen.
+The badge in the topbar shows progress (`12/24`), turns ✓ when done and ⚠ if
+some pairs failed (an unknown pair, or no network). Candles are warmed first
+and open interest afterwards, so charts become switchable before the OI
+pane. The loader yields the shared CCXT path to the engine between requests:
+a user action never waits behind more than the download in flight, and cache
+hits never take that path at all.
+
 **Replay date window** is configured from the compact controls in the top bar.
 Choose the first visible-history date, the boundary after which bars reveal
 one-by-one, and the last date (defaults to now). The same absolute range is
@@ -207,15 +227,6 @@ from Orders. Replay evaluates stop and limit triggers against candle ranges,
 using low-before-high for bullish candles and high-before-low for bearish ones.
 Positions and fills include detailed risk/execution data.
 
-Legacy Python side (optional, not the app):
-
-```
-examples/_smoke_slice.py      vertical-slice smoke test (replay -> buy/sell -> PnL -> fills)
-examples/ccxt_compatibility.py  runnable CCXT-style example
-examples/realtime_simulator.py  step-by-step live feed demo
-examples/market_data.py         stdlib-only disk cache + Binance download (cache-first)
-```
-
 ```
 data/ohlcv/                    local market-data cache (machine-local, gitignored)
 ```
@@ -240,17 +251,6 @@ bun run build                   # or: npm run build
 bun test                        # or: npm test
 ```
 
-### Python environment (optional, legacy research scripts only)
-
-```bash
-uv venv --python 3.12                                  # create .venv (once)
-uv pip install --python .venv/bin/python -e .          # build + install simccxt
-```
-
-`import simccxt` inside `.venv` resolves to the installed package — no
-`PYTHONPATH` needed. Re-run `uv pip install -e .` after any Rust change.
-The main app never needs this: it runs without Python entirely.
-
 ## Quick Start (terminal)
 
 Terminal 1 — Rust engine + WebSocket API:
@@ -272,34 +272,6 @@ Lightweight Charts → BUY button → Rust order execution → position/account
 update → React. Press ▶, wait for bars, hit BUY, watch the position and PnL —
 all computed in Rust.
 
-## Quick Start (Python, optional legacy bindings)
-
-```python
-import simccxt
-
-exchange = simccxt.binance()          # interchangeable with ccxt.binance()
-exchange.add_market("BTC/USDT", "spot")
-exchange.deposit("USDT", 100_000.0)
-exchange.deposit("BTC", 1.0)
-
-exchange.load_candles("BTC/USDT", "1m", [
-    [1704067200000, 99000.0, 101000.0, 98000.0, 100000.0, 10.0],
-    [1704067260000, 100000.0, 102000.0, 99500.0, 101500.0, 12.0],
-])
-
-print(exchange.fetch_ohlcv("BTC/USDT", "1m"))
-print(exchange.fetch_ticker("BTC/USDT"))
-print(exchange.fetch_order_book("BTC/USDT"))
-
-order = exchange.create_order("BTC/USDT", "limit", "buy", 0.01, 90000.0)
-print(exchange.fetch_open_orders("BTC/USDT"))
-exchange.cancel_order(order["id"], "BTC/USDT")
-print(exchange.fetch_balance())
-```
-
-See `examples/ccxt_compatibility.py` for a runnable strategy that only uses the CCXT
-public interface.
-
 ## Implemented CCXT Surface
 
 - `fetch_ohlcv`, `fetch_ticker`, `fetch_order_book`, `fetch_trades`
@@ -313,52 +285,22 @@ public interface.
 - `is_paused()` — whether the simulator clock is paused
 - Time control: `step`, `run`, `pause`, `resume`, `seek`, `reset`
 
-## Step-by-step simulator (live-feed behaviour from disk)
+## Step-by-step replay (live-feed behaviour from disk)
 
-Like ccxt fetches real data from the internet, simccxt can deliver stored data
-step-by-step as if it were a live feed — but sourced from local memory/CSV on
-disk, fully deterministic:
-
-```python
-import simccxt
-
-ex = simccxt.binance()
-ex.add_market("BTC/USDT", "spot")
-ex.load_candles_from_csv("BTC/USDT", "1s", "data/btc_1s.csv")  # data from DISK
-
-ex.reset(start_ms)      # point the simulator clock at the first bar
-ex.set_step_ms(1000)    # one step = 1 second of market time
-ex.resume()
-
-while not ex.replay_done("BTC/USDT", "1s"):
-    bars = ex.fetch_ohlcv_live("BTC/USDT", "1s")   # only bars <= now
-    print(ex.now_ms(), len(bars), bars[-1][4])
-    ex.step(1)          # advance the clock (no real sleeping required)
-```
-
-New Python API for the simulator:
-
-- `account_snapshot()` — compact one-call state for the UI: balances, equity,
-  PnL, positions, open orders (all computed in Rust).
-- `market_snapshot(symbol)` — last price / ticker for one symbol.
-- `fetch_fills(symbol=None, limit=None)` — account's own trades (fills).
-- `close_position(symbol, qty=None)` — market-counter a position to flat.
-- `load_candles_from_csv(symbol, timeframe, path)` — load OHLCV from disk
-  (`timestamp,open,high,low,close,volume`, ms/s or ISO-8601 timestamps).
-- `reset(time_ms)` / `resume()` / `pause()` / `is_paused()` / `set_step_ms(ms)`
-- `step(n=1)` / `run()` — advance the simulator clock.
-- `fetch_ohlcv_live(symbol, timeframe)` — OHLCV rows with `timestamp <= now`
-  (a per-step live feed).
-- `replay_done(symbol, timeframe)` — true when the last candle was consumed.
+simccxt delivers stored data step-by-step as if it were a live feed — sourced
+from local memory/CSV on disk, fully deterministic. The terminal drives it
+from the topbar (▶ play, +1 step, ⏮ reset) or with the keyboard
+(`Space` / `→` / `Home`); the `Даты` popover sets the window that all charts
+share, and the topbar timeframe picker chooses the interval.
 
 ### Clock semantics (important)
 
-- `reset()` puts the clock at the given timestamp **and pauses it** — call
-  `resume()` before stepping, otherwise `step()` does nothing.
-- `fetch_ohlcv()` returns **all** loaded candles (ignores the clock);
-  `fetch_ohlcv_live()` returns only candles with `timestamp <= now`.
-- `step_ms` defaults to 1000 ms. For 1-minute bars set `set_step_ms(60000)`
-  so one step equals one bar.
+- `reset` puts the clock at the reveal boundary **and pauses it** — the
+  transport resumes playback from there.
+- A `snapshot` carries only bars at or before the clock; later bars arrive as
+  `candle` deltas as the replay advances.
+- Each chart has its own series and clock granularity (`step_ms` follows the
+  selected timeframe), so one tick equals one bar of that chart.
 
 ## WebSocket protocol (Rust ↔ TypeScript)
 
@@ -374,13 +316,14 @@ to other clients, so concurrent users never observe each other's state.
 Frontend → Rust commands: `subscribe`, `place_order`, `cancel_order`,
 `close_position`, `replay` (`play` / `pause` / `step` / `reset` / `set_speed` /
 `set_step`), `login` (nick, empty = keep server-assigned), `challenge`
-(`join` + `risk_usdt`), `ping`.
+(`join` + `risk_usdt`), `preload` (warm the caches for watchlist × timeframes),
+`ping`.
 
 Rust → frontend events: `welcome`, `snapshot` (historical candles + account +
 replay state, once), then only deltas: `candle` (new/updated bar),
 `market_update`, `account_update`, `order_update`, `trade`, `replay_state`,
-plus `login_ok`, `challenge_ok` and the `challenge_board` broadcast (no `to`:
-every socket receives it).
+plus `login_ok`, `challenge_ok`, `preload_progress` / `preload_done` and the
+`challenge_board` broadcast (no `to`: every socket receives it).
 Keep-alive: `heartbeat` every 10 s while quiet (paused replay), and `resync`
 if a client lags behind (it re-subscribes for a fresh snapshot).
 
@@ -398,26 +341,15 @@ cargo run -p simccxt-server -- --symbol BTC/USDT --timeframe 1m
 # subscribe -> snapshot -> place market BUY -> order_update + account_update
 ```
 
-The legacy Python version of the same loop (`examples/_smoke_slice.py`) is kept
-for the optional bindings:
-
-```python
-import simccxt
-ex = simccxt.binance()
-ex.add_market("BTC/USDT", "spot"); ex.deposit("USDT", 100_000.0)
-ex.load_candles("BTC/USDT", "1m", rows)   # historical data
-ex.reset(rows[0][0]); ex.resume(); ex.set_step_ms(60_000)
-ex.step(); ex.step()                      # Rust replay sets a reference price
-order = ex.create_order("BTC/USDT", "market", "buy", 0.5, None)  # Rust executes
-print(ex.account_snapshot())              # position + PnL (Rust-computed)
-print(ex.fetch_fills(None, None))         # account's own fills
-```
+In the terminal the same loop is: pick a coin and a timeframe (topbar), press
+▶, click BUY, and watch the position, the fills and the PnL update — all of
+them computed in Rust and pushed over the WebSocket.
 
 ## Data layer: disk cache + Rust CCXT
 
 The Rust server itself implements "not on disk → fetch from the internet"
 (`src/server/src/market_data.rs`: `ensure_series` / `download_series`) using
-CCXT's unified exchange API, so the terminal needs no Python to load data:
+CCXT's unified exchange API, so the terminal loads no data itself:
 
 - Order per `exchange@symbol@timeframe`: **already in memory → disk cache → CCXT
   download → synthetic fallback** (synthetic is always logged, never silent).
@@ -433,8 +365,11 @@ CCXT's unified exchange API, so the terminal needs no Python to load data:
 - Historical cache format: `ts_ms,open,high,low,close,volume` with millisecond
   timestamps.
   (explicitly reported in the server log).
-- `examples/market_data.py` (stdlib-only legacy helper) can prefill the same
-  cache files for date ranges; repeat runs are instant (cache hit).
+- The `preload` command warms these same caches for the whole watchlist in the
+  background; after it has run, repeat runs are instant (cache hit).
+- A venue with no open-interest history is remembered on disk
+  (`*_oi_*_none` marker), so that failed request is not retried on every
+  subscribe.
 
 `data/` is gitignored — cache is machine-local.
 
@@ -443,13 +378,16 @@ CCXT's unified exchange API, so the terminal needs no Python to load data:
 1. **The Rust engine is single-threaded by design** (`Rc<RefCell>` event bus).
     `simccxt-server` therefore owns the `Exchange` on one dedicated OS thread
     and talks to it through a message channel; WebSocket tasks never touch the
-    engine directly. (The legacy PyO3 `Exchange` class is likewise `unsendable`.)
+    engine directly. CCXT downloads are shared between that engine thread and
+    the preloader thread, so a priority gate gives the network to the engine
+    first and takes it per request — a click never queues behind a whole
+    warm-up batch.
 2. **CSV timestamps.** The Rust server accepts epoch seconds/milliseconds
     (auto-detected) and ISO-8601 (`2026-03-01 00:00:00+00:00`).
 3. **Determinism.** Same data + config + seed ⇒ byte-identical outputs.
     Synthetic fallback data is seeded; download caches make reruns
     offline-instant.
-4. **Environment.** Never commit `.venv/`, `target/`, `data/`,
+4. **Environment.** Never commit `target/`, `data/`,
     `frontend/node_modules/`, `frontend/dist/` or generated `*_out/` dirs
     (gitignored). Never run two servers on one port; find the exact PID via a
     `/proc` scan and `kill` it (pattern `pkill -f` once killed the invoking
@@ -464,9 +402,9 @@ CCXT's unified exchange API, so the terminal needs no Python to load data:
 | terminal shows `connected` but `data Ns ago` keeps growing | link is silent past the 10 s heartbeat — the watchdog reconnects automatically; check the server log for `disconnected (send-failed)` |
 | rapid clicks drop drawing points | fixed: placement uses manual mouseup detection, the chart's click event swallows fast clicks |
 | chart stays at 1 bar | clock starts paused after reset — press ▶ (play) |
-| `fetch_ohlcv_live` returns nothing after `reset` (legacy Python API) | clock starts paused — call `resume()` before `step()` |
+| a coin takes long to open | its series is not cached yet — the topbar badge shows the warm-up progress; after `✓` every listed pair is local |
+| topbar badge shows ⚠ | some pairs failed (unknown symbol, or the venue has no data for it) — the log line names them; the rest still work |
 | Live download slow/fails | check server logs and exchange/API availability; online download errors are surfaced instead of substituting synthetic data (synthetic bars are used only in offline mode) |
-| `import simccxt` resolves to a stray `simccxt.so` | delete repo-root copies; the venv-installed package is canonical (legacy bindings only) |
 
 ## License
 

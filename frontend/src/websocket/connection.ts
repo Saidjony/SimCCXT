@@ -32,6 +32,31 @@ export function subscribeSim(
   });
 }
 
+/**
+ * Ask Rust to warm the disk caches for the whole watchlist x every timeframe
+ * in the background. Unlike a burst of `subscribe`s this touches no session
+ * state (no snapshot, no clock reset, no account change): Rust only fills
+ * files on a background thread, so switching a coin or a timeframe later is
+ * instant. The replay date window rides along, so its range cache is warm too.
+ */
+export function preloadSim(
+  symbols: string[],
+  timeframes: string[],
+  exchange: ExchangeId,
+): void {
+  if (symbols.length === 0 || timeframes.length === 0) return;
+  const range = getState().replayWindow;
+  sendSim({
+    type: "preload",
+    symbols,
+    timeframes,
+    exchange,
+    start_ms: range.start_ms,
+    end_ms: range.end_ms,
+  });
+  store.startPreload(symbols.length * timeframes.length);
+}
+
 /** Silence longer than this (with a live socket) means the link is dead. */
 const WATCHDOG_MS = 25000;
 

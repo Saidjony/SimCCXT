@@ -29,7 +29,7 @@
 //! carries `to` (the session's client_id); each socket drops messages that
 //! address another client, so two users never see each other's state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -41,7 +41,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use simccxt_exchange::{CreateOrderParams, Exchange};
 use crate::market_data::{
-    apply_series_window, ensure_oi, ensure_series, ensure_series_window, tf_step_ms, SeriesRequest,
+    apply_series_window, ensure_oi, ensure_series, ensure_series_window, mark_background_net,
+    oi_cache_hit, oi_period, tf_step_ms, warm_oi_cache, warm_series_cache, SeriesRequest,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -65,6 +66,8 @@ use tokio::sync::broadcast;
 //   {"type":"challenge","join":true,"risk_usdt":10,"capital_usdt":1000,
 //    "request_id":".."}
 //    (risk_usdt must be >0 and is fixed for the current session)
+//   {"type":"preload","symbols":["BTC/USDT","ETH/USDT"],"timeframes":["1m","5m"],
+//    "exchange":"binance","start_ms":..,"end_ms":..,"request_id":".."}
 //   {"type":"ping"}
 //
 // Rust -> frontend:
@@ -84,8 +87,17 @@ use tokio::sync::broadcast;
 //   {"type":"login_ok","to":7,"nick":"..","request_id":".."}
 //   {"type":"challenge_ok","to":7,"joined":true,"nick":"..","request_id":".."}
 //   {"type":"challenge_board","board":[..]}         (NO `to`: goes to EVERYONE)
+//   {"type":"preload_progress","to":7,"done":3,"total":24,"failed":0,
+//    "symbol":"ETH/USDT","timeframe":"1h","status":"downloaded","note":".."}
+//   {"type":"preload_done","to":7,"done":24,"total":24,"failed":1}
 //   {"type":"error","to":7,"message":"..","request_id":".."}
 //   {"type":"pong","to":7}
+//
+// PRELOAD (background market data): the watchlist x all timeframes is warmed
+// on a separate thread, so switching a coin/timeframe never waits for a
+// download. It only fills the disk caches (and the OI grid) — it never
+// touches a session, its series, its clock or its account, and it sends no
+// candles. Progress is addressed to the requesting client.
 //
 // SESSIONS (isolation): every connection owns a private session — its own
 // `Exchange` (1M USDT paper account, orders, positions), its own series and
@@ -159,6 +171,22 @@ enum ClientCmd {
         capital_usdt: Option<f64>,
         request_id: Option<String>,
     },
+    /// Background warm-up of the disk caches for watchlist x timeframes.
+    /// Does not touch this session: no snapshot, no clock reset, no account
+    /// change — only `preload_progress` / `preload_done` come back.
+    Preload {
+        #[serde(default)]
+        symbols: Vec<String>,
+        #[serde(default)]
+        timeframes: Vec<String>,
+        #[serde(default = "default_exchange")]
+        exchange: String,
+        // The replay date window [start_ms, end_ms]: its range cache is warmed
+        // too, so a subscribe inside it also resolves from disk.
+        start_ms: Option<i64>,
+        end_ms: Option<i64>,
+        request_id: Option<String>,
+    },
     Replay {
         action: String,
         #[serde(default)]
@@ -183,6 +211,47 @@ fn default_exchange() -> String {
 enum EngineJob {
     Command { client_id: u64, cmd: ClientCmd },
     Disconnect { client_id: u64 },
+}
+
+/// One background warm-up request: every `symbol x timeframe` pair the client
+/// wants ready before it switches to them. Deduplicated and capped by
+/// `preload_plan`, then handed to the preloader thread.
+struct PreloadJob {
+    client_id: u64,
+    exchange: String,
+    pairs: Vec<(String, String)>,
+    /// Replay date window, so the date-range caches are warm too.
+    window: Option<(i64, i64)>,
+}
+
+/// Cap on one request (a client cannot queue an unbounded download storm).
+const PRELOAD_MAX_PAIRS: usize = 64;
+/// Timeframes the server accepts in a warm-up request.
+const PRELOAD_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
+
+/// Deduplicated, validated `symbol x timeframe` list for a warm-up request.
+/// Pure helper so it can be unit-tested: malformed symbols/timeframes are
+/// dropped and the order stays stable (watchlist order first, timeframes after).
+fn preload_plan(symbols: &[String], timeframes: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for symbol in symbols {
+        let symbol = symbol.trim().to_uppercase();
+        if !symbol.contains('/') {
+            continue;
+        }
+        for timeframe in timeframes {
+            let timeframe = timeframe.trim().to_ascii_lowercase();
+            if !PRELOAD_TIMEFRAMES.contains(&timeframe.as_str()) {
+                continue;
+            }
+            let pair = (symbol.clone(), timeframe.clone());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out.truncate(PRELOAD_MAX_PAIRS);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +442,8 @@ struct Engine {
     /// Missing series may be downloaded via CCXT (false in unit tests,
     /// and when the server is started with `--offline`).
     allow_net: bool,
+    /// Background cache warm-up sender (see PRELOAD above).
+    preload: Option<mpsc::Sender<PreloadJob>>,
 }
 
 /// Heartbeat period: even a paused replay emits traffic so the frontend can
@@ -673,11 +744,17 @@ fn use_series(
 impl Engine {
     /// Unit-test constructor: never touches the network.
     fn new(out: broadcast::Sender<String>) -> Self {
-        Engine { sessions: HashMap::new(), out, allow_net: false }
+        Engine { sessions: HashMap::new(), out, allow_net: false, preload: None }
     }
 
     fn with_net(mut self, allow_net: bool) -> Self {
         self.allow_net = allow_net;
+        self
+    }
+
+    /// Attach the background preloader (the only place a warm-up can run).
+    fn with_preload(mut self, preload: mpsc::Sender<PreloadJob>) -> Self {
+        self.preload = Some(preload);
         self
     }
 
@@ -833,6 +910,39 @@ impl Engine {
                         log!("[engine] #{to} subscribe failed: {err}");
                         evs.push(error_json(err, request_id));
                     }
+                }
+            }
+            ClientCmd::Preload {
+                symbols, timeframes, exchange, start_ms, end_ms, request_id, ..
+            } => {
+                let pairs = preload_plan(&symbols, &timeframes);
+                let window = match (start_ms, end_ms) {
+                    (Some(start), Some(end)) if start < end => Some((start, end)),
+                    _ => None,
+                };
+                if pairs.is_empty() {
+                    evs.push(error_json(
+                        "preload: no valid symbol/timeframe pairs".into(),
+                        request_id,
+                    ));
+                } else if let Some(tx) = self.preload.clone() {
+                    let total = pairs.len();
+                    let job = PreloadJob { client_id: to, exchange, pairs, window };
+                    if tx.send(job).is_ok() {
+                        log!("[preload] #{to} queued {total} pairs");
+                        evs.push(json!({
+                            "type": "preload_progress",
+                            "done": 0, "total": total, "failed": 0,
+                            "status": "queued", "note": "",
+                        }));
+                    } else {
+                        evs.push(error_json("preload: background loader is gone".into(), request_id));
+                    }
+                } else {
+                    evs.push(error_json(
+                        "preload: background loader is not available".into(),
+                        request_id,
+                    ));
                 }
             }
             ClientCmd::PlaceOrder {
@@ -1300,10 +1410,142 @@ fn parse_args() -> Args {
     Args { port, symbol, timeframe, data_dir, offline }
 }
 
+/// One progress line of a warm-up batch (pure data, so the sender stays simple).
+struct PreloadReport<'a> {
+    client_id: u64,
+    done: usize,
+    total: usize,
+    failed: usize,
+    symbol: &'a str,
+    timeframe: &'a str,
+    status: &'a str,
+    note: String,
+}
+
+/// Background preloader thread: fills the disk caches for `watchlist x
+/// timeframes` so switching a coin or a timeframe is instant. It only touches
+/// files — never a session, its series, clock or account — and it never blocks
+/// the engine thread (CCXT downloads happen here instead).
+///
+/// Two phases on purpose: every candle series first (that is what makes a
+/// chart switchable), then the open-interest grids, which are slower and are
+/// only chart context. Failures are counted, never fatal.
+fn preload_main(
+    rx: mpsc::Receiver<PreloadJob>,
+    out: broadcast::Sender<String>,
+    data_dir: PathBuf,
+    allow_net: bool,
+) {
+    // This thread yields the shared CCXT path to the engine between pairs.
+    mark_background_net();
+    log!("[preload] background loader started (net={})", if allow_net { "on" } else { "off" });
+    while let Ok(job) = rx.recv() {
+        let total = job.pairs.len();
+        let client_id = job.client_id;
+        let mut done = 0usize;
+        let mut failed = 0usize;
+        // Free function (not a closure) so the counters can advance between calls.
+        fn report(out: &broadcast::Sender<String>, job: PreloadReport<'_>) {
+            let event = msg(json!({
+                "type": "preload_progress",
+                "to": job.client_id,
+                "done": job.done,
+                "total": job.total,
+                "failed": job.failed,
+                "symbol": job.symbol,
+                "timeframe": job.timeframe,
+                "status": job.status,
+                "note": job.note,
+            }));
+            let _ = out.send(event);
+        }
+        log!("[preload] #{client_id}: warming {total} series for {}", job.exchange);
+
+        // Phase 1 — candles: this is what the charts need to switch instantly.
+        for (symbol, timeframe) in &job.pairs {
+            match warm_series_cache(
+                &job.exchange,
+                symbol,
+                timeframe,
+                &data_dir,
+                allow_net,
+                job.window,
+            ) {
+                Ok(note) => {
+                    log!("[preload] {} {symbol} {timeframe}: {note}", job.exchange);
+                    done += 1;
+                    report(&out, PreloadReport {
+                        client_id, done, total, failed,
+                        symbol, timeframe, status: "cached", note,
+                    });
+                }
+                Err(error) => {
+                    log!("[preload] {} {symbol} {timeframe}: {error}", job.exchange);
+                    failed += 1;
+                    done += 1;
+                    report(&out, PreloadReport {
+                        client_id, done, total, failed,
+                        symbol, timeframe, status: "error", note: error,
+                    });
+                }
+            }
+        }
+
+        // Phase 2 — open interest: chart context, slower, never blocking a
+        // chart. Several timeframes share one OI grid, and a venue that has no
+        // OI history for a symbol answers for all of them, so each grid is
+        // tried once and a symbol is dropped after its first failure.
+        let mut oi_grids: HashSet<(String, String)> = HashSet::new();
+        let mut oi_unsupported: HashSet<String> = HashSet::new();
+        if allow_net {
+            for (symbol, timeframe) in &job.pairs {
+                if oi_unsupported.contains(symbol) {
+                    continue;
+                }
+                let Some(period) = oi_period(timeframe) else { continue };
+                if !oi_grids.insert((symbol.clone(), period.to_string())) {
+                    continue; // this grid was already handled in this batch
+                }
+                if oi_cache_hit(&job.exchange, symbol, timeframe, &data_dir) {
+                    continue; // nothing to fetch
+                }
+                match warm_oi_cache(&job.exchange, symbol, timeframe, &data_dir, allow_net) {
+                    Ok(note) => {
+                        log!("[preload] {} {symbol} {timeframe}: {note}", job.exchange);
+                        report(&out, PreloadReport {
+                            client_id, done, total, failed,
+                            symbol, timeframe, status: "cached", note,
+                        });
+                    }
+                    Err(error) => {
+                        log!("[preload] {} {symbol} {timeframe} OI: {error}", job.exchange);
+                        oi_unsupported.insert(symbol.clone());
+                        report(&out, PreloadReport {
+                            client_id, done, total, failed,
+                            symbol, timeframe, status: "error", note: error,
+                        });
+                    }
+                }
+            }
+        }
+
+        let final_event = msg(json!({
+            "type": "preload_done",
+            "to": client_id,
+            "done": done,
+            "total": total,
+            "failed": failed,
+        }));
+        let _ = out.send(final_event);
+    }
+    log!("[preload] channel closed, loader stopped");
+}
+
 fn engine_main(
     rx: mpsc::Receiver<EngineJob>,
     out: broadcast::Sender<String>,
     args: Args,
+    preload: Option<mpsc::Sender<PreloadJob>>,
 ) {
     log!(
         "[engine] cli defaults: {} {} (every session subscribes its own series, net={})",
@@ -1312,6 +1554,9 @@ fn engine_main(
         if args.offline { "off" } else { "CCXT" }
     );
     let mut engine = Engine::new(out).with_net(!args.offline);
+    if let Some(preload) = preload {
+        engine = engine.with_preload(preload);
+    }
 
     loop {
         match rx.recv_timeout(engine.next_timeout()) {
@@ -1337,11 +1582,20 @@ async fn main() {
     let args = parse_args();
     let port = args.port;
     let (jobs_tx, jobs_rx) = mpsc::channel::<EngineJob>();
+    let (preload_tx, preload_rx) = mpsc::channel::<PreloadJob>();
     let (out_tx, _) = broadcast::channel::<String>(1024);
     let out_for_engine = out_tx.clone();
+    let data_dir = args.data_dir.clone();
+    let preload_net = !args.offline;
+    let out_for_preload = out_tx.clone();
+    std::thread::Builder::new()
+        .name("simccxt-preload".into())
+        .spawn(move || preload_main(preload_rx, out_for_preload, data_dir, preload_net))
+        .expect("spawn preload thread");
+    let preload = Some(preload_tx);
     std::thread::Builder::new()
         .name("simccxt-engine".into())
-        .spawn(move || engine_main(jobs_rx, out_for_engine, args))
+        .spawn(move || engine_main(jobs_rx, out_for_engine, args, preload))
         .expect("spawn engine thread");
     let listener = TcpListener::bind(("127.0.0.1", port)).await.expect("bind ws port");
     log!("[ws] simccxt-server listening on ws://127.0.0.1:{port}/");
@@ -1396,6 +1650,56 @@ mod tests {
                 assert_eq!(steps, Some(3));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn preload_plan_dedupes_and_validates() {
+        let symbols = vec!["btc/usdt".to_string(), "ETH/USDT".to_string(), "bogus".to_string()];
+        let timeframes = vec![
+            "5m".to_string(),
+            "1m".to_string(),
+            "7z".to_string(),
+            "5M".to_string(),
+            "1m".to_string(),
+        ];
+        let plan = preload_plan(&symbols, &timeframes);
+        // "bogus" (no slash) and "7z" (unknown timeframe) are dropped,
+        // "5M" is normalized to "5m" and every duplicate collapses.
+        assert_eq!(
+            plan,
+            vec![
+                ("BTC/USDT".to_string(), "5m".to_string()),
+                ("BTC/USDT".to_string(), "1m".to_string()),
+                ("ETH/USDT".to_string(), "5m".to_string()),
+                ("ETH/USDT".to_string(), "1m".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn preload_plan_is_capped() {
+        let symbols = (0..40).map(|i| format!("C{i}/USDT")).collect::<Vec<_>>();
+        let timeframes = PRELOAD_TIMEFRAMES.iter().map(|tf| tf.to_string()).collect::<Vec<_>>();
+        assert!(preload_plan(&symbols, &timeframes).len() <= PRELOAD_MAX_PAIRS);
+    }
+
+    #[test]
+    fn client_cmd_preload_parses() {
+        let cmd: ClientCmd = serde_json::from_str(
+            r#"{"type":"preload","symbols":["BTC/USDT"],"timeframes":["1h","1d"],
+                "exchange":"bybit","start_ms":1000,"end_ms":2000}"#,
+        )
+        .expect("preload parses");
+        match cmd {
+            ClientCmd::Preload { symbols, timeframes, exchange, start_ms, end_ms, .. } => {
+                assert_eq!(symbols, vec!["BTC/USDT".to_string()]);
+                assert_eq!(timeframes, vec!["1h".to_string(), "1d".to_string()]);
+                assert_eq!(exchange, "bybit");
+                assert_eq!(start_ms, Some(1000));
+                assert_eq!(end_ms, Some(2000));
+            }
+            other => panic!("expected preload, got {other:?}"),
         }
     }
 
@@ -1564,6 +1868,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: None,
+                tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,
@@ -1615,6 +1920,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: Some(entry * 0.99),
+                tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,
@@ -1678,6 +1984,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: Some(stop),
+                tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,
@@ -1750,6 +2057,7 @@ mod tests {
                 price: Some(entry),
                 stop_price: None,
                 stop_loss_price: Some(stop),
+                tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,
@@ -1798,6 +2106,7 @@ mod tests {
                 price: None,
                 stop_price: Some(trigger),
                 stop_loss_price: Some(stop),
+                tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,
@@ -1963,6 +2272,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: None,
+                tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
                 reduce_only: false,

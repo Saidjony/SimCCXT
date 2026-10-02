@@ -69,6 +69,17 @@ function route(m: ServerMessage): void {
       // No `to`: shared by design, the route() filter above lets it through.
       store.applyBoard(m.board);
       break;
+    case "preload_progress":
+      store.advancePreload(
+        m.done,
+        m.total,
+        m.failed,
+        m.symbol ? `${m.symbol} · ${m.timeframe}` : "",
+      );
+      break;
+    case "preload_done":
+      store.finishPreload(m.done, m.total, m.failed);
+      break;
     case "error":
       store.setError(m.message);
       break;
