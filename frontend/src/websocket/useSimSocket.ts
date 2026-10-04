@@ -15,15 +15,15 @@ function route(m: ServerMessage): void {
       subscribeSim(getState().symbol, getState().timeframe, getState().exchange);
       // Restore identity: login (stored nick or empty = server random nick),
       // then rejoin the challenge when the user opted in before.
+      // Every session joins the shared board with the stored risk (the "видно
+      // всем" opt-in checkbox was removed; there is no "leave" anymore).
       sendSim({ type: "login", name: getState().nick });
-      if (getState().inChallenge) {
-        sendSim({
-          type: "challenge",
-          join: true,
-          risk_usdt: getState().fixedRiskUsdt,
-          capital_usdt: getState().initialCapitalUsdt,
-        });
-      }
+      sendSim({
+        type: "challenge",
+        join: true,
+        risk_usdt: getState().fixedRiskUsdt,
+        capital_usdt: getState().initialCapitalUsdt,
+      });
       break;
     case "snapshot":
       store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period, m.fills);

@@ -98,6 +98,122 @@ export interface ChallengeEntry {
   symbol: string;
 }
 
+// --- read-only diary HTTP API (GET /api/trader/:nick, /api/candles) ---
+
+/** One closed round-trip trade reconstructed by the engine (FIFO). */
+export interface DiaryTrade {
+  symbol: string;
+  side: "long" | "short";
+  direction: string; // "buy→sell" | "sell→buy"
+  qty: number;
+  entry_price: number;
+  exit_price: number;
+  pnl: number;
+  r: number;
+  entry_time_ms: number;
+  exit_time_ms: number;
+  entry_fee: number;
+  exit_fee: number;
+  fee: number;
+  entry_order_id: string;
+  exit_order_id: string;
+}
+
+/** One still-open position (leftover lots of a single symbol). */
+export interface DiaryPosition {
+  symbol: string;
+  side: "long" | "short";
+  qty: number;
+  entry_price: number;
+  entry_time_ms: number;
+  mark_price: number;
+  unrealized: number;
+}
+
+export interface DiaryStats {
+  total_trades: number;
+  win_rate: number;
+  wins: number;
+  losses: number;
+  realized_pnl: number;
+  total_pnl: number;
+  avg_r: number;
+  avg_win: number;
+  avg_loss: number;
+  best: number;
+  worst: number;
+  fees: number;
+}
+
+/** Reply of `GET /api/trader/:nick`. `error` ⇒ trader is offline (HTTP 404). */
+export interface DiaryData {
+  type: "diary";
+  nick: string;
+  error?: string;
+  trades?: DiaryTrade[];
+  positions?: DiaryPosition[];
+  stats?: DiaryStats;
+  risk_usdt?: number;
+  capital_usdt?: number;
+  equity?: number;
+  in_challenge?: boolean;
+  symbol?: string;
+  timeframe?: string;
+  exchange?: string;
+  range?: ReplayWindow;
+}
+
+/** One row of `GET /api/traders`. */
+export interface TraderRow {
+  nick: string;
+  in_challenge: boolean;
+  risk_usdt: number;
+  capital_usdt: number;
+  symbol: string;
+  timeframe: string;
+  equity: number;
+  realized: number;
+  unrealized: number;
+  pnl: number;
+  r: number | null;
+  trades: number;
+}
+
+export interface TradersData {
+  type: "traders";
+  traders: TraderRow[];
+}
+
+/** Reply of `GET /api/candles` (diary chart data). */
+export interface CandlesData {
+  type: "candles";
+  symbol: string;
+  timeframe?: string;
+  candles: CandleRow[];
+  error?: string;
+}
+
+/**
+ * Base URL of the read-only diary HTTP API, derived from the WS URL: Rust
+ * binds the HTTP listener on `ws_port + 1`, so `ws://127.0.0.1:19003` ⇒
+ * `http://127.0.0.1:19004`. A URL without an explicit port (reverse proxy)
+ * keeps its origin, assuming the proxy routes `/api` too. Pure function of
+ * the input so it is unit-testable (no `window`, no `import.meta`).
+ */
+export function apiBaseFrom(ws: string): string {
+  try {
+    const url = new URL(ws);
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    if (url.port) url.port = String(Number(url.port) + 1);
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.origin;
+  } catch {
+    return "http://127.0.0.1:9002"; // default ws port 9001 + 1
+  }
+}
+
 // --- frontend -> Rust ---
 
 export type ClientMessage =

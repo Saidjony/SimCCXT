@@ -1,5 +1,5 @@
 import type { ClientMessage, ExchangeId, ServerMessage } from "../types/protocol";
-import { parseServerMessage } from "../types/protocol";
+import { apiBaseFrom, parseServerMessage } from "../types/protocol";
 import { getState, store } from "../state/store";
 
 export function wsUrl(): string {
@@ -13,6 +13,16 @@ export function wsUrl(): string {
   }
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   return proto + "://" + window.location.host;
+}
+
+/**
+ * Base URL of the read-only diary HTTP API (see `apiBaseFrom` for the
+ * port+1 rule). Kept next to `wsUrl` so both URLs come from one place.
+ */
+export function apiUrl(): string {
+  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+  if (env && env["VITE_API_URL"]) return String(env["VITE_API_URL"]).replace(/\/+$/, "");
+  return apiBaseFrom(wsUrl());
 }
 
 export type Route = (m: ServerMessage) => void;

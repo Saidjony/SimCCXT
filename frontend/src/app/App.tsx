@@ -1,8 +1,10 @@
 import { useEffect } from "react";
 import { TradingTerminal } from "./TradingTerminal";
+import { TraderDiary } from "../components/TraderDiary";
 import { preloadSim } from "../websocket/connection";
 import { CHART_TIMEFRAMES } from "../chart/MiniChart";
 import { getState, useSim } from "../state/store";
+import { traderFromSearch } from "../trade/diary";
 
 /**
  * Background market-data loader.
@@ -40,7 +42,19 @@ export function useBackgroundPreload(): void {
   }, [status, symbols, exchange, startMs, endMs]);
 }
 
+/**
+ * App = router on ONE query param: `?trader=<nick>` opens the read-only diary
+ * of an online trader (pure HTTP, no WebSocket — the session belongs to the
+ * original tab), anything else is the terminal. The preload hook lives in
+ * `Terminal` so hooks are never called conditionally here.
+ */
 export function App(): JSX.Element {
+  const trader = traderFromSearch(window.location.search);
+  if (trader) return <TraderDiary nick={trader} />;
+  return <Terminal />;
+}
+
+function Terminal(): JSX.Element {
   useBackgroundPreload();
   return <TradingTerminal />;
 }

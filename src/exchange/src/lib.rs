@@ -414,9 +414,12 @@ impl Exchange {
 
         let orders = self.fetch_open_orders(None);
 
-        let total_pnl = self.broker.portfolio().unrealized_pnl()
-            + self.broker.portfolio().realized_pnl()
-            + self.spot_unrealized();
+        // Realized and unrealized are SEPARATE: `unrealized` used to hold the
+        // total (realized + unrealized), which made every consumer that added
+        // the two fields double-count — the board's R was ×2 and the terminal
+        // showed "Unrealized ≠ 0" while flat.
+        let realized_pnl = self.broker.portfolio().realized_pnl() + self.spot_realized();
+        let unrealized_pnl = self.broker.portfolio().unrealized_pnl() + self.spot_unrealized();
 
         json!({
             "time": self.now_ms(),
@@ -425,8 +428,8 @@ impl Exchange {
             "positions": positions,
             "open": orders,
             "pnl": json!({
-                "realized": self.broker.portfolio().realized_pnl() + self.spot_realized(),
-                "unrealized": total_pnl,
+                "realized": realized_pnl,
+                "unrealized": unrealized_pnl,
                 "fees": self.broker.wallet().total_fees(),
             }),
         })

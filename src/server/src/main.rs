@@ -45,12 +45,14 @@ use crate::market_data::{
     oi_cache_hit, oi_period, tf_step_ms, warm_oi_cache, warm_series_cache, SeriesRequest,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 // ---------------------------------------------------------------------------
 // PROTOCOL (must stay in sync with frontend/src/types/protocol.ts)
 // ---------------------------------------------------------------------------
 //
+
+mod diary;
 // Frontend -> Rust ("type" tagged):
 //   {"type":"subscribe","symbol":"BTC/USDT","timeframe":"1m",
 //    "exchange":"binance","request_id":".."}
@@ -207,10 +209,21 @@ fn default_exchange() -> String {
 }
 
 /// One unit of work for the engine thread: a command from a client, or the
-/// teardown of that client's session.
+/// teardown of that client's session, or a diary request (read-only HTTP).
 enum EngineJob {
     Command { client_id: u64, cmd: ClientCmd },
     Disconnect { client_id: u64 },
+    Diary { nick: String, reply: oneshot::Sender<Value> },
+    Traders { reply: oneshot::Sender<Value> },
+    /// Read-only candles for the diary chart (throwaway Exchange, no session).
+    Candles {
+        exchange: String,
+        symbol: String,
+        timeframe: String,
+        start_ms: i64,
+        end_ms: i64,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// One background warm-up request: every `symbol x timeframe` pair the client
@@ -315,7 +328,8 @@ struct PendingProtection {
     symbol: String,
     entry_side: String,
     entry_order_id: String,
-    stop_price: f64,
+    stop_price: f64, // 0.0 = no take-protection arm
+    take_price: Option<f64>,
     remaining: f64,
 }
 
@@ -415,7 +429,7 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
         let trades = {
             let fills = s.ex.fetch_fills(None, None);
             let mut ids = std::collections::HashSet::new();
-            for f in &fills { ids.insert(f["order_id"].as_str().unwrap_or("").to_string()); }
+            for f in &fills { ids.insert(f["orderId"].as_str().unwrap_or("").to_string()); }
             ids.len()
         };
         let r = r_of(pnl, s.risk_usdt).unwrap_or(0.0);
@@ -524,26 +538,50 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
         if let Some(index) = pending_index {
             let protect_amount = amount.min(s.pending_protections[index].remaining);
             let stop_price = s.pending_protections[index].stop_price;
+            let take_price = s.pending_protections[index].take_price;
             let entry_side = s.pending_protections[index].entry_side.clone();
-            let stop_side = if entry_side == "buy" { "sell" } else { "buy" };
-            match s.ex.create_order(
-                &symbol,
-                "stop",
-                stop_side,
-                protect_amount,
-                None,
-                CreateOrderParams::new().stop_price(stop_price).reduce_only(true),
-            ) {
-                Ok(order) => {
-                    if let Some(id) = order["id"].as_str() {
-                        s.active_protections.push((symbol.clone(), entry_side, id.to_string()));
-                    }
-                    events.push(json!({ "type": "order_update", "order": order }));
-                }
-                Err(error) => events.push(error_json(
-                    format!("stop loss could not be armed for {symbol}: {error}"),
+            let protect_side = if entry_side == "buy" { "sell" } else { "buy" };
+            if stop_price > 0.0 {
+                match s.ex.create_order(
+                    &symbol,
+                    "stop",
+                    protect_side,
+                    protect_amount,
                     None,
-                )),
+                    CreateOrderParams::new().stop_price(stop_price).reduce_only(true),
+                ) {
+                    Ok(order) => {
+                        if let Some(id) = order["id"].as_str() {
+                            s.active_protections.push((symbol.clone(), entry_side.clone(), id.to_string()));
+                        }
+                        events.push(json!({ "type": "order_update", "order": order }));
+                    }
+                    Err(error) => events.push(error_json(
+                        format!("stop loss could not be armed for {symbol}: {error}"),
+                        None,
+                    )),
+                }
+            }
+            if let Some(tp) = take_price {
+                match s.ex.create_order(
+                    &symbol,
+                    "take_profit",
+                    protect_side,
+                    protect_amount,
+                    None,
+                    CreateOrderParams::new().stop_price(tp).reduce_only(true),
+                ) {
+                    Ok(order) => {
+                        if let Some(id) = order["id"].as_str() {
+                            s.active_protections.push((symbol.clone(), entry_side, id.to_string()));
+                        }
+                        events.push(json!({ "type": "order_update", "order": order }));
+                    }
+                    Err(error) => events.push(error_json(
+                        format!("take profit could not be armed for {symbol}: {error}"),
+                        None,
+                    )),
+                }
             }
             s.pending_protections[index].remaining -= protect_amount;
             if s.pending_protections[index].remaining <= f64::EPSILON {
@@ -698,6 +736,50 @@ fn use_series(
         start_ms.saturating_add((step_ms as i64).saturating_mul(20))
     });
     let end_ms = end_ms.unwrap_or(last_ms);
+    let (mut start_ms, mut reveal_start_ms, end_ms) = if !allow_net && !rows.is_empty() {
+        let loaded_start = rows.first().map(|row| row[0] as i64).unwrap_or(last_ms);
+        let loaded_end = last_ms;
+        if start_ms < loaded_start || end_ms > loaded_end {
+            let (ns, ne) = if end_ms <= loaded_start || start_ms >= loaded_end {
+                // Requested window does not intersect the cache at all.
+                (loaded_start, loaded_end)
+            } else {
+                (start_ms.max(loaded_start), end_ms.min(loaded_end))
+            };
+            // Keep the requested reveal only if it lands inside the clipped
+            // window, else adopt the natural "start + 20 bars" like a fresh
+            // subscribe would (a clamped-out reveal means a blank chart).
+            let nr = if reveal_start_ms > ns && reveal_start_ms <= ne {
+                reveal_start_ms
+            } else {
+                (ns + 20 * step_ms as i64).min(ne)
+            };
+            log!(
+                "[engine] {exchange} {symbol} {timeframe}: requested [{start_ms}..{end_ms}] not fully covered offline — clamping to loaded [{ns}..{ne}]"
+            );
+            (ns, nr, ne)
+        } else {
+            (start_ms, reveal_start_ms, end_ms)
+        }
+    } else {
+        (start_ms, reveal_start_ms, end_ms)
+    };
+    // The OI overlay is part of the chart context — it must be visible from
+    // the very first frame. When the OI cache starts later than the series
+    // start, begin the replay window AT the first available OI point
+    // (otherwise the window ahead is OI-silent, which reads as "нет данных").
+    if let Some((first_oi, _)) = s.oi.first() {
+        let first_oi = *first_oi;
+        if first_oi > start_ms && first_oi < end_ms {
+            log!(
+                "[engine] {exchange} {symbol} {timeframe}: OI starts at {first_oi} — shift replay start"
+            );
+            start_ms = first_oi;
+            if reveal_start_ms < start_ms {
+                reveal_start_ms = start_ms + 20 * step_ms as i64;
+            }
+        }
+    }
     ensure_series_window(
         &mut s.ex,
         SeriesRequest {
@@ -960,9 +1042,24 @@ impl Engine {
                 } else {
                     true
                 };
+                let valid_tp = if let Some(tp) = tp_price {
+                    let reference = price.or(stop_price).or_else(|| s.ex.last_price_for(&symbol));
+                    reference.is_some_and(|entry| {
+                        tp.is_finite()
+                            && tp > 0.0
+                            && if side == "buy" { tp > entry } else { tp < entry }
+                    })
+                } else {
+                    true
+                };
                 if !valid_stop {
                     evs.push(error_json(
                         "stop loss must be below the entry price for BUY and above it for SELL".into(),
+                        request_id,
+                    ));
+                } else if !valid_tp {
+                    evs.push(error_json(
+                        "take profit must be above the entry price for BUY and below it for SELL".into(),
                         request_id,
                     ));
                 } else {
@@ -980,13 +1077,14 @@ impl Engine {
                             Ok(order) => {
                                 evs.push(json!({
                                     "type": "order_update", "order": order, "request_id": request_id }));
-                                if let Some(stop_price) = stop_loss_price {
+                                if stop_loss_price.is_some() || tp_price.is_some() {
                                     let order_id = order["id"].as_str().unwrap_or_default().to_string();
                                     s.pending_protections.push(PendingProtection {
                                         symbol: symbol.clone(),
                                         entry_side: side.clone(),
                                         entry_order_id: order_id,
-                                        stop_price,
+                                        stop_price: stop_loss_price.unwrap_or(0.0),
+                                        take_price: tp_price,
                                         remaining: quantity,
                                     });
                                 }
@@ -1178,6 +1276,131 @@ impl Engine {
         }
     }
 
+    fn handle_diary(&self, nick: &str, reply: oneshot::Sender<Value>) {
+        let mut result = json!({"type": "diary", "nick": nick, "error": "trader not found"});
+        for s in self.sessions.values() {
+            if s.nick != nick {
+                continue;
+            }
+            let fills = s.ex.fetch_fills(None, None);
+            let risk = s.risk_usdt;
+            let snap = s.ex.account_snapshot();
+            let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
+            let equity = snap["equity"].as_f64().unwrap_or(0.0);
+
+            // Mark prices from open positions (for unrealized PnL).
+            let mut mark_prices = HashMap::new();
+            for p in snap["positions"].as_array().unwrap_or(&vec![]) {
+                let sym = p["symbol"].as_str().unwrap_or("");
+                mark_prices.insert(sym.to_string(), p["markPrice"].as_f64().unwrap_or(0.0));
+            }
+
+            // fetch_fills is newest-first; mirror `timestamp` into `time_ms`
+            // and stamp a chronological `fill_index` (older ⇒ smaller) so the
+            // FIFO replay is deterministic inside one millisecond.
+            let n = fills.len() as u64;
+            let mut fills_with_meta: Vec<Value> = fills
+                .into_iter()
+                .enumerate()
+                .map(|(idx, mut f)| {
+                    f["time_ms"] = json!(f["timestamp"].as_i64().unwrap_or(0));
+                    f["fill_index"] = json!(n - idx as u64);
+                    f
+                })
+                .collect();
+            fills_with_meta.reverse(); // chronological (oldest first)
+
+            let (trades, positions) =
+                diary::reconstruct_trades(fills_with_meta, risk, mark_prices);
+
+            // Win/loss aggregates for the stats block.
+            let wins: Vec<f64> = trades.iter().filter(|t| t.pnl > 0.0).map(|t| t.pnl).collect();
+            let losses: Vec<f64> = trades.iter().filter(|t| t.pnl < 0.0).map(|t| t.pnl).collect();
+            let total_pnl: f64 = trades.iter().map(|t| t.pnl).sum();
+
+            result = json!({
+                "type": "diary",
+                "nick": nick,
+                "trades": trades.iter().map(|t| {
+                    json!({
+                        "symbol": t.symbol,
+                        "side": t.side,
+                        "direction": t.direction,
+                        "qty": t.qty,
+                        "entry_price": t.entry_price,
+                        "exit_price": t.exit_price,
+                        "pnl": t.pnl,
+                        "r": t.r,
+                        "entry_time_ms": t.entry_time_ms,
+                        "exit_time_ms": t.exit_time_ms,
+                        "entry_fee": t.entry_fee,
+                        "exit_fee": t.exit_fee,
+                        "fee": t.fee,
+                        "entry_order_id": t.entry_order_id,
+                        "exit_order_id": t.exit_order_id,
+                    })
+                }).collect::<Vec<_>>(),
+                "positions": positions.iter().map(|p| {
+                    json!({
+                        "symbol": p.symbol,
+                        "side": p.side,
+                        "qty": p.qty,
+                        "entry_price": p.entry_price,
+                        "entry_time_ms": p.entry_time_ms,
+                        "mark_price": p.mark_price,
+                        "unrealized": p.unrealized,
+                    })
+                }).collect::<Vec<_>>(),
+                "stats": {
+                    "total_trades": trades.len(),
+                    "win_rate": if trades.is_empty() {
+                        0.0
+                    } else {
+                        wins.len() as f64 / trades.len() as f64
+                    },
+                    "wins": wins.len(),
+                    "losses": losses.len(),
+                    "realized_pnl": realized,
+                    "total_pnl": total_pnl,
+                    "avg_r": if trades.is_empty() {
+                        0.0
+                    } else {
+                        trades.iter().map(|t| t.r).sum::<f64>() / trades.len() as f64
+                    },
+                    "avg_win": if wins.is_empty() {
+                        0.0
+                    } else {
+                        wins.iter().sum::<f64>() / wins.len() as f64
+                    },
+                    "avg_loss": if losses.is_empty() {
+                        0.0
+                    } else {
+                        losses.iter().sum::<f64>() / losses.len() as f64
+                    },
+                    "best": trades.iter().map(|t| t.pnl).fold(0.0, f64::max),
+                    "worst": trades.iter().map(|t| t.pnl).fold(0.0, f64::min),
+                    "fees": trades.iter().map(|t| t.fee).sum::<f64>(),
+                },
+                "risk_usdt": risk,
+                "capital_usdt": s.capital_usdt,
+                "equity": equity,
+                "in_challenge": s.in_challenge,
+                // Context for the chart: which series the diary page should
+                // load candles for (session's current selection).
+                "symbol": s.symbol,
+                "timeframe": s.timeframe,
+                "exchange": s.exchange,
+                "range": {
+                    "start_ms": s.range_start_ms,
+                    "reveal_start_ms": s.reveal_start_ms,
+                    "end_ms": s.range_end_ms,
+                },
+            });
+            break;
+        }
+        let _ = reply.send(result);
+    }
+
     fn handle_job(&mut self, job: EngineJob, data_dir: &Path) {
         match job {
             EngineJob::Command { client_id, cmd } => self.handle_command(client_id, cmd, data_dir),
@@ -1189,7 +1412,103 @@ impl Engine {
                     }
                 }
             }
+            EngineJob::Diary { nick, reply } => self.handle_diary(&nick, reply),
+            EngineJob::Traders { reply } => self.handle_traders(reply),
+            EngineJob::Candles { exchange, symbol, timeframe, start_ms, end_ms, reply } => {
+                self.handle_candles(&exchange, &symbol, &timeframe, start_ms, end_ms, data_dir, reply)
+            }
         }
+    }
+
+    fn handle_traders(&self, reply: oneshot::Sender<Value>) {
+        // All online participants (richer than the public board: equity and
+        // realized figures come straight from the engine's snapshots).
+        let mut rows: Vec<(f64, String, Value)> = self
+            .sessions
+            .values()
+            .map(|s| {
+                let snap = s.ex.account_snapshot();
+                let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
+                let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
+                let equity = snap["equity"].as_f64().unwrap_or(0.0);
+                let pnl = realized + unrealized;
+                let trades = {
+                    let fills = s.ex.fetch_fills(None, None);
+                    let mut ids = std::collections::HashSet::new();
+                    for f in &fills {
+                        ids.insert(f["orderId"].as_str().unwrap_or("").to_string());
+                    }
+                    ids.len()
+                };
+                let r = r_of(pnl, s.risk_usdt);
+                let value = json!({
+                    "nick": s.nick,
+                    "in_challenge": s.in_challenge,
+                    "risk_usdt": s.risk_usdt,
+                    "capital_usdt": s.capital_usdt,
+                    "symbol": s.symbol,
+                    "timeframe": s.timeframe,
+                    "equity": equity,
+                    "realized": realized,
+                    "unrealized": unrealized,
+                    "pnl": pnl,
+                    "r": r,
+                    "trades": trades,
+                });
+                (r.unwrap_or(f64::NEG_INFINITY), s.nick.clone(), value)
+            })
+            .collect();
+        // Deterministic order: most R first, ties broken by nick.
+        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        let traders: Vec<Value> = rows.into_iter().map(|(_, _, v)| v).collect();
+        let _ = reply.send(json!({"type":"traders","traders":traders}));
+    }
+
+    /// Candles for the diary chart: read-only, loaded into a throwaway
+    /// `Exchange` so no session is touched. Falls back to the error JSON when
+    /// the series cannot be loaded (offline and not cached).
+    fn handle_candles(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        timeframe: &str,
+        start_ms: i64,
+        end_ms: i64,
+        data_dir: &Path,
+        reply: oneshot::Sender<Value>,
+    ) {
+        let mut ex = Exchange::default();
+        // Offline with no cache would make `ensure_series` fabricate 2000
+        // synthetic bars — never serve those as a trader's chart.
+        let mut result = if !self.allow_net
+            && !market_data::has_series_cache(exchange, symbol, timeframe, data_dir)
+        {
+            json!({"type": "candles", "symbol": symbol, "error":
+                   format!("{exchange} {symbol} {timeframe}: no cached candles (offline)"),
+                   "candles": []})
+        } else {
+            match ensure_series(
+                &mut ex,
+                exchange,
+                symbol,
+                timeframe,
+                data_dir,
+                self.allow_net,
+                false,
+            ) {
+                Ok(()) => Value::Null,
+                Err(e) => json!({"type": "candles", "symbol": symbol, "error": e, "candles": []}),
+            }
+        };
+        if result.is_null() {
+            let mut rows = ex.fetch_ohlcv(symbol, timeframe, None, None);
+            rows.retain(|r| {
+                let t = r[0] as i64;
+                (start_ms <= 0 || t >= start_ms) && (end_ms <= 0 || t <= end_ms)
+            });
+            result = json!({"type": "candles", "symbol": symbol, "timeframe": timeframe, "candles": rows});
+        }
+        let _ = reply.send(result);
     }
 
     /// Sleep until the next session step is due (or the idle poll fires).
@@ -1599,6 +1918,34 @@ async fn main() {
         .expect("spawn engine thread");
     let listener = TcpListener::bind(("127.0.0.1", port)).await.expect("bind ws port");
     log!("[ws] simccxt-server listening on ws://127.0.0.1:{port}/");
+    let http_port = port + 1;
+    // The diary HTTP API is optional: if `ws_port + 1` is taken (another
+    // tool's range), degrade to WebSocket-only instead of killing the server.
+    match TcpListener::bind(("127.0.0.1", http_port)).await {
+        Err(e) => log!("[http] diary API disabled (port {http_port} busy): {e}"),
+        Ok(http_listener) => {
+            log!("[http] simccxt diary API listening on http://127.0.0.1:{http_port}/");
+            let jobs_tx_http = jobs_tx.clone();
+
+            // HTTP: GET /api/traders, GET /api/trader/:nick, GET /api/candles.
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _addr) = match http_listener.accept().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log!("[http] accept failed: {e}");
+                            continue;
+                        }
+                    };
+                    let tx = jobs_tx_http.clone();
+                    tokio::spawn(async move {
+                        handle_http_request(stream, tx).await;
+                    });
+                }
+            });
+        }
+    }
+
     let mut next_id: u64 = 1;
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -1612,6 +1959,232 @@ async fn main() {
         next_id += 1;
         tokio::spawn(handle_conn(stream, addr, id, jobs_tx.clone(), out_tx.clone()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP read-only API (diary + traders list + diary chart candles)
+//
+// Deviation from the original plan: the plan proposed serving HTTP on the
+// SAME port as WS by peeking at the first byte (0x81 = WS). That is wrong:
+// a WebSocket *handshake* starts with ASCII "GET / HTTP/1.1" — the same first
+// byte as plain HTTP (0x81 is a frame byte, seen only after the handshake).
+// Discriminating safely would require parsing headers before handing the
+// stream to tungstenite. We instead bind `ws_port + 1` and rely on CORS
+// (`Access-Control-Allow-Origin: *`), which the frontend needs anyway.
+// ---------------------------------------------------------------------------
+
+/// Routes understood by the HTTP API. Pure enum so parsing is unit-testable.
+#[derive(Debug, PartialEq)]
+enum HttpRoute {
+    Options,
+    Traders,
+    Trader(String),
+    Candles {
+        exchange: String,
+        symbol: String,
+        timeframe: String,
+        start_ms: i64,
+        end_ms: i64,
+    },
+    NotFound,
+    MethodNotAllowed,
+}
+
+/// Parse the request line (`METHOD target`) into an API route.
+fn route_request(method: &str, target: &str) -> HttpRoute {
+    if method == "OPTIONS" {
+        return HttpRoute::Options;
+    }
+    if method != "GET" {
+        return HttpRoute::MethodNotAllowed;
+    }
+    // Split off the query string.
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
+    if path == "/api/traders" {
+        return HttpRoute::Traders;
+    }
+    if let Some(raw) = path.strip_prefix("/api/trader/") {
+        let nick = percent_decode(raw);
+        if nick.is_empty() {
+            return HttpRoute::NotFound;
+        }
+        return HttpRoute::Trader(nick);
+    }
+    if path == "/api/candles" {
+        let params = parse_query(query);
+        let symbol = params.get("symbol").cloned().unwrap_or_default();
+        let timeframe = params.get("timeframe").cloned().unwrap_or_default();
+        if symbol.is_empty() || timeframe.is_empty() {
+            return HttpRoute::NotFound;
+        }
+        let num = |key: &str| -> i64 {
+            params.get(key).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)
+        };
+        return HttpRoute::Candles {
+            exchange: params.get("exchange").cloned().unwrap_or_else(default_exchange),
+            symbol,
+            timeframe,
+            start_ms: num("start_ms"),
+            end_ms: num("end_ms"),
+        };
+    }
+    HttpRoute::NotFound
+}
+
+/// `a=1&b=%D0%BA` → map with percent-decoded keys and values.
+fn parse_query(query: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        out.insert(percent_decode(k), percent_decode(v));
+    }
+    out
+}
+
+/// Assemble a complete HTTP/1.1 response. Headers come BEFORE the body and
+/// `Content-Length` counts body bytes — the previous implementation appended
+/// headers after the JSON, which made `response.json()` fail in the browser.
+fn http_response(status: u16, reason: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+}
+
+/// Read the request head (up to the blank line) with a size cap.
+async fn read_request_head(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 8192 {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+async fn handle_http_request(mut stream: tokio::net::TcpStream, jobs_tx: std::sync::mpsc::Sender<EngineJob>) {
+    use tokio::io::AsyncWriteExt;
+
+    let head = match read_request_head(&mut stream).await {
+        Some(h) => h,
+        None => return,
+    };
+    let req_line = head.lines().next().unwrap_or("");
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+
+    // Send one job to the engine and wait for its reply (bounded — the
+    // engine may be busy warming caches).
+    async fn ask(
+        jobs_tx: &std::sync::mpsc::Sender<EngineJob>,
+        make: impl FnOnce(oneshot::Sender<Value>) -> EngineJob,
+    ) -> Result<Value, ()> {
+        let (tx, rx) = oneshot::channel::<Value>();
+        jobs_tx.send(make(tx)).map_err(|_| ())?;
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(v)) => Ok(v),
+            _ => Err(()),
+        }
+    }
+
+    // 404 semantics: the diary reply carries `error` when the nick is unknown
+    // (the trader went offline) — surface it as a real HTTP 404.
+    let json_reply = |v: &Value| -> String {
+        let status = if v.get("error").is_some() { 404 } else { 200 };
+        let reason = if status == 404 { "Not Found" } else { "OK" };
+        http_response(status, reason, &serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+    };
+
+    let response = match route_request(method, target) {
+        HttpRoute::Options => http_response(204, "No Content", ""),
+        HttpRoute::Traders => match ask(&jobs_tx, |reply| EngineJob::Traders { reply }).await {
+            Ok(v) => json_reply(&v),
+            Err(()) => http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}"),
+        },
+        HttpRoute::Trader(nick) => {
+            match ask(&jobs_tx, |reply| EngineJob::Diary { nick, reply }).await {
+                Ok(v) => json_reply(&v),
+                Err(()) => http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}"),
+            }
+        }
+        HttpRoute::Candles { exchange, symbol, timeframe, start_ms, end_ms } => {
+            match ask(&jobs_tx, |reply| EngineJob::Candles {
+                exchange,
+                symbol,
+                timeframe,
+                start_ms,
+                end_ms,
+                reply,
+            })
+            .await
+            {
+                Ok(v) => json_reply(&v),
+                Err(()) => http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}"),
+            }
+        }
+        HttpRoute::NotFound => http_response(404, "Not Found", "{\"error\":\"not found\"}"),
+        HttpRoute::MethodNotAllowed => {
+            http_response(405, "Method Not Allowed", "{\"error\":\"method not allowed\"}")
+        }
+    };
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+/// Percent-decode a path/query component to a `String`.
+///
+/// Bytes are collected first and decoded as UTF-8 at the end, so Cyrillic
+/// nicks (`%D0%9A...`) survive intact — pushing `b as char` per byte (the
+/// previous implementation) produced one Latin-1 char per UTF-8 byte. Hex is
+/// parsed from raw bytes (never a `&str` slice) so a multi-byte character
+/// right after `%` cannot trigger a char-boundary panic.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let hex_val = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        // Copy the whole (possibly multi-byte) UTF-8 character as-is.
+        let c = s[i..].chars().next().unwrap_or('\u{fffd}');
+        out.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+        i += c.len_utf8();
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,5 +2880,119 @@ mod tests {
         let rows = last["board"].as_array().expect("board array");
         assert_eq!(rows.len(), 1, "leaver drops off the board");
         assert_eq!(rows[0]["nick"], "Второй");
+    }
+
+    // -------------------------------------------------------------------
+    // HTTP API: routing, percent-decoding, response framing
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn route_get_traders_and_diary() {
+        assert_eq!(route_request("GET", "/api/traders"), HttpRoute::Traders);
+        assert_eq!(
+            route_request("GET", "/api/trader/Бык-Бык-7"),
+            HttpRoute::Trader("Бык-Бык-7".into())
+        );
+        // Query string on the diary path is ignored (nick only).
+        assert_eq!(
+            route_request("GET", "/api/trader/abc?x=1"),
+            HttpRoute::Trader("abc".into())
+        );
+    }
+
+    #[test]
+    fn route_decodes_percent_encoded_cyrillic_nick() {
+        // %D0%91%D1%8B%D0%BA = "Бык"
+        assert_eq!(
+            route_request("GET", "/api/trader/%D0%91%D1%8B%D0%BA"),
+            HttpRoute::Trader("Бык".into())
+        );
+    }
+
+    #[test]
+    fn route_candles_parses_params_and_defaults() {
+        let r = route_request(
+            "GET",
+            "/api/candles?symbol=BTC%2FUSDT&timeframe=5m&exchange=binance&start_ms=100&end_ms=200",
+        );
+        assert_eq!(
+            r,
+            HttpRoute::Candles {
+                exchange: "binance".into(),
+                symbol: "BTC/USDT".into(),
+                timeframe: "5m".into(),
+                start_ms: 100,
+                end_ms: 200,
+            }
+        );
+        // exchange/start/end optional
+        let r = route_request("GET", "/api/candles?symbol=ETH%2FUSDT&timeframe=1h");
+        assert_eq!(
+            r,
+            HttpRoute::Candles {
+                exchange: "binance".into(),
+                symbol: "ETH/USDT".into(),
+                timeframe: "1h".into(),
+                start_ms: 0,
+                end_ms: 0,
+            }
+        );
+        // missing symbol ⇒ 404
+        assert_eq!(
+            route_request("GET", "/api/candles?timeframe=5m"),
+            HttpRoute::NotFound
+        );
+    }
+
+    #[test]
+    fn route_rejects_unknown_paths_and_methods() {
+        assert_eq!(route_request("GET", "/"), HttpRoute::NotFound);
+        assert_eq!(route_request("GET", "/api"), HttpRoute::NotFound);
+        assert_eq!(route_request("GET", "/api/trader/"), HttpRoute::NotFound);
+        assert_eq!(route_request("POST", "/api/traders"), HttpRoute::MethodNotAllowed);
+        assert_eq!(route_request("DELETE", "/api/trader/x"), HttpRoute::MethodNotAllowed);
+        assert_eq!(route_request("OPTIONS", "/api/traders"), HttpRoute::Options);
+    }
+
+    #[test]
+    fn percent_decode_handles_utf8_and_invalid_sequences() {
+        // Cyrillic byte-by-byte percent-encoding stays valid UTF-8.
+        assert_eq!(percent_decode("%D0%91%D1%8B%D0%BA-1"), "Бык-1");
+        // Mixed: literal + encoded.
+        assert_eq!(percent_decode("Бык%201"), "Бык 1");
+        // Truncated / invalid hex is left as-is (no panic, no garbage).
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%D"), "%D"); // truncated: needs 2 hex digits
+        // "%D0" IS valid hex → one byte 0xD0, but that byte alone is not a
+        // complete UTF-8 char, so lossy conversion yields U+FFFD (no panic).
+        assert_eq!(percent_decode("%D0"), "\u{fffd}");
+        // Raw UTF-8 input passes through untouched.
+        assert_eq!(percent_decode("Тихий-Медведь-3"), "Тихий-Медведь-3");
+        // '%' followed by a multi-byte char must not panic (char-boundary).
+        assert_eq!(percent_decode("%Б"), "%Б");
+    }
+
+    #[test]
+    fn http_response_is_a_well_formed_json_reply() {
+        let resp = http_response(200, "OK", "{\"a\":1}");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "version required: {resp:?}");
+        assert!(resp.contains("Content-Type: application/json; charset=utf-8\r\n"));
+        assert!(resp.contains("Content-Length: 7\r\n"), "body bytes = 7");
+        assert!(resp.contains("Access-Control-Allow-Origin: *\r\n"));
+        // Headers strictly before body: split on the blank line.
+        let (head, body) = resp.split_once("\r\n\r\n").expect("head/body separator");
+        assert!(head.ends_with("Connection: close"), "last header before body");
+        assert_eq!(body, "{\"a\":1}");
+        // Content-Length must equal actual body byte length (Cyrillic = 2 bytes/char).
+        let cyr = http_response(404, "Not Found", "{\"error\":\"Бык\"}");
+        let (_, cyr_body) = cyr.split_once("\r\n\r\n").unwrap();
+        let declared: usize = cyr
+            .lines()
+            .find(|l| l.starts_with("Content-Length:"))
+            .unwrap()
+            .trim_start_matches("Content-Length: ")
+            .parse()
+            .unwrap();
+        assert_eq!(declared, cyr_body.len());
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSimSocket } from "../websocket/useSimSocket";
 import { useSim } from "../state/store";
 import { ChartWorkspace } from "../chart/ChartWorkspace";
@@ -44,6 +44,41 @@ export function TradingTerminal(): JSX.Element {
   const timeframe = useSim((s) => s.timeframe);
   const exchange = useSim((s) => s.exchange);
 
+  // Resizable side rail width (px), persisted across reloads.
+  const [sideWidth, setSideWidth] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem("simccxt.side-width"));
+      if (Number.isFinite(saved) && saved >= 280 && saved <= 720) return saved;
+    } catch {
+      /* storage unavailable */
+    }
+    return 336;
+  });
+  const sideRef = useRef<HTMLElement | null>(null);
+  const startSideResize = (e: React.MouseEvent): void => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sideRef.current?.getBoundingClientRect().width ?? sideWidth;
+    const onMove = (ev: MouseEvent): void => {
+      const next = Math.min(Math.max(startW + (startX - ev.clientX), 280), 720);
+      setSideWidth(Math.round(next));
+    };
+    const onUp = (): void => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      setSideWidth((w) => {
+        try {
+          localStorage.setItem("simccxt.side-width", String(w));
+        } catch {
+          /* ignore */
+        }
+        return w;
+      });
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   return (
     <div className="app">
       <header className="topbar">
@@ -74,7 +109,13 @@ export function TradingTerminal(): JSX.Element {
         <main className="main">
           <ChartWorkspace />
         </main>
-        <aside className="side">
+        {/* Draggable width handle between the chart workspace and the side rail */}
+        <div className="side-resizer" onMouseDown={startSideResize} />
+        <aside
+          className="side"
+          ref={sideRef as React.MutableRefObject<HTMLElement | null>}
+          style={{ width: sideWidth, flex: `0 0 ${sideWidth}px` }}
+        >
           <CoinList />
           <ChallengeCard />
           <OrderPanel />

@@ -22,10 +22,7 @@ export function ChallengeCard(): JSX.Element {
   const [collapsed, setCollapsed] = useState(false);
   const nick = useSim((s) => s.nick);
   const serverNick = useSim((s) => s.serverNick);
-  const inChallenge = useSim((s) => s.inChallenge);
   const board = useSim((s) => s.board);
-  const fixedRiskUsdt = useSim((s) => s.fixedRiskUsdt);
-  const initialCapitalUsdt = useSim((s) => s.initialCapitalUsdt);
   const [draft, setDraft] = useState<string | null>(null);
   const shown = draft ?? nick;
 
@@ -34,18 +31,6 @@ export function ChallengeCard(): JSX.Element {
     store.setNick(name);
     setDraft(null);
     sendSim({ type: "login", name, request_id: nextRequestId() });
-  };
-
-  const toggleJoin = (): void => {
-    const join = !inChallenge;
-    store.setInChallenge(join);
-    sendSim({
-      type: "challenge",
-      join,
-      risk_usdt: join ? fixedRiskUsdt : undefined,
-      capital_usdt: join ? initialCapitalUsdt : undefined,
-      request_id: nextRequestId(),
-    });
   };
 
   return (
@@ -80,10 +65,9 @@ export function ChallengeCard(): JSX.Element {
             aria-label="ник для челленджа"
           />
         </div>
-        <label className="crit-row" style={{ marginTop: 6 }}>
-          <input type="checkbox" checked={inChallenge} onChange={toggleJoin} />
-          <span>участвовать (видно всем)</span>
-        </label>
+        {/* "Видно всем" is the default: every session joins the shared board
+            (see useSimSocket welcome handler), so there is no opt-in toggle.
+        */}
         {board.length === 0 && (
           <div className="lbl" style={{ marginTop: 6 }}>пока пусто — участники появятся здесь</div>
         )}
@@ -96,7 +80,23 @@ export function ChallengeCard(): JSX.Element {
             <tbody>
               {board.map((e) => (
                 <tr key={e.nick} className={e.nick === serverNick ? "me" : ""}>
-                  <td>{e.nick}</td>
+                  <td>
+                    {e.nick === serverNick ? (
+                      e.nick
+                    ) : (
+                      // Read-only diary of someone else's ONLINE session.
+                      // Opens in a new tab so this terminal keeps its socket.
+                      <a
+                        className="diary-link"
+                        href={`/?trader=${encodeURIComponent(e.nick)}`}
+                        target="_blank"
+                        rel="noopener"
+                        title={`Дневник ${e.nick}`}
+                      >
+                        {e.nick}
+                      </a>
+                    )}
+                  </td>
                   <td className="num">{e.risk}</td>
                   <td className="num">{fmtMoney(e.capital)}</td>
                   <td className="num">{fmtMoney(e.equity)}</td>

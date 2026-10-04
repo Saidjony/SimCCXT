@@ -705,6 +705,14 @@ pub(super) fn ensure_oi(
     }
 }
 
+/// True when a real on-disk series cache exists for `symbol@tf`.
+/// The read-only diary candles API checks this first: offline with no cache
+/// must answer "no data" instead of `ensure_series`'s silent synthetic bars —
+/// fabricated history must never be served as a trader's chart.
+pub(super) fn has_series_cache(exchange: &str, symbol: &str, tf: &str, data_dir: &Path) -> bool {
+    data_dir.join(series_file(exchange, symbol, tf)).exists()
+}
+
 /// Make sure `symbol@timeframe` is loaded. Order: already in memory →
 /// disk cache → CCXT download (saved to cache) → synthetic fallback.
 /// Network is only attempted when `allow_net` (off in unit tests, and with
@@ -957,6 +965,24 @@ mod tests {
         let back = load_csv(&path).expect("load");
         assert_eq!(back.len(), 2);
         assert_eq!(back[1].close, 2.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn has_series_cache_only_sees_real_files() {
+        // The read-only diary candles API answers "no data" offline instead of
+        // letting `ensure_series` fabricate bars — this is that gate.
+        let dir = std::env::temp_dir().join(format!("simccxt-cachechk-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join(series_file("binance", "BTC/USDT", "5m")));
+        assert!(!has_series_cache("binance", "BTC/USDT", "5m", &dir));
+
+        let path = dir.join(series_file("binance", "BTC/USDT", "5m"));
+        std::fs::write(&path, "ts_ms,open,high,low,close,volume\n").expect("touch cache");
+        assert!(has_series_cache("binance", "BTC/USDT", "5m", &dir));
+        // A different exchange or timeframe must not be mistaken for a hit.
+        assert!(!has_series_cache("bybit", "BTC/USDT", "5m", &dir));
+        assert!(!has_series_cache("binance", "BTC/USDT", "1m", &dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

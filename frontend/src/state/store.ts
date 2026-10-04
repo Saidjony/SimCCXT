@@ -247,13 +247,15 @@ function loadUser(): { name: string; inChallenge: boolean } {
       const parsed = JSON.parse(raw) as { name?: unknown; inChallenge?: unknown };
       return {
         name: typeof parsed.name === "string" ? parsed.name : "",
-        inChallenge: parsed.inChallenge === true,
+        // Every session participates on the shared board now (the "видно
+        // всем" opt-in toggle is gone) — ignore the stored flag.
+        inChallenge: true,
       };
     }
   } catch {
     // private mode / corrupt data: start anonymous
   }
-  return { name: "", inChallenge: false };
+  return { name: "", inChallenge: true };
 }
 
 function persistUser(name: string, inChallenge: boolean): void {
@@ -334,7 +336,13 @@ export interface SimState {
   /** Background market-data warm-up progress for watchlist x timeframes. */
   preload: PreloadProgress;
   bgLoaded: boolean;
+  /** Drawings of the ACTIVE coin (what the charts render). */
   drawings: Drawing[];
+  /**
+   * Per-coin stash: every coin keeps its own drawings, `drawings` above is
+   * just the active coin's set (swapped in `applySnapshot` on a coin switch).
+   */
+  drawingsBySymbol: Record<string, Drawing[]>;
   tool: Tool;
   /** Selected drawing (highlight + Delete key). Null = none. */
   selectedId: string | null;
@@ -431,6 +439,7 @@ let state: SimState = {
   // Pre-load all watchlist symbols for all timeframes (background).
   bgLoaded: false,
   drawings: [],
+  drawingsBySymbol: {},
   tool: "none",
   selectedId: null,
   positionSizeUsdt: 100,
@@ -514,6 +523,15 @@ export const store = {
     fills: FillLine[] = [],
   ): void {
     const selectedExchange = EXCHANGE_IDS.includes(exchange) ? exchange : state.exchange;
+    // Coin switch: stash the active coin's drawings, pull in the incoming
+    // coin's own set (empty if never drawn on). Same coin (replay reset,
+    // reconnect, timeframe change): drawings stay untouched — they are
+    // anchored to absolute time, so they still fit the new series.
+    const switching = symbol !== state.symbol;
+    const drawingsBySymbol = switching
+      ? { ...state.drawingsBySymbol, [state.symbol]: state.drawings }
+      : state.drawingsBySymbol;
+    const drawings = switching ? (drawingsBySymbol[symbol] ?? []) : state.drawings;
     set({
       symbol,
       exchange: selectedExchange,
@@ -528,6 +546,10 @@ export const store = {
       oiPeriod,
       fills: fills.slice(0, 500),
       error: null,
+      drawings,
+      drawingsBySymbol,
+      // A selection points into the stashed set: drop it when coins change.
+      selectedId: switching ? null : state.selectedId,
     });
     persistExchange(selectedExchange);
   },
