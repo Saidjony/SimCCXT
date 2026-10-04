@@ -98,6 +98,7 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
   zone: "2 клика — углы прямоугольника · drag — двигать",
   position: "3 клика — вход, стоп, тейк · drag — двигать",
   ruler: "2 клика — замер-прямоугольник (гаснет через 4 с)",
+  note: "1 клик — текстовая заметка в этой точке · drag — двигать",
 };
 
 /**
@@ -943,6 +944,12 @@ export function Chart(): JSX.Element {
       if (active === "ray") {
         store.addDrawing({ kind: "ray", t0: t, price, color: "#4a9ec4", title: "луч " + price.toFixed(1) });
         store.setTool("none");
+      } else if (active === "note") {
+        const text = window.prompt("Текст заметки:", "");
+        if (text && text.trim()) {
+          store.addDrawing({ kind: "note", t0: t, price, color: "#e0af68", title: text.trim() });
+        }
+        store.setTool("none");
       } else if (active === "vline") {
         const dt = new Date(t);
         const hh = String(dt.getUTCHours()).padStart(2, "0");
@@ -1022,6 +1029,7 @@ export function Chart(): JSX.Element {
       case "vline": return { t: d.t, p: 0 };
       case "zone": return { t: Math.min(d.t1, d.t2), p: Math.max(d.p1, d.p2) };
       case "position": return { t: Math.min(d.t1, d.t2), p: d.entry };
+      case "note": return { t: d.t0, p: d.price };
     }
   }
 
@@ -1064,6 +1072,9 @@ export function Chart(): JSX.Element {
     if (o.kind === "ray") {
       store.updateDrawing(drag.id, (x) =>
         x.kind === "ray" ? { ...x, t0: snapTime(rows, o.t0 + dT), price: o.price + dP } : x);
+    } else if (o.kind === "note") {
+      store.updateDrawing(drag.id, (x) =>
+        x.kind === "note" ? { ...x, t0: snapTime(rows, o.t0 + dT), price: o.price + dP } : x);
     } else if (o.kind === "vline") {
       store.updateDrawing(drag.id, (x) =>
         x.kind === "vline" ? { ...x, t: snapTime(rows, o.t + dT) } : x);
@@ -1228,6 +1239,21 @@ export function Chart(): JSX.Element {
           }}
           {...handlers}
         />
+      );
+    }
+    if (d.kind === "note") {
+      const x = xFor(d.t0);
+      const y = yFor(d.price);
+      if (x === null || y === null) return null;
+      return (
+        <div
+          key={d.id + (ghost ? "-g" : "")}
+          className={"ov-note" + sel + (ghost ? " ghost" : "")}
+          style={{ left: x, top: y + 8 }}
+          {...handlers}
+        >
+          {d.title}
+        </div>
       );
     }
     return positionOverlay(d, ghost);

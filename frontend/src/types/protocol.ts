@@ -161,6 +161,9 @@ export interface DiaryData {
   timeframe?: string;
   exchange?: string;
   range?: ReplayWindow;
+  /** Visual context the trader published (see ClientMessage 'diary_meta'). */
+  drawings?: Array<Record<string, unknown>>;
+  criteria?: Record<string, string[]>;
 }
 
 /** One row of `GET /api/traders`. */
@@ -244,6 +247,14 @@ export type ClientMessage =
     }
   | { type: "cancel_order"; order_id: string; symbol: string; request_id?: string }
   | { type: "close_position"; symbol: string; quantity?: number | null; request_id?: string }
+  // Visual context of this session (annotations + enabled criteria) published
+  // to the server so the read-only diary API can surface them.
+  | {
+      type: "diary_meta";
+      drawings?: Array<Record<string, unknown>>;
+      criteria?: Record<string, string[]>;
+      request_id?: string;
+    }
   | {
       type: "replay";
       action: "play" | "pause" | "step" | "reset" | "set_speed" | "set_step";

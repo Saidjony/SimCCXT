@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useSimSocket } from "../websocket/useSimSocket";
-import { useSim } from "../state/store";
+import { getState, useSim } from "../state/store";
 import { ChartWorkspace } from "../chart/ChartWorkspace";
 import { ReplayControls } from "../components/ReplayControls";
 import { TopbarTools } from "./TopbarTools";
@@ -9,7 +9,7 @@ import { ChallengeCard } from "../components/ChallengeCard";
 import { OrderPanel } from "../components/OrderPanel";
 import { BottomTerminal } from "../components/Panels";
 import type { ExchangeId } from "../types/protocol";
-import { subscribeSim } from "../websocket/connection";
+import { subscribeSim, sendSim } from "../websocket/connection";
 import { store } from "../state/store";
 
 /** Connection + data-age badge: "connected · data 2s ago" vs "connecting…". */
@@ -38,6 +38,21 @@ function ConnBadge(): JSX.Element {
 /** Small components, one job each. No business logic: Rust decides. */
 export function TradingTerminal(): JSX.Element {
   useSimSocket();
+  // Publish this session's visual context (drawings + enabled criteria) so
+  // the read-only diary API can surface them later.
+  useEffect(() => {
+    const push = (): void => {
+      const s = getState();
+      sendSim({
+        type: "diary_meta",
+        drawings: s.drawings as unknown as Array<Record<string, unknown>>,
+        criteria: s.chartCriteria,
+      });
+    };
+    push();
+    const id = window.setInterval(push, 4000);
+    return () => window.clearInterval(id);
+  }, []);
   const error = useSim((s) => s.error);
   const serverNick = useSim((s) => s.serverNick);
   const symbol = useSim((s) => s.symbol);
@@ -45,6 +60,23 @@ export function TradingTerminal(): JSX.Element {
   const exchange = useSim((s) => s.exchange);
 
   // Resizable side rail width (px), persisted across reloads.
+  const [sideHidden, setSideHidden] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("simccxt.side-hidden") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleSide = (): void => {
+    setSideHidden((h) => {
+      try {
+        localStorage.setItem("simccxt.side-hidden", h ? "0" : "1");
+      } catch {
+        /* ignore */
+      }
+      return !h;
+    });
+  };
   const [sideWidth, setSideWidth] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem("simccxt.side-width"));
@@ -103,6 +135,14 @@ export function TradingTerminal(): JSX.Element {
         {serverNick && <span className="nick-badge">вы: {serverNick}</span>}
         <TopbarTools />
         <ReplayControls />
+        <button
+          className="btn b-dim side-toggle"
+          onClick={toggleSide}
+          title={sideHidden ? "Показать боковую панель" : "Скрыть боковую панель"}
+          aria-label="Скрыть/показать боковую панель"
+        >
+          ☰
+        </button>
         {error && <span className="err">{error}</span>}
       </header>
       <div className="toprow">
@@ -110,16 +150,20 @@ export function TradingTerminal(): JSX.Element {
           <ChartWorkspace />
         </main>
         {/* Draggable width handle between the chart workspace and the side rail */}
-        <div className="side-resizer" onMouseDown={startSideResize} />
+        {!sideHidden && (
+          <div className="side-resizer" onMouseDown={startSideResize} />
+        )}
+        {!sideHidden && (
         <aside
           className="side"
           ref={sideRef as React.MutableRefObject<HTMLElement | null>}
           style={{ width: sideWidth, flex: `0 0 ${sideWidth}px` }}
         >
+          <OrderPanel />
           <CoinList />
           <ChallengeCard />
-          <OrderPanel />
         </aside>
+        )}
       </div>
       <div className="bottom">
         <BottomTerminal />

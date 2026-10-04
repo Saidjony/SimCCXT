@@ -13,6 +13,7 @@ import {
   overallR,
   safeStats,
 } from "../trade/diary";
+import { criterionLabel } from "../trade/criteria";
 
 interface SortState {
   by: "time" | "r" | "pnl";
@@ -208,6 +209,33 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
         note={candleError}
         selectedRef={selectedRef}
       />
+
+      {(diary.criteria && Object.keys(diary.criteria).length > 0 || Boolean(diary.drawings?.length)) && (
+        <div className="diary-meta">
+          <div className="lbl">Контекст графиков трейдера</div>
+          {diary.criteria && Object.keys(diary.criteria).length > 0 && (
+            <div className="diary-criteria">
+              {Object.entries(diary.criteria).map(([key, ids]) => (
+                <div key={key} className="diary-criteria-row">
+                  <span className="lbl">{key}:</span>
+                  {ids.map((id) => (
+                    <span key={id} className="chip">✓ {criterionLabel(id)}</span>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+          {diary.drawings && diary.drawings.length > 0 && (
+            <div className="diary-drawings">
+              {diary.drawings.map((d, i) => (
+                <span key={i} className="chip">
+                  {String(d["kind"] ?? "?")}: {String(d["title"] ?? "").slice(0, 48)}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {positions.length > 0 && (
         <table className="grid-table diary-table">

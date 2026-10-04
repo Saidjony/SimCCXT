@@ -29,6 +29,14 @@ export function OrderPanel(): JSX.Element {
   const fixedRiskUsdt = useSim((s) => s.fixedRiskUsdt);
   const inChallenge = useSim((s) => s.inChallenge);
   const base = symbol.split("/")[0] ?? "";
+  const positions = useSim((s) => s.account?.positions ?? []);
+  const openPos = positions.find((p) => p.symbol === symbol && p.qty > 0);
+  const openQty = openPos ? openPos.qty : 0;
+  const openSide = openPos && openPos.side === "short" ? "SHORT" : openPos ? "LONG" : "";
+  const closeMarket = (): void => {
+    if (!openPos) return;
+    sendSim({ type: "close_position", symbol, quantity: null, request_id: nextRequestId() });
+  };
 
   const [kind, setKind] = useState<EntryKind>("market");
   const [price, setPrice] = useState("");
@@ -177,6 +185,15 @@ export function OrderPanel(): JSX.Element {
         <button className="btn b-green" disabled={!ready || !validLongStop} onClick={() => send("buy")}>BUY</button>
         <button className="btn b-red" disabled={!ready || !validShortStop} onClick={() => send("sell")}>SELL</button>
       </div>
+      {openPos && (
+        <button
+          className="btn b-red close-market-btn"
+          title={`Закрыть ${openQty} ${base} по рынку`}
+          onClick={closeMarket}
+        >
+          ✕ закрыть {openSide} {openQty} {base} по рынку
+        </button>
+      )}
       <div className="status">{inChallenge ? `${preview} · риск за раунд зафиксирован` : preview}</div>
       {error && <div className="err">{error}</div>}
     </div>

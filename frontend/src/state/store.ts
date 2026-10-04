@@ -23,16 +23,18 @@ export type Drawing =
   | { id: string; kind: "ray"; t0: number; price: number; color: string; title: string }
   | { id: string; kind: "vline"; t: number; color: string; title: string }
   | { id: string; kind: "zone"; t1: number; p1: number; t2: number; p2: number; color: string; title: string }
-  | { id: string; kind: "position"; t1: number; t2: number; entry: number; sl: number; tp: number; color: string; title: string };
+  | { id: string; kind: "position"; t1: number; t2: number; entry: number; sl: number; tp: number; color: string; title: string }
+  | { id: string; kind: "note"; t0: number; price: number; color: string; title: string };
 
-export type Tool = "none" | "ray" | "vline" | "zone" | "position" | "ruler";
+export type Tool = "none" | "ray" | "vline" | "zone" | "position" | "ruler" | "note";
 
 /** A drawing without its id (id is assigned by the store). Distributive over the union. */
 export type NewDrawing =
   | { kind: "ray"; t0: number; price: number; color: string; title: string }
   | { kind: "vline"; t: number; color: string; title: string }
   | { kind: "zone"; t1: number; p1: number; t2: number; p2: number; color: string; title: string }
-  | { kind: "position"; t1: number; t2: number; entry: number; sl: number; tp: number; color: string; title: string };
+  | { kind: "position"; t1: number; t2: number; entry: number; sl: number; tp: number; color: string; title: string }
+  | { kind: "note"; t0: number; price: number; color: string; title: string };
 
 // ---------------------------------------------------------------------------
 // Watchlist: the right-panel coin list. Persisted per browser (localStorage);
@@ -76,7 +78,9 @@ const SYMBOL_RE = /^[A-Z0-9]{2,12}\/[A-Z0-9]{2,12}$/;
 function defaultReplayWindow(): ReplayWindow {
   const end = Date.now();
   const day = 24 * 60 * 60_000;
-  return { start_ms: end - 3 * day, reveal_start_ms: end - 2 * day, end_ms: end };
+  // Two months of context; the first month is pre-revealed and the last
+  // month is what the replay acts on tick by tick.
+  return { start_ms: end - 60 * day, reveal_start_ms: end - 30 * day, end_ms: end };
 }
 
 function loadReplayWindow(): ReplayWindow {

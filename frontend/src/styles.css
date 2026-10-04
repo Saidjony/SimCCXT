@@ -155,6 +155,8 @@ body {
 .pill.dim { background: #2a3342; color: var(--muted); font-weight: 600; }
 .btn-sm { padding: 3px 10px; font-size: 12px; }
 .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.close-market-btn { display: block; width: 100%; margin-top: 6px; font-weight: 600; letter-spacing: 0.2px; }
+.side-toggle { padding: 3px 9px; }
 .card {
   background: linear-gradient(180deg, #161e2b 0%, var(--panel) 100%);
   border: 1px solid var(--line);
@@ -344,6 +346,14 @@ td, th { padding: 3px 4px; }
 .ov-vline.selected { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
 .ov-pos.selected { box-shadow: 0 0 0 2px var(--accent); }
 .ov-zone.ghost, .ov-pos.ghost { opacity: 0.55; pointer-events: none; }
+.ov-note {
+  position: absolute; z-index: 5; cursor: move;
+  background: rgba(224, 175, 104, 0.18); color: var(--text);
+  border: 1px solid #e0af68; border-radius: 4px;
+  padding: 2px 6px; font-size: 11px; white-space: nowrap; max-width: 220px;
+}
+.ov-note.selected { border-color: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.ov-note.ghost { opacity: 0.55; pointer-events: none; }
 .ov-ruler-box {
   position: absolute; z-index: 4; pointer-events: none;
   border: 2px solid var(--accent); background: rgba(74, 158, 196, 0.12); border-radius: 2px;
@@ -512,6 +522,11 @@ td, th { padding: 3px 4px; }
 .mini-drawing {
   position: absolute; box-sizing: border-box; pointer-events: none;
 }
+.mini-note {
+  background: rgba(224, 175, 104, 0.2); color: var(--text);
+  border: 1px solid #e0af68; border-radius: 4px;
+  padding: 1px 5px; white-space: nowrap; max-width: 160px; overflow: hidden;
+}
 .mini-ray { height: 0; border-top: 2px dashed; }
 .mini-vline { top: 0; bottom: 26px; width: 2px; opacity: 0.85; }
 .mini-zone {
@@ -594,6 +609,9 @@ td, th { padding: 3px 4px; }
 .diary-table tbody tr.sel { background: rgba(74, 158, 196, 0.15); }
 .diary-table th.sortable { cursor: pointer; user-select: none; }
 .diary-table tbody tr { cursor: pointer; }
+.diary-meta { margin: 0 0 14px; display: flex; flex-direction: column; gap: 6px; }
+.diary-criteria, .diary-drawings { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.diary-criteria-row { display: flex; align-items: center; gap: 5px; }
 @media (max-width: 720px) {
   .toprow { height: auto; min-height: 0; flex-direction: column; }
   .main { min-height: 100vh; }

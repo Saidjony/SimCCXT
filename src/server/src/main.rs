@@ -201,6 +201,15 @@ enum ClientCmd {
         timestamp_ms: Option<i64>,
         request_id: Option<String>,
     },
+    /// Client pushes its visual context (drawings + enabled criteria) so the
+    /// read-only diary API can surface it later. Captured verbatim.
+    DiaryMeta {
+        #[serde(default)]
+        drawings: Option<Vec<serde_json::Value>>,
+        #[serde(default)]
+        criteria: Option<serde_json::Map<String, serde_json::Value>>,
+        request_id: Option<String>,
+    },
     Ping,
 }
 
@@ -316,6 +325,7 @@ struct Session {
     capital_usdt: f64,
     pending_protections: Vec<PendingProtection>,
     active_protections: Vec<(String, String, String)>,
+    diary_meta: serde_json::Value, // client-pushed drawings/criteria to show in the diary
     oi: Vec<(i64, f64)>, // open-interest history (ts_ms, USDT value), context only
     oi_period: String, // OI grid actually loaded ("5m", "" when none)
     oi_fed: usize,
@@ -505,7 +515,7 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "candles": rows,
         "account": s.ex.account_snapshot(),
         "replay": replay_json(s),
-        "oi": s.oi.iter().filter(|(ts, _)| *ts <= s.ex.now_ms()).collect::<Vec<_>>(),
+        "oi": s.oi.clone(),
         "oi_period": s.oi_period,
         "fills": s.ex.fetch_fills(None, Some(500)),
         "request_id": request_id,
@@ -690,6 +700,7 @@ fn new_session(nick: String) -> Session {
         capital_usdt: 0.0,
         pending_protections: Vec::new(),
         active_protections: Vec::new(),
+        diary_meta: json!({"drawings": [], "criteria": {}}),
         oi: Vec::new(),
         oi_period: String::new(),
         oi_fed: 0,
@@ -736,7 +747,7 @@ fn use_series(
         start_ms.saturating_add((step_ms as i64).saturating_mul(20))
     });
     let end_ms = end_ms.unwrap_or(last_ms);
-    let (mut start_ms, mut reveal_start_ms, end_ms) = if !allow_net && !rows.is_empty() {
+    let (start_ms, reveal_start_ms, end_ms) = if !allow_net && !rows.is_empty() {
         let loaded_start = rows.first().map(|row| row[0] as i64).unwrap_or(last_ms);
         let loaded_end = last_ms;
         if start_ms < loaded_start || end_ms > loaded_end {
@@ -764,22 +775,6 @@ fn use_series(
     } else {
         (start_ms, reveal_start_ms, end_ms)
     };
-    // The OI overlay is part of the chart context — it must be visible from
-    // the very first frame. When the OI cache starts later than the series
-    // start, begin the replay window AT the first available OI point
-    // (otherwise the window ahead is OI-silent, which reads as "нет данных").
-    if let Some((first_oi, _)) = s.oi.first() {
-        let first_oi = *first_oi;
-        if first_oi > start_ms && first_oi < end_ms {
-            log!(
-                "[engine] {exchange} {symbol} {timeframe}: OI starts at {first_oi} — shift replay start"
-            );
-            start_ms = first_oi;
-            if reveal_start_ms < start_ms {
-                reveal_start_ms = start_ms + 20 * step_ms as i64;
-            }
-        }
-    }
     ensure_series_window(
         &mut s.ex,
         SeriesRequest {
@@ -878,6 +873,29 @@ impl Engine {
         // re-broadcast to everyone after the directed events go out.
         let mut board_push = false;
         match cmd {
+            ClientCmd::DiaryMeta { drawings, criteria, request_id } => {
+                let s = self.session(to);
+                // Bound size so a misbehaving client can't bloat the session.
+                let mut meta = s.diary_meta.clone();
+                if let Some(d) = drawings {
+                    meta["drawings"] = serde_json::Value::Array(d.into_iter().take(64).collect());
+                }
+                if let Some(c) = criteria {
+                    const MAX_KEYS: usize = 32;
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in c.into_iter().take(MAX_KEYS) {
+                        if k.len() <= 32 {
+                            let list = v.as_array().map(|a| a.iter().take(16).cloned().collect::<Vec<_>>());
+                            if let Some(list) = list {
+                                map.insert(k, serde_json::Value::Array(list));
+                            }
+                        }
+                    }
+                    meta["criteria"] = serde_json::Value::Object(map);
+                }
+                s.diary_meta = meta;
+                let _ = request_id;
+            }
             ClientCmd::Ping => {
                 evs.push(json!({ "type": "pong" }));
             }
@@ -1385,6 +1403,10 @@ impl Engine {
                 "capital_usdt": s.capital_usdt,
                 "equity": equity,
                 "in_challenge": s.in_challenge,
+                // Client-pushed visual context: annotations the trader made on
+                // the charts + the criteria they enabled, for the review page.
+                "drawings": s.diary_meta["drawings"].clone(),
+                "criteria": s.diary_meta["criteria"].clone(),
                 // Context for the chart: which series the diary page should
                 // load candles for (session's current selection).
                 "symbol": s.symbol,

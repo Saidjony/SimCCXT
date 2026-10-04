@@ -49,6 +49,16 @@ function RulerIcon(): JSX.Element {
   );
 }
 
+function NoteIcon(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M4 5h16v12H9l-5 4V5z" />
+      <line x1="8" y1="10" x2="16" y2="10" />
+      <line x1="8" y1="13" x2="13" y2="13" />
+    </svg>
+  );
+}
+
 function TrashIcon(): JSX.Element {
   return (
     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
@@ -66,6 +76,7 @@ const TOOLS: { id: Exclude<Tool, "none">; title: string; Icon: () => JSX.Element
   { id: "zone", title: "Зона-прямоугольник (2 клика)", Icon: ZoneIcon },
   { id: "position", title: "Позиция long/short + TP/SL (3 клика: вход, стоп, тейк)", Icon: PositionIcon },
   { id: "ruler", title: "Линейка (2 клика, гаснет)", Icon: RulerIcon },
+  { id: "note", title: "Текстовая заметка (1 клик)", Icon: NoteIcon },
 ];
 
 /** Drawing toolbar docked top-right inside the chart. Icon-only buttons. */

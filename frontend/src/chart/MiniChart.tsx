@@ -1,13 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ColorType, CrosshairMode, createChart } from "lightweight-charts";
 import type { AutoscaleInfo, IChartApi, ISeriesApi, UTCTimestamp } from "lightweight-charts";
-import type { CandleRow, ServerMessage } from "../types/protocol";
-import { parseServerMessage } from "../types/protocol";
+import type { CandleRow } from "../types/protocol";
 import type { Drawing } from "../state/store";
 import { chartCriteriaKey, useSim } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import { nearestCandleTime } from "./overlays";
-import { wsUrl } from "../websocket/connection";
 import { ChartCriteriaPicker } from "./ChartCriteriaPicker";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 
@@ -33,21 +31,19 @@ export function MiniChart({
   mainTimeframe,
 }: Props): JSX.Element {
   const symbol = useSim((s) => s.symbol);
-  const exchange = useSim((s) => s.exchange);
-  const replayWindow = useSim((s) => s.replayWindow);
-  const replayNow = useSim((s) => s.replay.now_ms);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const applyingCrosshairRef = useRef(false);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
-  const replayNowRef = useRef(replayNow);
-  const lastSyncedBucketRef = useRef<number | null>(null);
-  const lastMainTimeframeRef = useRef(mainTimeframe);
-  replayNowRef.current = replayNow;
-  const [candles, setCandles] = useState<CandleRow[]>([]);
-  const [status, setStatus] = useState("Загрузка…");
+  // Data source: the SHARED session's candle buffer, aggregated into this
+  // pane's timeframe. This is what keeps every pane on the same clock and
+  // price (main + minis read from one store instead of three sessions).
+  const candlesBase = useSim((s) => s.candles);
+  const candles = useMemo(
+    () => aggregateCandles(candlesBase, timeframeMs(timeframe)),
+    [candlesBase, timeframe],
+  );
   const [viewTick, setViewTick] = useState(0);
   const drawings = useSim((s) => s.drawings);
   const drawingsRef = useRef(drawings);
@@ -182,102 +178,28 @@ export function MiniChart({
       value: amount,
       color: close >= open ? "rgba(61, 154, 80, 0.45)" : "rgba(212, 102, 102, 0.45)",
     })));
-    chartRef.current?.timeScale().scrollToRealTime();
+    // Few aggregated bars (early replay on a higher pane timeframe): spread
+    // them across the pane instead of pinning one bar at the right edge.
+    if (candles.length > 0 && candles.length < 25) {
+      chartRef.current?.timeScale().fitContent();
+    } else {
+      chartRef.current?.timeScale().scrollToRealTime();
+    }
   }, [candles]);
 
-  useEffect(() => {
-    let socket: WebSocket | null = null;
-    let retryTimer = 0;
-    let disposed = false;
-    let retryDelay = 1_000;
-    setCandles([]);
-    setStatus("Загрузка…");
+  const [, tickSetViewTick] = useState(0);
+  void tickSetViewTick;
 
-    const connect = (): void => {
-      if (disposed) return;
-      socket = new WebSocket(wsUrl());
-      socketRef.current = socket;
-      socket.onopen = () => {
-        if (disposed) {
-          socket?.close();
-          return;
-        }
-        retryDelay = 1_000;
-        setStatus("Подключено");
-      };
-      socket.onmessage = (event: MessageEvent<string>) => {
-        if (disposed) return;
-        const message = parseServerMessage(String(event.data));
-        if (!message) return;
-        if (message.type === "welcome") {
-          socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange, ...replayWindow }));
-          const now = replayNowRef.current;
-          lastSyncedBucketRef.current = Math.floor(now / timeframeMs(timeframe));
-          lastMainTimeframeRef.current = mainTimeframe;
-          if (now > 0) {
-            socket?.send(JSON.stringify({ type: "replay", action: "reset", timestamp_ms: now }));
-            socket?.send(JSON.stringify({ type: "replay", action: "pause" }));
-            socket?.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange, ...replayWindow }));
-          }
-        } else if (message.type === "snapshot") {
-          if (message.symbol !== symbol || message.timeframe !== timeframe ||
-              (message.type === "snapshot" && (message.exchange ?? "binance") !== exchange)) return;
-          setCandles(message.candles);
-          setStatus("");
-        } else if (
-          message.type === "candle" &&
-          message.symbol === symbol &&
-          message.timeframe === timeframe &&
-          (message.exchange === undefined || message.exchange === exchange)
-        ) {
-          setCandles((previous) => applyCandle(previous, message));
-        } else if (message.type === "error") {
-          setStatus(message.message);
-        }
-      };
-      socket.onclose = () => {
-        if (disposed) return;
-        setStatus("Переподключение…");
-        retryTimer = window.setTimeout(connect, retryDelay);
-        retryDelay = Math.min(retryDelay * 2, 10_000);
-      };
-      socket.onerror = () => socket?.close();
-    };
-    connect();
+  useEffect(() => {
+    let disposed = false;
+    const id = window.setInterval(() => {
+      if (!disposed) setViewTick((t) => t + 1);
+    }, 1000);
     return () => {
       disposed = true;
-      window.clearTimeout(retryTimer);
-      if (socket?.readyState === WebSocket.CONNECTING) {
-        // Close after the handshake to avoid a spurious browser warning.
-      } else {
-        socket?.close();
-      }
-      socketRef.current = null;
+      window.clearInterval(id);
     };
-  }, [symbol, timeframe, exchange, replayWindow.start_ms, replayWindow.reveal_start_ms, replayWindow.end_ms]);
-
-  useEffect(() => {
-    if (replayNow <= 0) return;
-    const bucket = Math.floor(replayNow / timeframeMs(timeframe));
-    const mainTimeframeChanged = lastMainTimeframeRef.current !== mainTimeframe;
-    if (lastSyncedBucketRef.current === bucket && !mainTimeframeChanged) return;
-    lastSyncedBucketRef.current = bucket;
-    lastMainTimeframeRef.current = mainTimeframe;
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: "replay", action: "reset", timestamp_ms: replayNow }));
-    socket.send(JSON.stringify({ type: "replay", action: "pause" }));
-    socket.send(JSON.stringify({ type: "subscribe", symbol, timeframe, exchange, ...replayWindow }));
-  }, [
-    replayNow,
-    symbol,
-    timeframe,
-    mainTimeframe,
-    exchange,
-    replayWindow.start_ms,
-    replayWindow.reveal_start_ms,
-    replayWindow.end_ms,
-  ]);
+  }, []);
 
   const selectedCriteria = useSim((s) => s.chartCriteria[chartCriteriaKey(s.symbol, timeframe)] ?? []);
   void viewTick;
@@ -374,6 +296,7 @@ function drawingTimeBounds(drawing: Drawing): [number, number] {
     case "vline": return [drawing.t, drawing.t];
     case "zone":
     case "position": return [drawing.t1, drawing.t2];
+    case "note": return [drawing.t0, drawing.t0];
   }
 }
 
@@ -383,6 +306,7 @@ function drawingPrices(drawing: Drawing): number[] {
     case "vline": return [];
     case "zone": return [drawing.p1, drawing.p2];
     case "position": return [drawing.entry, drawing.sl, drawing.tp];
+    case "note": return [drawing.price];
   }
 }
 
@@ -398,12 +322,41 @@ function timeframeMs(timeframe: string): number {
   }
 }
 
-function applyCandle(rows: CandleRow[], message: Extract<ServerMessage, { type: "candle" }>): CandleRow[] {
-  const candle = message.candle;
-  const last = rows[rows.length - 1];
-  if (!last || candle[0] > last[0]) return [...rows, candle];
-  if (candle[0] === last[0]) return [...rows.slice(0, -1), candle];
-  return rows;
+/**
+ * Aggregate the shared source bars (main timeframe) into the pane's timeframe
+ * buckets. Buckets align to target-step boundaries; the latest bucket is
+ * always the "now" one, so its close equals the main chart's last close —
+ * keeping all panes' last price identical.
+ */
+function aggregateCandles(rows: CandleRow[], stepMs: number): CandleRow[] {
+  if (stepMs <= 0 || rows.length === 0) return rows;
+  const out: CandleRow[] = [];
+  let bucketStart = -1;
+  let o = 0;
+  let h = 0;
+  let l = 0;
+  let c = 0;
+  let v = 0;
+  for (const row of rows) {
+    const ts = row[0];
+    const bucket = Math.floor(ts / stepMs) * stepMs;
+    if (bucket !== bucketStart) {
+      if (bucketStart >= 0) out.push([bucketStart, o, h, l, c, v]);
+      bucketStart = bucket;
+      o = row[1];
+      h = row[2];
+      l = row[3];
+      c = row[4];
+      v = row[5];
+    } else {
+      h = Math.max(h, row[2]);
+      l = Math.min(l, row[3]);
+      c = row[4];
+      v += row[5];
+    }
+  }
+  if (bucketStart >= 0) out.push([bucketStart, o, h, l, c, v]);
+  return out;
 }
 
 function drawOnMiniChart(
@@ -435,6 +388,14 @@ function drawOnMiniChart(
     return <div key={drawing.id} className="mini-drawing mini-ray" style={{
       left, top, width: Math.max(0, host.clientWidth - left), borderColor: drawing.color,
     }} title={drawing.title} />;
+  }
+  if (drawing.kind === "note") {
+    const left = x(drawing.t0);
+    const top = y(drawing.price);
+    if (left === null || top === null || left > host.clientWidth || top > host.clientHeight) return null;
+    return <div key={drawing.id} className="mini-drawing mini-note" style={{
+      left, top: top + 8, borderColor: drawing.color,
+    }}>{drawing.title}</div>;
   }
   if (drawing.kind === "vline") {
     const left = x(drawing.t);

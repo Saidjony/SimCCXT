@@ -416,8 +416,18 @@ fn download_series_window(
 }
 
 fn window_file(exchange: &str, symbol: &str, tf: &str, start_ms: i64, end_ms: i64) -> String {
-    let base = binance_file(symbol, tf).trim_end_matches(".csv").to_string();
-    format!("{exchange}_{base}_{start_ms}_{end_ms}.csv")
+    // Cache key aligned to day boundaries: a client asking for "now-60d"
+    // must hit the same file on every reconnect, otherwise each subscribe
+    // re-downloads the whole window (the raw ms differ per request).
+    const DAY_MS: i64 = 86_400_000;
+    let key_start = start_ms.div_euclid(DAY_MS) * DAY_MS;
+    let key_end = end_ms.div_euclid(DAY_MS) * DAY_MS + DAY_MS;
+    let base = binance_file(symbol, tf)
+        .trim_end_matches(".csv")
+        .to_string();
+    format!(
+        "{exchange}_{base}_{key_start}_{key_end}.csv",
+    )
 }
 
 /// Load enough history for the requested window, fetching and caching an
@@ -453,7 +463,11 @@ pub(super) fn ensure_series_window(
     let candles = if let Some(candles) = load_csv(&path) {
         candles
     } else {
-        let candles = download_series_window(exchange, symbol, timeframe, start_ms, end_ms)?;
+        // Download the day-aligned window: the cache key is normalized in
+        // `window_file`, so every reconnect of the same window hits it.
+        let key_start = start_ms.div_euclid(86_400_000) * 86_400_000;
+        let key_end = end_ms.div_euclid(86_400_000) * 86_400_000 + 86_400_000;
+        let candles = download_series_window(exchange, symbol, timeframe, key_start, key_end)?;
         save_csv(&path, &candles)?;
         candles
     };
@@ -665,10 +679,9 @@ pub(super) fn ensure_oi(
     oi.clear();
     oi_period_out.clear();
     let Some(period) = oi_period(tf) else { return };
-    if oi_known_missing(exchange, symbol, tf, data_dir) {
-        log!("[engine] {exchange} {symbol} OI@{period}: none available (known)");
-        return;
-    }
+    // Note: an exact `_none` sentinel does NOT short-circuit here — a
+    // denser-cache fallback below may still deliver real points, and only
+    // downloading is pointless when we know the source won't serve it.
     let path = data_dir.join(oi_file(exchange, symbol, period));
     if let Some(rows) = load_pairs_csv(&path) {
         log!(
@@ -678,6 +691,22 @@ pub(super) fn ensure_oi(
         );
         *oi = rows;
         *oi_period_out = period.to_string();
+        return;
+    }
+    // Exact cache missing (or sentinel): derive a usable overlay from the
+    // coarsest finer-grained cached period. OI is chart context —real points
+    // from a denser cache beat "нет данных" for a whole timeframe.
+    if let Some((sub, rows)) = coarsest_finer_cached_oi(exchange, symbol, period, data_dir) {
+        log!(
+            "[engine] {exchange} {symbol} OI@{period}: derived from {sub} cache ({} pts)",
+            rows.len()
+        );
+        *oi = rows;
+        *oi_period_out = period.to_string();
+        return;
+    }
+    if oi_known_missing(exchange, symbol, tf, data_dir) {
+        log!("[engine] {exchange} {symbol} OI@{period}: none available (known)");
         return;
     }
     if allow_net {
@@ -711,6 +740,31 @@ pub(super) fn ensure_oi(
 /// fabricated history must never be served as a trader's chart.
 pub(super) fn has_series_cache(exchange: &str, symbol: &str, tf: &str, data_dir: &Path) -> bool {
     data_dir.join(series_file(exchange, symbol, tf)).exists()
+}
+
+/// Closest finer-grained cached OI series for `exchange/symbol` that can
+/// stand in for `period`. Order of preference: coarser sub-periods first
+/// (15m beats 5m for a 1h target — denser rows noisily clutter the pane).
+fn coarsest_finer_cached_oi(
+    exchange: &str,
+    symbol: &str,
+    period: &str,
+    data_dir: &Path,
+) -> Option<(&'static str, Vec<(i64, f64)>)> {
+    let target_step = tf_step_ms(period);
+    for sub_period in ["4h", "1h", "15m", "5m"] {
+        let sub_step = tf_step_ms(sub_period);
+        if sub_step >= target_step {
+            continue;
+        }
+        let path = data_dir.join(oi_file(exchange, symbol, sub_period));
+        if let Some(rows) = load_pairs_csv(&path) {
+            if !rows.is_empty() {
+                return Some((sub_period, rows));
+            }
+        }
+    }
+    None
 }
 
 /// Make sure `symbol@timeframe` is loaded. Order: already in memory →
@@ -926,6 +980,23 @@ mod tests {
     fn tf_steps_known() {
         assert_eq!(tf_step_ms("1m"), 60_000);
         assert_eq!(tf_step_ms("1h"), 3_600_000);
+    }
+
+    #[test]
+    fn oi_falls_back_to_finer_cached_period() {
+        // ETH/USDT has no real 1h OI cache (only a `_none` sentinel), but its
+        // 15m cache is real history — the 1h pane must derive from it.
+        let dir = std::env::temp_dir().join(format!("simccxt-oifallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows: Vec<(i64, f64)> = (0..5).map(|i| (1_789_000_000_000 + i * 900_000, 100.0 + i as f64)).collect();
+        save_pairs_csv(&dir.join(oi_file("binance", "ETH/USDT", "15m")), &rows).expect("save");
+        let (period, loaded) =
+            coarsest_finer_cached_oi("binance", "ETH/USDT", "1h", &dir).expect("fallback exists");
+        assert_eq!(period, "15m");
+        assert_eq!(loaded.len(), 5);
+        // 5m target: 15m is coarser, so no fallback.
+        assert!(coarsest_finer_cached_oi("binance", "ETH/USDT", "5m", &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
