@@ -54,6 +54,8 @@ use tokio::sync::{broadcast, oneshot};
 //
 
 mod diary;
+#[cfg(test)]
+mod diary_scenarios;
 // Frontend -> Rust ("type" tagged):
 //   {"type":"subscribe","symbol":"BTC/USDT","timeframe":"1m",
 //    "exchange":"binance","request_id":".."}
