@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use simccxt_core::{Position, PositionSide, Side, Symbol};
@@ -85,14 +86,28 @@ impl Portfolio {
 
     /// Apply a fill to the portfolio, returning the realized PnL from this fill.
     pub fn apply_fill(&mut self, symbol: &Symbol, side: Side, amount: f64, price: f64) -> f64 {
+        self.apply_fill_at(symbol, side, amount, price, None)
+    }
+
+    /// Same, but stamping the position's open time (`opened_at`, epoch ms) when
+    /// the fill opens (or flips) it. The open time survives adds and partial
+    /// closes — it is what "откуда заходил" means on the chart.
+    pub fn apply_fill_at(
+        &mut self,
+        symbol: &Symbol,
+        side: Side,
+        amount: f64,
+        price: f64,
+        opened_at_ms: Option<i64>,
+    ) -> f64 {
         assert!(amount >= 0.0, "fill amount must be non-negative");
         if amount == 0.0 {
             return 0.0;
         }
 
         let realized = match side {
-            Side::Buy => self.apply_buy(symbol, amount, price),
-            Side::Sell => self.apply_sell(symbol, amount, price),
+            Side::Buy => self.apply_buy(symbol, amount, price, opened_at_ms),
+            Side::Sell => self.apply_sell(symbol, amount, price, opened_at_ms),
         };
 
         // Remove flat positions.
@@ -101,12 +116,13 @@ impl Portfolio {
         realized
     }
 
-    fn apply_buy(&mut self, symbol: &Symbol, amount: f64, price: f64) -> f64 {
+    fn apply_buy(&mut self, symbol: &Symbol, amount: f64, price: f64, opened_at_ms: Option<i64>) -> f64 {
         let mut realized = 0.0;
         let key = symbol.symbol.clone();
         match self.positions.get_mut(&key) {
             None => {
-                let pos = Position::new(symbol.clone(), PositionSide::Long, amount, price, price);
+                let mut pos = Position::new(symbol.clone(), PositionSide::Long, amount, price, price);
+                pos.opened_at = DateTime::<Utc>::from_timestamp_millis(opened_at_ms.unwrap_or(0)).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
                 self.positions.insert(key, pos);
             }
             Some(pos) => {
@@ -132,6 +148,8 @@ impl Portfolio {
                         pos.side = PositionSide::Long;
                         pos.qty = remaining;
                         pos.entry_price = price;
+                        // Flip: this is a brand-new position from here on.
+                        pos.opened_at = DateTime::<Utc>::from_timestamp_millis(opened_at_ms.unwrap_or(0)).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
                     }
                 }
             }
@@ -139,12 +157,13 @@ impl Portfolio {
         realized
     }
 
-    fn apply_sell(&mut self, symbol: &Symbol, amount: f64, price: f64) -> f64 {
+    fn apply_sell(&mut self, symbol: &Symbol, amount: f64, price: f64, opened_at_ms: Option<i64>) -> f64 {
         let mut realized = 0.0;
         let key = symbol.symbol.clone();
         match self.positions.get_mut(&key) {
             None => {
-                let pos = Position::new(symbol.clone(), PositionSide::Short, amount, price, price);
+                let mut pos = Position::new(symbol.clone(), PositionSide::Short, amount, price, price);
+                pos.opened_at = DateTime::<Utc>::from_timestamp_millis(opened_at_ms.unwrap_or(0)).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
                 self.positions.insert(key, pos);
             }
             Some(pos) => {
@@ -170,6 +189,8 @@ impl Portfolio {
                         pos.side = PositionSide::Short;
                         pos.qty = remaining;
                         pos.entry_price = price;
+                        // Flip: this is a brand-new position from here on.
+                        pos.opened_at = DateTime::<Utc>::from_timestamp_millis(opened_at_ms.unwrap_or(0)).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
                     }
                 }
             }

@@ -39,6 +39,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use simccxt_core::Symbol;
 use simccxt_exchange::{CreateOrderParams, Exchange};
 use crate::market_data::{
     apply_series_window, ensure_oi, ensure_series, ensure_series_window, mark_background_net,
@@ -215,6 +216,15 @@ enum ClientCmd {
 
 fn default_exchange() -> String {
     "binance".to_string()
+}
+
+/// Same, but for values that arrive from the client: an empty string is a
+/// missing value, not a venue named "" (which would fail deep inside CCXT).
+fn exchange_or_default(raw: Option<&str>) -> String {
+    match raw {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => default_exchange(),
+    }
 }
 
 /// One unit of work for the engine thread: a command from a client, or the
@@ -613,11 +623,18 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
                 let mut rest = Vec::new();
                 for (active_symbol, active_side, active_id) in s.active_protections.drain(..) {
                     if active_symbol == symbol && active_side == protected_side {
+                        // "already gone" is normal, not an error: the sibling
+                        // may have triggered on this very bar (it was then
+                        // rejected by reduce_only), so there is nothing left
+                        // to cancel. Only real failures are worth reporting.
                         if let Err(error) = s.ex.cancel_order(&active_id, &symbol) {
-                            events.push(error_json(
-                                format!("could not cancel remaining stop {active_id}: {error}"),
-                                None,
-                            ));
+                            let text = error.to_string();
+                            if !text.contains("unknown order") {
+                                events.push(error_json(
+                                    format!("could not cancel remaining stop {active_id}: {text}"),
+                                    None,
+                                ));
+                            }
                         }
                     } else {
                         rest.push((active_symbol, active_side, active_id));
@@ -721,6 +738,17 @@ fn use_series(
     allow_net: bool,
 ) -> Result<String, String> {
     let RequestedWindow { start_ms, reveal_start_ms, end_ms } = window;
+    // "Bare" switch = the client sent no dates at all, or exactly the window
+    // the session already runs. Judged on the REQUEST (before it is resolved
+    // against the new series, whose bar grid differs per timeframe).
+    let same_window = (start_ms.is_none() && reveal_start_ms.is_none() && end_ms.is_none())
+        || (start_ms == Some(s.range_start_ms)
+            && reveal_start_ms == Some(s.reveal_start_ms)
+            && end_ms == Some(s.range_end_ms));
+    // Only a session that already runs a series may "keep its clock": on the
+    // first subscribe the clock is wall-clock initialised and must be reset
+    // onto the freshly loaded series.
+    let continuing = !s.symbol.is_empty() && !s.timeframe.is_empty();
     let reload = exchange != s.exchange
         || symbol != s.symbol
         || timeframe != s.timeframe
@@ -788,6 +816,14 @@ fn use_series(
             end_ms,
         },
     )?;
+    // `same_window` (computed from the request) decides whether this is a bare
+    // timeframe/symbol switch.
+    // Where the replay clock stood before this switch: on a bare timeframe (or
+    // symbol) change the window is unchanged, so we must NOT rewind to the
+    // reveal point — that would teleport the trader to a moment *before*
+    // their own entry (position flips, resting orders fill on stale prices,
+    // stops never trigger). Keep the time by mapping it onto the new series.
+    let prev_now = s.ex.now_ms();
     let reset_ms = apply_series_window(
         &mut s.ex,
         &symbol,
@@ -796,10 +832,20 @@ fn use_series(
         reveal_start_ms,
         end_ms,
     )?;
+    let reset_ms = if same_window && continuing && prev_now > start_ms {
+        let rows = s.ex.fetch_ohlcv(&symbol, &timeframe, None, None);
+        // Last bar at-or-before where we were, clamped into the window.
+        let keep = rows
+            .iter()
+            .rev()
+            .find(|row| (row[0] as i64) <= prev_now)
+            .map(|row| row[0] as i64)
+            .unwrap_or(reset_ms);
+        keep.clamp(reset_ms, end_ms)
+    } else {
+        reset_ms
+    };
     s.oi.retain(|(ts, _)| *ts >= start_ms && *ts <= end_ms);
-    s.symbol = symbol;
-    s.timeframe = timeframe;
-    s.exchange = exchange;
     s.step_ms = step_ms;
     s.range_start_ms = start_ms;
     s.reveal_start_ms = reveal_start_ms;
@@ -808,6 +854,21 @@ fn use_series(
     let was_paused = s.ex.is_paused();
     let ts = DateTime::from_timestamp_millis(reset_ms).unwrap_or_else(Utc::now);
     s.ex.reset(ts);
+    // Keeping the clock on a bare timeframe/symbol switch: do NOT replay the
+    // new series' history through the broker. Those bars are months old —
+    // feeding them would fire resting stops/TPs at historical prices (the
+    // "автоматический добор" and "стоп не срабатывает" symptoms). The live
+    // context price is seeded instead, so the very next bar continues from
+    // where the trader actually was.
+    if same_window && continuing && prev_now > start_ms {
+        if let Ok(sym) = Symbol::parse(&symbol) {
+            let ctx = s.ex.last_price_for(&symbol).unwrap_or(0.0);
+            if ctx > 0.0 {
+                s.ex.apply_price(&sym, ctx, ts);
+            }
+            s.ex.mark_symbol_history_played(&sym, ts);
+        }
+    }
     if !was_paused {
         s.ex.resume();
     }
@@ -815,6 +876,9 @@ fn use_series(
     s.fed = 0;
     s.fills_seen = s.ex.fetch_fills(None, None).len();
     s.last_step = std::time::Instant::now();
+    s.symbol = symbol;
+    s.timeframe = timeframe;
+    s.exchange = exchange;
     Ok(format!("{} {} {} ({} bars)", s.exchange, s.symbol, s.timeframe, rows.len()))
 }
 
@@ -2046,7 +2110,7 @@ fn route_request(method: &str, target: &str) -> HttpRoute {
             params.get(key).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)
         };
         return HttpRoute::Candles {
-            exchange: params.get("exchange").cloned().unwrap_or_else(default_exchange),
+            exchange: exchange_or_default(params.get("exchange").map(|v| v.as_str())),
             symbol,
             timeframe,
             start_ms: num("start_ms"),
@@ -2388,6 +2452,72 @@ mod tests {
     fn test_data_dir() -> &'static Path {
         // No cache files here: every series is deterministic synthetic data.
         Path::new("/nonexistent-simccxt-session-test")
+    }
+
+    #[test]
+    fn timeframe_switch_keeps_the_replay_clock() {
+        // Regression: switching the timeframe used to rewind the clock to the
+        // window's reveal point, i.e. *before* the trader's own entry. That
+        // flipped the position's PnL, re-evaluated resting orders against an
+        // old price and left stops untouchable.
+        let (tx, _rx) = broadcast::channel::<String>(512);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "5m"), data);
+        // Play forward so the clock is well past the reveal point.
+        for _ in 0..40 {
+            eng.handle_command(1, replay_cmd("step"), data);
+        }
+        let before = eng.sessions[&1].ex.now_ms();
+        assert!(before > 0, "clock advanced");
+
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "1h"), data);
+        let session = &eng.sessions[&1];
+        let after = session.ex.now_ms();
+        // The clock snaps onto a bar boundary of the NEW series, so it may move
+        // by up to one new-timeframe bar. It may also be pinned to the end of
+        // available data (the coarser series simply has no bars past `before`)
+        // — but it must never rewind to the window's reveal point.
+        let series_end = session
+            .ex
+            .fetch_ohlcv("BTC/USDT", "1h", None, None)
+            .last()
+            .map(|row| row[0] as i64)
+            .unwrap_or(0);
+        let one_bar = tf_step_ms("1h") as i64;
+        assert!(
+            after >= before - one_bar || after == series_end,
+            "timeframe switch rewound the clock: {before} -> {after} (series end {series_end})"
+        );
+        assert!(
+            after <= before + one_bar,
+            "timeframe switch jumped the clock forward past one bar: {before} -> {after}"
+        );
+        assert_eq!(session.timeframe, "1h");
+    }
+
+    #[test]
+    fn explicit_window_change_still_resets_the_clock() {
+        // The other half of the rule: picking new dates DOES rewind to reveal.
+        let (tx, _rx) = broadcast::channel::<String>(512);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "5m"), data);
+        for _ in 0..40 {
+            eng.handle_command(1, replay_cmd("step"), data);
+        }
+        let before = eng.sessions[&1].ex.now_ms();
+        assert!(before > 0);
+
+        // A different date range is not a "same window" switch, so the
+        // reveal-based reset must still be allowed to move the clock.
+        let session = &eng.sessions[&1];
+        let new_window = (Some(0), Some(1), Some(2));
+        let same_window = new_window.0 == Some(session.range_start_ms)
+            && new_window.1 == Some(session.reveal_start_ms)
+            && new_window.2 == Some(session.range_end_ms);
+        assert!(!same_window, "a new date range must count as a window change");
     }
 
     #[test]

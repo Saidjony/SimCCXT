@@ -323,6 +323,39 @@ impl Exchange {
         fed
     }
 
+    /// Mark every bar of `symbol@timeframe` up to (and including) `until` as
+    /// already replayed, without feeding them through the broker.
+    ///
+    /// Used when the session switches timeframe at a preserved clock position:
+    /// the new series has a different bar grid, and replaying its whole history
+    /// would fire resting stop/TP orders against months-old prices.
+    pub fn mark_history_played(&mut self, symbol: &Symbol, timeframe: &str, until: DateTime<Utc>) {
+        self.replayed
+            .insert((symbol.symbol.clone(), timeframe.to_string()), Some(until));
+    }
+
+    /// Same, for every series currently loaded for `symbol`.
+    ///
+    /// `reset` clears the replayed marks of ALL series, and `feed_due` walks
+    /// all of them — so switching 5m -> 1h would replay the still-loaded 5m
+    /// history too, firing resting stops/TPs at old prices. Marking only the
+    /// new timeframe is not enough; the whole symbol's history must be
+    /// skipped, since the trader keeps their live position across the switch.
+    pub fn mark_symbol_history_played(&mut self, symbol: &Symbol, until: DateTime<Utc>) {
+        // Keys come from the LOADED series, not from `replayed`: `reset`
+        // clears the marks, so that map is empty right after a switch.
+        let keys: Vec<(String, String)> = self
+            .candles
+            .keys()
+            .map(|(sym, tf)| (sym.clone(), tf.clone()))
+            .collect();
+        for key in keys {
+            if key.0 == symbol.symbol {
+                self.replayed.insert(key, Some(until));
+            }
+        }
+    }
+
     /// Whether the order book has meet-side liquidity for a market order.
     fn market_has_liquidity(&self, symbol: &Symbol, side: Side) -> bool {
         self.broker
@@ -386,6 +419,10 @@ impl Exchange {
                 "side": if pos.side == simccxt_core::PositionSide::Long { "long" } else { "short" },
                 "qty": pos.qty,
                 "entryPrice": pos.entry_price,
+                // When the position was opened (epoch ms, 0 = unknown). The
+                // chart anchors the entry line here, so "откуда заходил"
+                // survives timeframe switches.
+                "entryTimeMs": pos.opened_at.timestamp_millis(),
                 "markPrice": mark,
                 "unrealizedPnl": pnl + pos.realized_pnl,
                 "realizedPnl": pos.realized_pnl,

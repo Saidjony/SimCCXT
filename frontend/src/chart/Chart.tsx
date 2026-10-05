@@ -14,6 +14,7 @@ import type {
   UTCTimestamp,
 } from "lightweight-charts";
 import type { CandleRow } from "../types/protocol";
+import { formatTs } from "../types/protocol";
 import { chartCriteriaKey, getState, store, useSim } from "../state/store";
 import { sendSim, subscribeSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
@@ -681,9 +682,49 @@ export function Chart(): JSX.Element {
         </svg>
         {account?.positions.filter((position) => position.symbol === symbol).map((position) => {
           const y = yFor(position.entryPrice);
-          return y === null ? null : (
-            <div key={`entry-${position.symbol}`} className="execution-line entry" style={{ top: y }}>
-              <span>{position.side.toUpperCase()} entry · {position.entryPrice.toFixed(2)}</span>
+          if (y === null) return null;
+          // Anchor the entry where it actually happened when the server told
+          // us (entryTimeMs), so the line survives a timeframe switch and
+          // "откуда заходил" stays visible instead of floating.
+          const times = candleTimesRef.current;
+          const entryMs =
+            position.entryTimeMs && position.entryTimeMs > 0 ? position.entryTimeMs : null;
+          const snapped = entryMs === null ? null : nearestCandleTime(times, entryMs);
+          const x = snapped === null ? null : xFor(snapped);
+          const when = entryMs === null ? "" : " · " + formatTs(entryMs);
+          return (
+            <div key={`entry-${position.symbol}`}>
+              {x !== null && y !== null && (
+                <svg
+                  className="entry-anchor"
+                  width="100%"
+                  height={containerRef.current?.clientHeight ?? 0}
+                  aria-hidden="true"
+                >
+                  <line
+                    x1={x}
+                    y1={y}
+                    x2={x}
+                    y2={(containerRef.current?.clientHeight ?? 0) - 8}
+                    stroke={position.side === "short" ? "#d46666" : "#3d9a50"}
+                    strokeWidth="1"
+                    strokeDasharray="3 3"
+                    opacity="0.6"
+                  />
+                  <circle
+                    cx={x}
+                    cy={y}
+                    r="4"
+                    fill={position.side === "short" ? "#d46666" : "#3d9a50"}
+                  />
+                </svg>
+              )}
+              <div className="execution-line entry" style={{ top: y }}>
+                <span>
+                  {position.side.toUpperCase()} entry · {position.entryPrice.toFixed(2)}
+                  {when}
+                </span>
+              </div>
             </div>
           );
         })}

@@ -291,6 +291,7 @@ td, th { padding: 3px 4px; }
   pointer-events: none; overflow: hidden;
 }
 .trade-links { position: absolute; inset: 0 auto auto 0; overflow: hidden; pointer-events: none; }
+.entry-anchor { position: absolute; inset: 0 auto auto 0; overflow: hidden; pointer-events: none; }
 .execution-line {
   position: absolute; left: 0; right: 0; border-top: 1px dashed;
   opacity: 0.88; pointer-events: none;

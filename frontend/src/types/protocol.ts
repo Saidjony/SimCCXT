@@ -18,6 +18,8 @@ export interface PositionLine {
   side: string;
   qty: number;
   entryPrice: number;
+  /** When the position was opened (epoch ms); 0/absent = unknown. */
+  entryTimeMs?: number;
   markPrice: number;
   unrealizedPnl: number;
   realizedPnl: number;

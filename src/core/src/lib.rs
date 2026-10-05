@@ -400,6 +400,9 @@ pub struct Position {
     pub liquidation_price: f64,
     /// Funding fee
     pub funding: f64,
+    /// When this position was opened (flat -> long/short). Kept across adds
+    /// and partial closes, reset on a flip. Zero = unknown (not set yet).
+    pub opened_at: DateTime<Utc>,
 }
 
 impl Position {
@@ -428,6 +431,7 @@ impl Position {
             realized_pnl: 0.0,
             liquidation_price,
             funding: 0.0,
+            opened_at: DateTime::<Utc>::UNIX_EPOCH,
         }
     }
 

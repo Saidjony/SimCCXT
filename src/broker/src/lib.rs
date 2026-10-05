@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use simccxt_core::{OrderStatus, OrderType, Side, Symbol, TimeInForce};
+use simccxt_core::{OrderStatus, OrderType, PositionSide, Side, Symbol, TimeInForce};
 use simccxt_order_engine::{ExecutionReport, FeeSchedule, Fill, Order, OrderEngine, OrderRequest};
 use simccxt_portfolio::{MarginMode, Portfolio};
 use simccxt_wallet::Wallet;
@@ -386,6 +386,32 @@ impl Broker {
             _ => request.price.unwrap_or(0.0),
         };
 
+        // reduce_only may never grow exposure: cap the order at the open
+        // position it is allowed to close (0 => nothing to do). Without this a
+        // stale sibling SL/TP that triggers on the same bar as its twin would
+        // open a position in the opposite direction.
+        let mut request = request;
+        if request.reduce_only && kind == MarketKind::Linear {
+            let held = self
+                .portfolio
+                .position(&symbol.symbol)
+                .filter(|pos| match (pos.side, request.side) {
+                    (PositionSide::Long, Side::Sell) => true,
+                    (PositionSide::Short, Side::Buy) => true,
+                    _ => false,
+                })
+                .map(|pos| pos.qty)
+                .unwrap_or(0.0);
+            if held <= f64::EPSILON {
+                return Err(BrokerError::InvalidOrderType(
+                    "reduce_only order with no open position".into(),
+                ));
+            }
+            if request.amount > held {
+                request.amount = held;
+            }
+        }
+
         // Lock or validate funds.
         let lock = if request.order_type == OrderType::Limit {
             Some(self.lock_funds(&symbol, kind, request.side, ref_price, request.amount)?)
@@ -419,7 +445,7 @@ impl Broker {
                 self.settle_spot(&symbol, request.side, lock, filled_amount, filled_notional, fee_total);
             }
             MarketKind::Linear => {
-                self.settle_linear(&symbol, request.side, lock, filled_amount, filled_notional, fee_total);
+                self.settle_linear(&symbol, request.side, lock, filled_amount, filled_notional, fee_total, timestamp);
             }
         }
 
@@ -503,7 +529,7 @@ impl Broker {
                 self.settle_spot(symbol, side, None, filled_amount, filled_notional, fee_total);
             }
             MarketKind::Linear => {
-                self.settle_linear(symbol, side, None, filled_amount, filled_notional, fee_total);
+                self.settle_linear(symbol, side, None, filled_amount, filled_notional, fee_total, timestamp);
             }
         }
 
@@ -627,6 +653,7 @@ impl Broker {
         filled_amount: f64,
         filled_notional: f64,
         fee_total: f64,
+        timestamp: DateTime<Utc>,
     ) {
         if let Some(lock) = &lock {
             let release = filled_amount * lock.unit_release;
@@ -634,7 +661,15 @@ impl Broker {
         }
         if filled_amount > 0.0 {
             let avg_price = filled_notional / filled_amount;
-            self.portfolio.apply_fill(symbol, side, filled_amount, avg_price);
+            // Stamp the open time so the chart can show where the position
+            // actually was entered (survives adds, resets on a flip).
+            self.portfolio.apply_fill_at(
+                symbol,
+                side,
+                filled_amount,
+                avg_price,
+                Some(timestamp.timestamp_millis()),
+            );
         }
         self.wallet.apply_fill(&symbol.quote, -fee_total);
         self.wallet.add_fee(fee_total);
@@ -788,7 +823,7 @@ impl Broker {
                     self.settle_spot(symbol, side, lock, filled_amount, filled_notional, fee_total);
                 }
                 MarketKind::Linear => {
-                    self.settle_linear(symbol, side, lock, filled_amount, filled_notional, fee_total);
+                    self.settle_linear(symbol, side, lock, filled_amount, filled_notional, fee_total, timestamp);
                 }
             }
             for f in &fills {
@@ -1043,6 +1078,47 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Filled);
         let pos = b.portfolio().position("BTC/USDT").unwrap();
         assert_eq!(pos.qty, 1.0);
+    }
+
+    #[test]
+    fn reduce_only_never_opens_or_flips() {
+        // A stale sibling SL/TP that triggers on the same bar as its twin
+        // must not open exposure in the opposite direction.
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+
+        // No position at all: reduce_only is rejected outright.
+        let mut req = BrokerOrderRequest::market(btc(), Side::Sell, 1.0);
+        req.reduce_only = true;
+        assert!(b.submit_order(req, ts()).is_err());
+        assert!(b.portfolio().positions().is_empty());
+
+        // Long 1.0, then a reduce_only sell for 5.0: capped at the position.
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Buy, 1.0), ts())
+            .unwrap();
+        b.engine_mut("BTC/USDT").unwrap().update_bid(100.0, 10.0);
+        let mut over = BrokerOrderRequest::market(btc(), Side::Sell, 5.0);
+        over.reduce_only = true;
+        b.submit_order(over, ts()).unwrap();
+        assert!(
+            b.portfolio().position("BTC/USDT").is_none(),
+            "reduce_only oversell must close, not flip to short"
+        );
+
+        // Same on the short side.
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Sell, 2.0), ts())
+            .unwrap();
+        assert_eq!(b.portfolio().position("BTC/USDT").unwrap().side, PositionSide::Short);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+        let mut over_buy = BrokerOrderRequest::market(btc(), Side::Buy, 9.0);
+        over_buy.reduce_only = true;
+        b.submit_order(over_buy, ts()).unwrap();
+        assert!(
+            b.portfolio().position("BTC/USDT").is_none(),
+            "reduce_only overbuy must close, not flip to long"
+        );
     }
 
     #[test]
