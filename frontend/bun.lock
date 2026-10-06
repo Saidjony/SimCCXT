@@ -5,7 +5,10 @@
     "": {
       "name": "simccxt-frontend",
       "dependencies": {
-        "lightweight-charts": "4.2.3",
+        "@tradingview/lwc-plugin-vertical-line": "1.0.0",
+        "@tradingview/lwc-toolkit": "1.0.0",
+        "fancy-canvas": "2.1.0",
+        "lightweight-charts": "5.2.1",
         "react": "18.3.1",
         "react-dom": "18.3.1",
       },
@@ -172,6 +175,10 @@
 
     "@rollup/rollup-win32-x64-msvc": ["@rollup/rollup-win32-x64-msvc@4.63.4", "", { "os": "win32", "cpu": "x64" }, "sha512-Erx822VRBwLa124shbj+wNXe//BOgMEctDV0m1aqTQdNO1S69DgNUCFKC1RCeZfixs1J31l6igk1ziyXErbigQ=="],
 
+    "@tradingview/lwc-plugin-vertical-line": ["@tradingview/lwc-plugin-vertical-line@1.0.0", "", { "dependencies": { "fancy-canvas": "~2.1.0" }, "peerDependencies": { "lightweight-charts": "^5.0.0" } }, "sha512-cLONPcWy/e66/RZb6vinnybFg5h8vDTHBrA8tUlNb0RJ5M5AFl/cBysV9Xn2yE/kqNJs2YijvnCozc99eMr5GA=="],
+
+    "@tradingview/lwc-toolkit": ["@tradingview/lwc-toolkit@1.0.0", "", { "peerDependencies": { "lightweight-charts": "^5.0.0" } }, "sha512-an3x2tEciW6z+YrNbsarOHhWuVUYxxy7eeIG/c0svllacbIDOdYiexZtZw0mnSuA4g491vVp9Z6079L0RhY2tw=="],
+
     "@types/babel__core": ["@types/babel__core@7.20.5", "", { "dependencies": { "@babel/parser": "^7.20.7", "@babel/types": "^7.20.7", "@types/babel__generator": "*", "@types/babel__template": "*", "@types/babel__traverse": "*" } }, "sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA=="],
 
     "@types/babel__generator": ["@types/babel__generator@7.27.0", "", { "dependencies": { "@babel/types": "^7.0.0" } }, "sha512-ufFd2Xi92OAVPYsy+P4n7/U7e68fex0+Ee8gSG9KX7eo084CWiQ4sdxktvdl0bOPupXtVJPY19zk6EwWqUQ8lg=="],
@@ -224,7 +231,7 @@
 
     "json5": ["json5@2.2.3", "", { "bin": "lib/cli.js" }, "sha512-XmOWe7eyHYH14cLdVPoyg+GOH3rYX++KpzrylJwSW98t3Nk+U8XOl8FWKOgwtzdb8lXGf6zYwDUzeHMWfxasyg=="],
 
-    "lightweight-charts": ["lightweight-charts@4.2.3", "", { "dependencies": { "fancy-canvas": "2.1.0" } }, "sha512-5kS/2hY3wNYNzhnS8Gb+GAS07DX8GPF2YVDnd2NMC85gJVQ6RLU6YrXNgNJ6eg0AnWPwCnvaGtYmGky3HiLQEw=="],
+    "lightweight-charts": ["lightweight-charts@5.2.1", "", { "dependencies": { "fancy-canvas": "2.1.0" } }, "sha512-IVwoK1RLFiLPubaKIjNbtjWLnpPMqiABSrTay6whmNa8L1+19292VtHJ+BWyPUuLCwF0tcQlhEWd1CLB2a1nsQ=="],
 
     "loose-envify": ["loose-envify@1.4.0", "", { "dependencies": { "js-tokens": "^3.0.0 || ^4.0.0" }, "bin": "cli.js" }, "sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q=="],
 

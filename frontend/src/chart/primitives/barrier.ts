@@ -33,6 +33,10 @@ export class BarrierPrimitive {
       lineStyle: LineStyle.Solid,
       lineVisible: true,
       showLabel: true,
+      // The plugin's own defaults (green label, white text) belong to no
+      // palette here: the time-axis label wears the barrier's colour instead.
+      labelBackgroundColor: d.color,
+      labelTextColor: readableInk(d.color),
       snap: "nearest",
       draggable: false,
       hitTestTolerance: 6,
@@ -52,13 +56,19 @@ export class BarrierPrimitive {
     if (d.kind !== "vline") return;
     this._color = d.color;
     this.line.setTime(toTime(d.t));
-    this.line.applyOptions({ color: this._selected ? C.accent : this._color });
+    this.line.applyOptions(this._lineOptions());
   }
 
   public setSelected(selected: boolean): void {
     if (this._selected === selected) return;
     this._selected = selected;
-    this.line.applyOptions({ color: selected ? C.accent : this._color });
+    this.line.applyOptions(this._lineOptions());
+  }
+
+  /** Line and time-axis label share the barrier's colour (accent when picked). */
+  private _lineOptions(): { color: string; labelBackgroundColor: string; labelTextColor: string } {
+    const color = this._selected ? C.accent : this._color;
+    return { color, labelBackgroundColor: color, labelTextColor: readableInk(color) };
   }
 
   /** Placement wins over selection while a tool is armed (handled in the chart). */
@@ -70,4 +80,14 @@ export class BarrierPrimitive {
   public refresh(): void {
     /* no external context (sizing/symbol) affects a vertical line */
   }
+}
+
+/** Ink that stays readable on `hex` (dark text on pale fills, white on dark). */
+function readableInk(hex: string): string {
+  const m = /^#([0-9a-fA-F]{6})$/.exec(hex);
+  if (!m) return "#ffffff";
+  const n = parseInt(m[1], 16);
+  const luma =
+    (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  return luma > 0.55 ? C.bg : "#ffffff";
 }

@@ -99,7 +99,9 @@ frontend/src/components   CoinList (right-panel watchlist: add/remove/flag +
                           Account/Positions/Orders/Trades tabs)
 frontend/src/trade        criteria catalogue (30 ids + short overlay labels)
 frontend/src/chart        three-panel timeframe workspace, market charts,
-                          DrawBar (icon toolbar), HTML-overlaid drawings
+                          DrawBar (icon toolbar), drawing engine
+frontend/src/chart/primitives  primitives drawn by lightweight-charts itself
+                          (drawings, pane legends; no HTML/SVG layer)
 frontend/src/websocket    singleton connection (reconnect, watchdog), router
 frontend/src/state        tiny external store (React state/context level, no Redux)
 frontend/src/types        explicit WebSocket protocol types (no `any`)
@@ -112,22 +114,25 @@ frontend/test             pure protocol/math tests (bun test / npm test)
 with two independent charts side by side below. Defaults are 5m, 1h and 1d;
 each chart has its own timeframe; criteria are saved per timeframe and shared
 between panels showing that timeframe. The lower charts have
-independent market-data feeds. Drag the dividers to resize the panels and the
-main chart's indicator pane; layout sizes persist in the browser. Drawings are
-projected onto each chart's nearest candle and price scale. Expand any chart to
+independent market-data feeds. Drag the dividers to resize the three panels;
+that split persists in the browser. Drawings are projected onto each chart's
+nearest candle and price scale. Expand any chart to
 fill the workspace and restore the three-panel layout with the same control.
 The price scale is reset to auto-fit when new timeframe data arrives. The main
 chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and fills markers.
 
-**Open interest + CVD** are separate resizable charts below the price chart.
-The main chart owns the visible time range; OI and CVD follow it by timestamp,
-so indicator updates cannot push or jitter the main chart. OI is revealed
-incrementally with replay candles; CVD is computed client-side over the visible
-series. Pan and zoom remain available on the main chart while either pane is
-visible. `Follow: ON` scrolls to the newest bar as replay advances; `OFF`
-preserves the manually selected view. Toggle indicators with the `OI` / `CVD`
-buttons. If a venue does not expose open-interest history, that pane reports
-that there is no OI data.
+**Open interest + CVD** are panes of the main chart itself (TradingView-style
+sub-panes: `chart.addPane()`), not separate charts — one clock, one crosshair,
+one zoom and one time axis, split by the library's own draggable dividers. OI is
+revealed incrementally with replay candles, so samples the replay clock has not
+reached yet stay hidden; CVD is computed client-side over the visible series.
+Each pane owns its legend chip and price axis, so indicator updates can never
+push or jitter the price pane. `Follow: ON` scrolls to the newest bar as replay
+advances; `OFF` preserves the manually selected view. Toggle panes with the
+`OI` / `CVD` buttons: the indicator block starts at 120 px (split evenly between
+the visible panes) and keeps whatever heights you drag its dividers to until the
+set of panes changes. If a venue does not expose open-interest history, the pane
+reports that there is no OI data.
 
 **Volume profile** (right side of the chart). Fixed-range horizontal volume
 over the VISIBLE bars: 64 price levels, POC flagged with its price. Recomputed
@@ -191,7 +196,7 @@ signals; drag to move with bar magnet, right-click / `Del` to delete,
 - ray level — 1 click, horizontal ray from the clicked bar, extends per tick;
 - replay barrier — 1 click: resets the Rust clock to that bar, bars right of
   it hide and reveal one by one on play (dragging the line re-points it);
-- zone rectangle — 2 clicks, HTML overlay;
+- zone rectangle — 2 clicks, filled rectangle primitive;
 - position long/short — 3 clicks (entry, stop, take-profit): TP/SL bands with
   reward/risk label; direction follows the stop side;
 - ruler rectangle — 2 clicks: `% · bars · points`, auto-fades in 4 s, plain

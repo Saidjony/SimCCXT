@@ -40,6 +40,7 @@ import type { SharedCrosshair } from "./crosshairSync";
 import { followLatest } from "./rangeSync";
 import { DrawingEngine } from "./primitives/engine";
 import type { GhostShape } from "./primitives/ghost";
+import { PaneLabelPrimitive } from "./primitives/paneLabel";
 
 function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
@@ -56,14 +57,13 @@ function lastAtOrBefore<T>(rows: T[], target: number, getTimestamp: (row: T) => 
   return lo - 1;
 }
 
-function loadOiPaneHeight(): number {
-  try {
-    const saved = Number(window.localStorage.getItem("simccxt.oi-pane-height"));
-    return Number.isFinite(saved) && saved >= 72 ? saved : 120;
-  } catch {
-    return 120;
-  }
-}
+/** Indicator pane palette: the legend chip and the line speak one colour. */
+const OI_COLOR = "#e0af68";
+const CVD_COLOR = "#4a9ec4";
+
+/** The indicator block starts at 120px (the old pane height), 72px minimum. */
+const INDICATOR_PANE_PX = 120;
+const INDICATOR_PANE_MIN = 72;
 
 function timeToMs(t: Time): number | null {
   if (typeof t === "number") return t * 1000;
@@ -110,7 +110,9 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
  * Drawings, execution lines and the volume profile are lightweight-charts
  * primitives (see ./primitives): they are painted by the chart itself, so
  * there is no overlay DOM to keep in sync — pan, zoom and screenshot can never
- * drift them off the bars. This component only owns state and intent.
+ * drift them off the bars. OI and CVD are panes of the SAME chart (addPane),
+ * so they share the time axis, the crosshair and every zoom for free. This
+ * component only owns state and intent.
  */
 export function Chart(): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -122,16 +124,15 @@ export function Chart(): JSX.Element {
   const lastAppliedRef = useRef<number | null>(null);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const oiWrapRef = useRef<HTMLDivElement | null>(null);
-  const cvdWrapRef = useRef<HTMLDivElement | null>(null);
-  const oiChartRef = useRef<IChartApi | null>(null);
-  const cvdChartRef = useRef<IChartApi | null>(null);
-  const syncedStateRef = useRef<string | null>(null);
+  /** OI / CVD ride in their own panes of THIS chart: one clock, one axis. */
   const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const cvdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  /** Guard against ping-pong when syncing the two time scales. */
-  const syncingRef = useRef(false);
-  const scaleSyncRafRef = useRef(0);
+  const oiLabelRef = useRef<PaneLabelPrimitive | null>(null);
+  const cvdLabelRef = useRef<PaneLabelPrimitive | null>(null);
+  /** Pane factors we applied last: any change means the user dragged a separator. */
+  const specFactorsRef = useRef<number[] | null>(null);
+  /** Cursor we put on the chart root for a hovered barrier (see the crosshair handler). */
+  const cursorOverrideRef = useRef<{ element: HTMLElement; previous: string } | null>(null);
   const pendingRef = useRef<Pt[]>([]);
   const previewRef = useRef<Pt | null>(null);
   const candleTimesRef = useRef<number[]>([]);
@@ -157,8 +158,6 @@ export function Chart(): JSX.Element {
   const versionRef = useRef(0);
   const cvdValuesRef = useRef<number[]>([]);
   const [follow, setFollow] = useState(true);
-  const [oiPaneHeight, setOiPaneHeight] = useState(loadOiPaneHeight);
-  const oiPaneHeightRef = useRef(oiPaneHeight);
   const followRef = useRef(true);
   const [hover, setHover] = useState<HoverBar | null>(null);
   /** Placed measurement (auto-fades) — painted by the ruler primitive. */
@@ -200,6 +199,13 @@ export function Chart(): JSX.Element {
         background: { type: ColorType.Solid, color: "#0b0e13" },
         textColor: "#c9d1d9",
         fontSize: 12,
+        // Native pane separators: one 1px rule between the price pane and the
+        // indicator panes, draggable (row-resize) exactly like TradingView's.
+        panes: {
+          enableResize: true,
+          separatorColor: "#222c3b",
+          separatorHoverColor: "rgba(74, 158, 196, 0.35)",
+        },
       },
       grid: {
         vertLines: { color: "#1b2330" },
@@ -209,12 +215,11 @@ export function Chart(): JSX.Element {
         mode: CrosshairMode.Normal,
         vertLine: { style: LineStyle.Dashed },
       },
-      // FIXED right-axis floor on every pane (not measured): identical
-      // gutters from birth, so the same timestamp always lands on the same
-      // x. Measured content stays below the floor (prices ~72px, OI compact
-      // labels ~50px, CVD ~60px), so it never clips — and there is no
-      // read-measure-apply race to chase as data arrives. No left gutter:
-      // every pane stretches to the left edge.
+      // One right-axis width for EVERY pane (the layout takes the widest
+      // label across panes, floored by minimumWidth): identical gutters from
+      // birth, so the same timestamp always lands on the same x in the price,
+      // OI and CVD panes — with no read-measure-apply race as data arrives.
+      // No left gutter: every pane stretches to the left edge.
       rightPriceScale: { borderColor: "#222c3b", minimumWidth: 96 },
       leftPriceScale: { visible: false },
       timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
@@ -222,13 +227,11 @@ export function Chart(): JSX.Element {
     const onSharedCrosshair: Parameters<typeof subscribeCrosshair>[0] = ({ position }) => {
       if (!position) {
         lastAppliedRef.current = null;
-        chart.clearCrosshairPosition();
-        if (oiChartRef.current) oiChartRef.current.clearCrosshairPosition();
-        if (cvdChartRef.current) cvdChartRef.current.clearCrosshairPosition();
+        chart.clearCrosshairPosition(); // one call hides every pane's cursor
         return;
       }
       // ONE shared time cursor for every pane: snap to the main candle grid
-      // so the main chart, OI and CVD all draw their vertical line at the
+      // so the price, OI and CVD panes all draw their vertical line at the
       // same x (previously OI used its own 5m-grid time — hence the spread).
       const sharedTimestamp = nearestCandleTime(candleTimesRef.current, position.timestamp);
       if (sharedTimestamp === null) {
@@ -248,19 +251,20 @@ export function Chart(): JSX.Element {
       } else {
         chart.clearCrosshairPosition();
       }
-      const oiRows = getState().oi;
-      const oiIndex = lastAtOrBefore(oiRows, sharedTimestamp, (row) => row[0]);
-      if (oiChartRef.current && oiSeriesRef.current) {
-        if (oiIndex >= 0) {
-          oiChartRef.current.setCrosshairPosition(oiRows[oiIndex][1], time, oiSeriesRef.current);
-        }
-        else oiChartRef.current.clearCrosshairPosition();
+      // Indicator panes: setCrosshairPosition is per pane, so OI and CVD get
+      // their own horizontal level while the price pane keeps the cursor's.
+      const oiSeries = oiSeriesRef.current;
+      if (oiSeries) {
+        const oiRows = getState().oi;
+        const oiIndex = lastAtOrBefore(oiRows, sharedTimestamp, (row) => row[0]);
+        if (oiIndex >= 0) chart.setCrosshairPosition(oiRows[oiIndex][1], time, oiSeries);
       }
-      if (cvdChartRef.current && cvdSeriesRef.current) {
-        const value = cvdValuesRef.current[candleIndex];
-        if (candleIndex >= 0 && value !== undefined) {
-          cvdChartRef.current.setCrosshairPosition(value, time, cvdSeriesRef.current);
-        } else cvdChartRef.current.clearCrosshairPosition();
+      const cvdSeries = cvdSeriesRef.current;
+      if (cvdSeries) {
+        const cvdValue = cvdValuesRef.current[candleIndex];
+        if (candleIndex >= 0 && cvdValue !== undefined) {
+          chart.setCrosshairPosition(cvdValue, time, cvdSeries);
+        }
       }
       window.requestAnimationFrame(() => {
         applyingCrosshairRef.current = false;
@@ -315,6 +319,9 @@ export function Chart(): JSX.Element {
 
     const ro = new ResizeObserver(() => {
       chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+      // The chart relayouts on its own frame; apply the indicator-pane spec
+      // right after it (a no-op once the user has dragged a separator).
+      window.requestAnimationFrame(() => applyIndicatorSpec());
     });
     ro.observe(el);
 
@@ -381,7 +388,10 @@ export function Chart(): JSX.Element {
       } else {
         setHover(null);
       }
-      const price = param.point ? bars.coordinateToPrice(param.point.y) : null;
+      // `point` is local to the pane under the cursor: only the price pane can
+      // turn a y into a price, the indicator panes would extrapolate nonsense.
+      const onPricePane = param.paneIndex === undefined || param.paneIndex === 0;
+      const price = param.point && onPricePane ? bars.coordinateToPrice(param.point.y) : null;
       const timestamp = param.time === undefined ? null : timeToMs(param.time);
       const position = price !== null && timestamp !== null && Number.isFinite(timestamp)
         ? { timestamp, price }
@@ -391,10 +401,19 @@ export function Chart(): JSX.Element {
       } else {
         publishCrosshair(position, "main");
       }
+      // The official vertical-line plugin reports no cursor while we own the
+      // drag, so the barrier announces itself here (the chart root is where
+      // the library keeps its own cursor override).
+      const hoveredId = engineRef.current?.hoveredId() ?? null;
+      const overBarrier =
+        hoveredId !== null &&
+        getState().drawings.some((d) => d.id === hoveredId && d.kind === "vline");
+      setBarrierCursor(overBarrier);
       // Live ghost while placing a multi-click tool: pushed straight into the
       // chart primitive, so a mousemove never re-renders React.
       const active = toolRef.current;
       if (
+        onPricePane &&
         (active === "zone" || active === "position" || active === "ruler") &&
         pendingRef.current.length > 0 &&
         param.point &&
@@ -434,14 +453,15 @@ export function Chart(): JSX.Element {
       engineRef.current?.destroy();
       engineRef.current = null;
       markersRef.current = null;
-      if (scaleSyncRafRef.current) {
-        window.cancelAnimationFrame(scaleSyncRafRef.current);
-        scaleSyncRafRef.current = 0;
-      }
       chart.remove();
       chartRef.current = null;
       barsRef.current = null;
       volumeRef.current = null;
+      oiSeriesRef.current = null;
+      cvdSeriesRef.current = null;
+      oiLabelRef.current = null;
+      cvdLabelRef.current = null;
+      specFactorsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -485,24 +505,18 @@ export function Chart(): JSX.Element {
     versionRef.current = version;
     const s = getState();
     candleTimesRef.current = s.candles.map(([timestamp]) => timestamp);
-    syncingRef.current = true;
-    try {
-      pushBars(chart, bars, volume, s.candles, s.fullReset);
-      store.consumedReset();
-      if (s.fullReset) chart.priceScale("right").applyOptions({ autoScale: true });
-      followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
-      // OI is forward-filled onto the candle grid, so it shares the range.
-      if (s.fullReset && oiSeriesRef.current && oiChartRef.current) {
-        pushOi(oiSeriesRef.current, s.oi, candleTimesRef.current);
-      }
-      if (cvdSeriesRef.current) {
-        cvdValuesRef.current = cumulativeDelta(s.candles);
-        pushCvd(cvdSeriesRef.current, s.candles);
-      }
-    } finally {
-      syncingRef.current = false;
+    pushBars(chart, bars, volume, s.candles, s.fullReset);
+    store.consumedReset();
+    if (s.fullReset) chart.priceScale("right").applyOptions({ autoScale: true });
+    followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
+    // OI is forward-filled onto the candle grid, so it shares the range.
+    if (s.fullReset && oiSeriesRef.current) {
+      pushOi(oiSeriesRef.current, s.oi, candleTimesRef.current);
     }
-    syncIndicatorsToMain();
+    if (cvdSeriesRef.current) {
+      cvdValuesRef.current = cumulativeDelta(s.candles);
+      pushCvd(cvdSeriesRef.current, s.candles);
+    }
   }, [version]);
 
   // Account fills as chart markers (rendered from Rust data, UI-only).
@@ -556,122 +570,81 @@ export function Chart(): JSX.Element {
     }
   }, [fills, symbol, version]);
 
-  // Indicators share the main chart's visible time range.
+  // OI / CVD live in panes of the main chart: one clock, one crosshair, one
+  // zoom, no second chart to keep in step. The panes are rebuilt together so
+  // their order is always price → OI → CVD.
   useEffect(() => {
-    const observers: ResizeObserver[] = [];
-    const main = chartRef.current;
-    let mainRangeListener: (() => void) | null = null;
-    let oiCrosshairMove: ((param: MouseEventParams) => void) | null = null;
-    let cvdCrosshairMove: ((param: MouseEventParams) => void) | null = null;
-    syncedStateRef.current = null;
+    const chart = chartRef.current;
+    if (!chart) return;
+    const created: ISeriesApi<"Line">[] = [];
+    const state0 = getState();
 
-    if (oiVisible && oiWrapRef.current) {
-      const el = oiWrapRef.current;
-      const chart = createChart(el, indicatorChartOptions(el));
-      const line = chart.addSeries(LineSeries, {
-        color: "#e0af68",
+    if (oiVisible) {
+      const line = chart.addPane().addSeries(LineSeries, {
+        color: OI_COLOR,
         lineWidth: 2,
         priceLineVisible: false,
         crosshairMarkerVisible: true,
         priceFormat: { type: "custom", minMove: 0.01, formatter: formatCompactUsdt },
       });
-      oiChartRef.current = chart;
+      const label = new PaneLabelPrimitive(oiLabel, OI_COLOR);
+      line.attachPrimitive(label);
       oiSeriesRef.current = line;
-      pushOi(line, getState().oi, candleTimesRef.current);
-      const observer = new ResizeObserver(() => {
-        chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-        scheduleIndicatorSync();
-      });
-      observer.observe(el);
-      observers.push(observer);
-      oiCrosshairMove = (param: MouseEventParams): void => {
-        const timestamp = param.time === undefined ? null : timeToMs(param.time);
-        const position = timestamp === null ? null : { timestamp };
-        if (applyingCrosshairRef.current) {
-          pendingPublishRef.current = { position, source: "oi" };
-          return;
-        }
-        publishCrosshair(position, "oi");
-      };
-      chart.subscribeCrosshairMove(oiCrosshairMove);
-    } else {
-      oiChartRef.current = null;
-      oiSeriesRef.current = null;
+      oiLabelRef.current = label;
+      created.push(line);
+      pushOi(line, state0.oi, candleTimesRef.current);
     }
 
-    if (cvdVisible && cvdWrapRef.current) {
-      const el = cvdWrapRef.current;
-      const chart = createChart(el, indicatorChartOptions(el));
-      const line = chart.addSeries(LineSeries, {
-        color: "#4a9ec4",
+    if (cvdVisible) {
+      const line = chart.addPane().addSeries(LineSeries, {
+        color: CVD_COLOR,
         lineWidth: 1,
-        priceScaleId: "right",
         priceLineVisible: false,
         crosshairMarkerVisible: true,
       });
-      cvdChartRef.current = chart;
+      const label = new PaneLabelPrimitive("CVD", CVD_COLOR);
+      line.attachPrimitive(label);
       cvdSeriesRef.current = line;
-      cvdValuesRef.current = cumulativeDelta(getState().candles);
-      pushCvd(line, getState().candles);
-      syncIndicatorsToMain();
-      const observer = new ResizeObserver(() => {
-        chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-        scheduleIndicatorSync();
-      });
-      observer.observe(el);
-      observers.push(observer);
-      cvdCrosshairMove = (param: MouseEventParams): void => {
-        const timestamp = param.time === undefined ? null : timeToMs(param.time);
-        const position = timestamp === null ? null : { timestamp };
-        if (applyingCrosshairRef.current) {
-          pendingPublishRef.current = { position, source: "cvd" };
-          return;
-        }
-        publishCrosshair(position, "cvd");
-      };
-      chart.subscribeCrosshairMove(cvdCrosshairMove);
-    } else {
-      cvdChartRef.current = null;
-      cvdSeriesRef.current = null;
-      // Creation floors stay as-is (a hidden scale would take 0px and break
-      // x-alignment with the OI pane, which keeps its spacer visible).
-    }
-    if (main && (oiChartRef.current || cvdChartRef.current)) {
-      mainRangeListener = (): void => {
-        if (!syncingRef.current) syncIndicatorsToMain();
-      };
-      main.timeScale().subscribeVisibleLogicalRangeChange(mainRangeListener);
-      syncIndicatorsToMain();
+      cvdLabelRef.current = label;
+      created.push(line);
+      cvdValuesRef.current = cumulativeDelta(state0.candles);
+      pushCvd(line, state0.candles);
     }
 
+    applyIndicatorSpec();
+
     return () => {
-      if (mainRangeListener) main?.timeScale().unsubscribeVisibleLogicalRangeChange(mainRangeListener);
-      if (oiCrosshairMove && oiChartRef.current) {
-        oiChartRef.current.unsubscribeCrosshairMove(oiCrosshairMove);
-      }
-      if (cvdCrosshairMove && cvdChartRef.current) {
-        cvdChartRef.current.unsubscribeCrosshairMove(cvdCrosshairMove);
-      }
-      observers.forEach((observer) => observer.disconnect());
-      oiChartRef.current?.remove();
-      cvdChartRef.current?.remove();
-      oiChartRef.current = null;
-      cvdChartRef.current = null;
+      oiLabelRef.current = null;
+      cvdLabelRef.current = null;
       oiSeriesRef.current = null;
       cvdSeriesRef.current = null;
-      syncedStateRef.current = null;
+      if (!chartRef.current) return; // the whole chart is going away with us
+      // Removing the last series takes the pane with it (library behaviour),
+      // so the visible panes can simply be created again by the next run.
+      for (const series of created) {
+        try {
+          chart.removeSeries(series);
+        } catch {
+          /* the chart was torn down under us */
+        }
+      }
+      applyIndicatorSpec();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oiVisible, cvdVisible]);
 
+  // OI is revealed with the replay clock; CVD follows every candle.
   useEffect(() => {
     const line = oiSeriesRef.current;
     if (!line) return;
     pushOi(line, oiData.filter(([timestamp]) => timestamp <= replayNow), candleTimesRef.current);
-    scheduleIndicatorSync();
   }, [oiData, replayNow]);
 
-  // Toggle a bottom-pane series without rebuilding the chart.
+  // The OI legend shows which grid is loaded (and when there is none).
+  useEffect(() => {
+    oiLabelRef.current?.setText(oiLabel);
+  }, [oiLabel]);
+
   return (
     <div
       className="chartwrap"
@@ -721,60 +694,6 @@ export function Chart(): JSX.Element {
       }}
     >
       <div ref={containerRef} className="chart" />
-      {oiVisible && (
-        <div
-          ref={oiWrapRef}
-          className="oi-wrap"
-          style={{ flexBasis: cvdVisible ? oiPaneHeight / 2 : oiPaneHeight, height: cvdVisible ? oiPaneHeight / 2 : oiPaneHeight }}
-        >
-          <div
-            className="oi-resize-handle"
-            role="separator"
-            aria-label="Изменить высоту панели индикаторов"
-            aria-orientation="horizontal"
-            aria-valuemin={72}
-            aria-valuemax={Math.round((containerRef.current?.parentElement?.clientHeight ?? 600) * 0.45)}
-            aria-valuenow={Math.round(oiPaneHeight)}
-            onPointerDown={startOiPaneResize}
-            onKeyDown={(event) => {
-              if (event.key === "ArrowUp") updateOiPaneHeight(oiPaneHeight + 8);
-              if (event.key === "ArrowDown") updateOiPaneHeight(oiPaneHeight - 8);
-            }}
-            tabIndex={0}
-            title="Перетащите, чтобы изменить высоту индикаторов"
-          />
-          <div className="oi-label">
-            {oiLabel}
-          </div>
-        </div>
-      )}
-      {cvdVisible && (
-        <div
-          ref={cvdWrapRef}
-          className="oi-wrap cvd-wrap"
-          style={{ flexBasis: oiVisible ? oiPaneHeight / 2 : oiPaneHeight, height: oiVisible ? oiPaneHeight / 2 : oiPaneHeight }}
-        >
-          {!oiVisible && (
-            <div
-              className="oi-resize-handle"
-              role="separator"
-              aria-label="Изменить высоту панели индикаторов"
-              aria-orientation="horizontal"
-              aria-valuemin={72}
-              aria-valuemax={Math.round((containerRef.current?.parentElement?.clientHeight ?? 600) * 0.45)}
-              aria-valuenow={Math.round(oiPaneHeight)}
-              onPointerDown={startOiPaneResize}
-              onKeyDown={(event) => {
-                if (event.key === "ArrowUp") updateOiPaneHeight(oiPaneHeight + 8);
-                if (event.key === "ArrowDown") updateOiPaneHeight(oiPaneHeight - 8);
-              }}
-              tabIndex={0}
-              title="Перетащите, чтобы изменить высоту индикаторов"
-            />
-          )}
-          <div className="oi-label">CVD</div>
-        </div>
-      )}
       <DrawBar />
       <div className="coin-info">
         <div className="coin-sym">{symbol}</div>
@@ -847,90 +766,72 @@ export function Chart(): JSX.Element {
     });
   }
 
+  /**
+   * Pane-local y -> price, but only inside the price pane: an indicator pane
+   * below it would turn the very same y into an unrelated, extrapolated price.
+   */
   function yToPrice(y: number): number | null {
+    const chart = chartRef.current;
+    if (!chart || y >= chart.paneSize(0).height) return null;
     const v = barsRef.current?.coordinateToPrice(y);
     return typeof v === "number" ? v : null;
   }
 
-  function startOiPaneResize(event: React.PointerEvent<HTMLDivElement>): void {
-    event.preventDefault();
-    const startY = event.clientY;
-    const initialHeight = oiPaneHeight;
-    const chartHeight = containerRef.current?.parentElement?.clientHeight ?? 600;
-    const move = (pointer: PointerEvent): void => {
-      updateOiPaneHeight(initialHeight + startY - pointer.clientY, chartHeight, false);
-    };
-    const stop = (): void => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", stop);
-      persistOiPaneHeight(oiPaneHeightRef.current);
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", stop, { once: true });
-  }
-
-  function updateOiPaneHeight(requested: number, chartHeight?: number, persist = true): void {
-    const maxHeight = (chartHeight ?? containerRef.current?.parentElement?.clientHeight ?? 600) * 0.45;
-    const height = Math.max(72, Math.min(maxHeight, requested));
-    oiPaneHeightRef.current = height;
-    setOiPaneHeight(height);
-    if (persist) persistOiPaneHeight(height);
-  }
-
-  function persistOiPaneHeight(height: number): void {
-    try {
-      window.localStorage.setItem("simccxt.oi-pane-height", String(height));
-    } catch {
-      // Keep the resized panel for this page load.
+  /**
+   * Indicator panes start at the old pane height (120px, split evenly) and
+   * the price pane keeps the rest. Re-applied on every chart resize — but only
+   * while the stretch factors are still ours: as soon as the user drags a
+   * native pane separator, their layout wins for the rest of the session.
+   */
+  function applyIndicatorSpec(): void {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const panes = chart.panes();
+    if (panes.length < 2) {
+      specFactorsRef.current = null;
+      return;
     }
+    const heights = panes.map((pane) => pane.getHeight());
+    const total = heights.reduce((sum, height) => sum + height, 0);
+    if (total <= 0 || heights.some((height) => height <= 0)) {
+      // A pane created this frame has no height yet: the chart lays out on
+      // its own frame, so ask again right after it.
+      if (total > 0) window.requestAnimationFrame(applyIndicatorSpec);
+      return;
+    }
+    const applied = specFactorsRef.current;
+    if (applied !== null) {
+      const sameSet = applied.length === panes.length;
+      const ours = sameSet && applied.every((f, i) => f === panes[i].getStretchFactor());
+      if (!ours && sameSet) return; // separator dragged by hand: keep it
+    }
+    const indicators = panes.length - 1;
+    const wanted = Math.max(INDICATOR_PANE_MIN, Math.min(INDICATOR_PANE_PX, total * 0.45));
+    const each = wanted / indicators;
+    const factors = panes.map((_, i) => (i === 0 ? Math.max(total - wanted, 60) : each));
+    panes.forEach((pane, i) => pane.setStretchFactor(factors[i]));
+    specFactorsRef.current = factors;
   }
 
-  /** Keep the indicator panes on the main chart's clock AND pixel grid:
-   * OI is forward-filled onto the candle times, so every pane shares
-   * identical time points; fixed axis floors (set at creation) keep every
-   * pane's gutters equal, so the same timestamp lands on the same x. */
-  function syncIndicatorsToMain(): void {
-    const main = chartRef.current;
-    if (!main) return;
-    const range = main.timeScale().getVisibleRange();
-    if (!range) return;
-    syncingRef.current = true;
-    try {
-      const state = getState();
-      const oi = state.oi;
-      const candles = state.candles;
-      const key =
-        `${timeToMs(range.from) ?? "?"}:${timeToMs(range.to) ?? "?"}:` +
-        `${oi.length}:${oi[0]?.[0] ?? 0}:${oi[oi.length - 1]?.[0] ?? 0}:` +
-        `${candles.length}:${candles[0]?.[0] ?? 0}:${candles[candles.length - 1]?.[0] ?? 0}`;
-      if (syncedStateRef.current === key) return;
-      const charts: IChartApi[] = [];
-      if (cvdChartRef.current) charts.push(cvdChartRef.current);
-      if (oiChartRef.current) charts.push(oiChartRef.current);
-      let failed = false;
-      for (const c of charts) {
-        try {
-          c.timeScale().setVisibleRange(range);
-        } catch {
-          failed = true; // no mappable data yet — retried on the next push
-        }
+  /**
+   * The official vertical-line plugin reports no cursor while `draggable` is
+   * off (the drag is ours), so the barrier announces `ew-resize` from here.
+   * The library keeps its own override on the chart root and rewrites it on
+   * every crosshair move, so this only has to re-state ours while it is over.
+   */
+  function setBarrierCursor(over: boolean): void {
+    const root = containerRef.current?.firstElementChild as HTMLElement | null;
+    if (!root) return;
+    const held = cursorOverrideRef.current;
+    if (over) {
+      if (!held || held.element !== root) {
+        cursorOverrideRef.current = { element: root, previous: root.style.cursor };
       }
-      if (!failed) syncedStateRef.current = key;
-    } catch {
-      // A chart can briefly have no visible range while a snapshot is applied.
-    } finally {
-      syncingRef.current = false;
+      root.style.cursor = "ew-resize";
+    } else if (held && held.element === root && root.style.cursor === "ew-resize") {
+      cursorOverrideRef.current = null;
+      root.style.cursor = held.previous;
     }
-  }
-
-  function scheduleIndicatorSync(): void {
-    if (scaleSyncRafRef.current) {
-      window.cancelAnimationFrame(scaleSyncRafRef.current);
-    }
-    scaleSyncRafRef.current = window.requestAnimationFrame(() => {
-      scaleSyncRafRef.current = 0;
-      syncIndicatorsToMain();
-    });
   }
 
   function pointFromEvent(e: React.MouseEvent): Pt | null {
@@ -1167,32 +1068,6 @@ function ghostShape(tool: Tool, pending: Pt[], mouse: Pt): GhostShape | null {
     return { kind: "position", entry, sl: pending[1], tp: mouse };
   }
   return null;
-}
-
-function indicatorChartOptions(el: HTMLDivElement) {
-  return {
-    width: el.clientWidth,
-    height: el.clientHeight,
-    layout: {
-      background: { type: ColorType.Solid, color: "#0b0e13" },
-      textColor: "#7d8590",
-      fontSize: 11,
-    },
-    grid: {
-      vertLines: { color: "#141b26" },
-      horzLines: { color: "#141b26" },
-    },
-    crosshair: {
-      mode: CrosshairMode.Normal,
-      vertLine: { style: LineStyle.Dashed },
-    },
-    // Same fixed floor as the main chart; no left gutter on any pane.
-    rightPriceScale: { borderColor: "#222c3b", minimumWidth: 96 },
-    leftPriceScale: { visible: false },
-    handleScroll: false,
-    handleScale: false,
-    timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
-  };
 }
 
 function pushOi(
