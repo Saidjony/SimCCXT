@@ -1,47 +1,45 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  BarSeries,
   ColorType,
   CrosshairMode,
+  HistogramSeries,
+  LineSeries,
   LineStyle,
   createChart,
+  createSeriesMarkers,
 } from "lightweight-charts";
 import type {
   IChartApi,
   ISeriesApi,
+  ISeriesMarkersPluginApi,
   MouseEventParams,
   SeriesMarker,
   Time,
   UTCTimestamp,
 } from "lightweight-charts";
 import type { CandleRow } from "../types/protocol";
-import { formatTs } from "../types/protocol";
 import { chartCriteriaKey, getState, store, useSim } from "../state/store";
 import { sendSim, subscribeSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import { SPEED_DOWN_CODES, SPEED_UP_CODES, nextSpeed } from "../replay/speed";
 import {
-  countBars,
   cumulativeDelta,
   formatCompactUsdt,
-  formatRuler,
   invertTime,
   nearestCandleTime,
-  positionBands,
   positionDirection,
   priceAxisFormat,
-  pairTradeFills,
-  profileBarLayout,
   riskReward,
-  rulerStats,
   snapTime,
-  toBox,
-  volumeProfile,
 } from "./overlays";
 import { DrawBar } from "./DrawBar";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 import type { SharedCrosshair } from "./crosshairSync";
 import { followLatest } from "./rangeSync";
+import { DrawingEngine } from "./primitives/engine";
+import type { GhostShape } from "./primitives/ghost";
 
 function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
@@ -93,7 +91,7 @@ interface RulerState {
 }
 
 const RULER_FADE_MS = 4000;
-const VOLUME_PROFILE_LEVELS = 64;
+const RULER_FADE_ANIM_MS = 800;
 
 const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
   ray: "клик — луч-уровень от этой точки · drag — двигать",
@@ -108,8 +106,11 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
  * OHLC bar chart. All interaction (crosshair, zoom, pan, drawings)
  * stays in the browser — nothing is sent to Rust.
  * Incremental updates: snapshot -> setData(), deltas -> update().
- * Every drawing is an HTML overlay: uniform drag, right-click delete,
- * live ghost preview while placing.
+ *
+ * Drawings, execution lines and the volume profile are lightweight-charts
+ * primitives (see ./primitives): they are painted by the chart itself, so
+ * there is no overlay DOM to keep in sync — pan, zoom and screenshot can never
+ * drift them off the bars. This component only owns state and intent.
  */
 export function Chart(): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -134,17 +135,24 @@ export function Chart(): JSX.Element {
   const pendingRef = useRef<Pt[]>([]);
   const previewRef = useRef<Pt | null>(null);
   const candleTimesRef = useRef<number[]>([]);
-  const rafRef = useRef(0);
   const rulerTimer = useRef(0);
   const dragRef = useRef<{
     id: string;
     orig: Drawing;
     offT: number;
     offP: number;
+    /** True once the drawing actually moved (distinguishes drag from click). */
+    moved: boolean;
   } | null>(null);
+  /** Window listeners of the in-flight drawing drag (drop or unmount). */
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  /** Pan/zoom flags parked while a drawing is being dragged. */
+  const parkedChartOptionsRef = useRef<
+    Partial<ReturnType<IChartApi["options"]>> | null
+  >(null);
   /** Mouse-down anchor for manual click detection (pan-safe placement). */
   const downRef = useRef<{ x: number; y: number; button: number } | null>(null);
-  /** Set when an overlay was actually dragged: suppress the click that follows. */
+  /** Set when a drawing was actually dragged: suppress the click that follows. */
   const suppressClickRef = useRef(false);
   const versionRef = useRef(0);
   const cvdValuesRef = useRef<number[]>([]);
@@ -153,11 +161,12 @@ export function Chart(): JSX.Element {
   const oiPaneHeightRef = useRef(oiPaneHeight);
   const followRef = useRef(true);
   const [hover, setHover] = useState<HoverBar | null>(null);
-  const [ruler, setRuler] = useState<RulerState | null>(null);
+  /** Placed measurement (auto-fades) — painted by the ruler primitive. */
   const rulerRef = useRef<RulerState | null>(null);
-  rulerRef.current = ruler;
-  // Bumped on pan/zoom/data/mousemove so HTML overlays reposition during render.
-  const [viewTick, setViewTick] = useState(0);
+  /** Drawing/execution/profile primitives live on the chart's own series. */
+  const engineRef = useRef<DrawingEngine | null>(null);
+  /** Fill markers as the v5 markers plugin (series.setMarkers is gone). */
+  const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
 
   const version = useSim((s) => s.candlesVersion);
   const drawings = useSim((s) => s.drawings);
@@ -265,13 +274,13 @@ export function Chart(): JSX.Element {
         }
       });
     };
-    const bars = chart.addBarSeries({
+    const bars = chart.addSeries(BarSeries, {
       upColor: "#3d9a50",
       downColor: "#d46666",
       openVisible: true,
       thinBars: false,
     });
-    const volume = chart.addHistogramSeries({
+    const volume = chart.addSeries(HistogramSeries, {
       priceScaleId: "",
       priceFormat: { type: "volume" },
     });
@@ -279,25 +288,35 @@ export function Chart(): JSX.Element {
     chartRef.current = chart;
     barsRef.current = bars;
     volumeRef.current = volume;
+    // Fill markers: the v5 markers plugin, created once for the series.
+    const markers = createSeriesMarkers(bars, []);
+    markersRef.current = markers;
+    // Every drawing / execution line / profile bar on this chart is a chart
+    // primitive, reconciled with the store by the engine.
+    const state0 = getState();
+    const engine = new DrawingEngine({
+      chart,
+      series: bars,
+      times: () => candleTimesRef.current,
+      positionSizeUsdt: state0.positionSizeUsdt,
+      symbol: state0.symbol,
+      trackHover: true,
+    });
+    engineRef.current = engine;
+    engine.sync(state0.drawings, state0.selectedId);
+    engine.setProfile(true, () => getState().candles);
+    engine.setExecution({
+      fills: state0.fills,
+      positions: state0.account?.positions ?? [],
+      orders: state0.account?.open ?? [],
+      symbol: state0.symbol,
+    });
     const crosshairListener = subscribeCrosshair(onSharedCrosshair);
 
     const ro = new ResizeObserver(() => {
       chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-      setViewTick((n) => n + 1);
     });
     ro.observe(el);
-    let priceScaleRaf = 0;
-    const onPriceScaleMove = (event: PointerEvent): void => {
-      const x = event.clientX - el.getBoundingClientRect().left;
-      if (x < el.clientWidth - 72 || priceScaleRaf) return;
-      priceScaleRaf = window.requestAnimationFrame(() => {
-        priceScaleRaf = 0;
-        setViewTick((n) => n + 1);
-      });
-    };
-    el.addEventListener("pointermove", onPriceScaleMove);
-    const bump = (): void => setViewTick((n) => n + 1);
-    chart.timeScale().subscribeVisibleLogicalRangeChange(bump);
 
     // [ / ] (any keyboard layout: matched on e.code) walk the replay speed one
     // rung. The server owns the clock, so this only sends the command — same
@@ -323,6 +342,8 @@ export function Chart(): JSX.Element {
         store.setTool("none");
         store.selectDrawing(null);
         pendingRef.current = [];
+        previewRef.current = null;
+        engineRef.current?.setGhost(null);
       } else if (!e.repeat && e.key === " ") {
         e.preventDefault();
         sendSim({ type: "replay", action: getState().replay.paused ? "play" : "pause" });
@@ -370,7 +391,8 @@ export function Chart(): JSX.Element {
       } else {
         publishCrosshair(position, "main");
       }
-      // Ghost preview while placing multi-click tools.
+      // Live ghost while placing a multi-click tool: pushed straight into the
+      // chart primitive, so a mousemove never re-renders React.
       const active = toolRef.current;
       if (
         (active === "zone" || active === "position" || active === "ruler") &&
@@ -382,15 +404,13 @@ export function Chart(): JSX.Element {
         const ms = timeToMs(param.time as Time);
         if (price !== null && ms !== null) {
           previewRef.current = { t: snapClick(ms), p: price };
-          if (!rafRef.current) {
-            rafRef.current = window.requestAnimationFrame(() => {
-              rafRef.current = 0;
-              setViewTick((n) => n + 1);
-            });
-          }
+          engineRef.current?.setGhost(
+            ghostShape(active, pendingRef.current, previewRef.current),
+          );
         }
       } else if (previewRef.current) {
         previewRef.current = null;
+        engineRef.current?.setGhost(null);
       }
     });
 
@@ -405,14 +425,15 @@ export function Chart(): JSX.Element {
 
     return () => {
       window.clearTimeout(rulerTimer.current);
-      if (rafRef.current) window.cancelAnimationFrame(rafRef.current);
-      if (priceScaleRaf) window.cancelAnimationFrame(priceScaleRaf);
       window.removeEventListener("keydown", onKey);
       crosshairListener();
       publishCrosshair(null, "main");
-      el.removeEventListener("pointermove", onPriceScaleMove);
       ro.disconnect();
-      chart.timeScale().unsubscribeVisibleLogicalRangeChange(bump);
+      dragCleanupRef.current?.();
+      dragCleanupRef.current = null;
+      engineRef.current?.destroy();
+      engineRef.current = null;
+      markersRef.current = null;
       if (scaleSyncRafRef.current) {
         window.cancelAnimationFrame(scaleSyncRafRef.current);
         scaleSyncRafRef.current = 0;
@@ -425,11 +446,34 @@ export function Chart(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Clear a half-finished multi-click when the tool changes.
+  // Clear a half-finished multi-click when the tool changes. Arming a tool
+  // also parks hit testing: placement clicks must win over selection.
   useEffect(() => {
     pendingRef.current = [];
     previewRef.current = null;
+    engineRef.current?.setGhost(null);
+    engineRef.current?.setArmed(tool !== "none");
   }, [tool]);
+
+  // Drawings and the selection that rides on them go straight to the engine.
+  useEffect(() => {
+    engineRef.current?.sync(drawings, selectedId);
+  }, [drawings, selectedId]);
+
+  // Position header (size + base asset) shown by the position primitive.
+  useEffect(() => {
+    engineRef.current?.setContext({ positionSizeUsdt, symbol });
+  }, [positionSizeUsdt, symbol]);
+
+  // Execution layer: closed-trade legs, entry line + anchor, resting stops.
+  useEffect(() => {
+    engineRef.current?.setExecution({
+      fills,
+      positions: account?.positions ?? [],
+      orders: account?.open ?? [],
+      symbol,
+    });
+  }, [fills, account, symbol]);
 
   // Incremental data: full snapshot -> setData(), tick -> update().
   useEffect(() => {
@@ -459,13 +503,12 @@ export function Chart(): JSX.Element {
       syncingRef.current = false;
     }
     syncIndicatorsToMain();
-    setViewTick((n) => n + 1);
   }, [version]);
 
   // Account fills as chart markers (rendered from Rust data, UI-only).
   useEffect(() => {
-    const bars = barsRef.current;
-    if (!bars) return;
+    const markers = markersRef.current;
+    if (!markers) return;
     const marksByTime = new Map<number, SeriesMarker<Time>>();
     const times = candleTimes();
     let signedQty = 0;
@@ -507,7 +550,7 @@ export function Chart(): JSX.Element {
     const marks = [...marksByTime.values()];
     marks.sort((a, b) => Number(a.time) - Number(b.time));
     try {
-      bars.setMarkers(marks);
+      markers.setMarkers(marks);
     } catch {
       /* timestamps outside the visible series: ignore */
     }
@@ -525,7 +568,7 @@ export function Chart(): JSX.Element {
     if (oiVisible && oiWrapRef.current) {
       const el = oiWrapRef.current;
       const chart = createChart(el, indicatorChartOptions(el));
-      const line = chart.addLineSeries({
+      const line = chart.addSeries(LineSeries, {
         color: "#e0af68",
         lineWidth: 2,
         priceLineVisible: false,
@@ -559,7 +602,7 @@ export function Chart(): JSX.Element {
     if (cvdVisible && cvdWrapRef.current) {
       const el = cvdWrapRef.current;
       const chart = createChart(el, indicatorChartOptions(el));
-      const line = chart.addLineSeries({
+      const line = chart.addSeries(LineSeries, {
         color: "#4a9ec4",
         lineWidth: 1,
         priceScaleId: "right",
@@ -635,13 +678,24 @@ export function Chart(): JSX.Element {
       onMouseDown={(e) => {
         if (e.button !== 0) return;
         downRef.current = { x: e.clientX, y: e.clientY, button: e.button };
+        // With a tool armed the next click places a drawing: never a drag.
+        if (toolRef.current !== "none") return;
+        const id = engineRef.current?.hoveredId() ?? null;
+        if (!id) return;
+        const drawing = getState().drawings.find((item) => item.id === id);
+        if (!drawing) return;
+        store.selectDrawing(id);
+        startDrawingDrag(drawing, e.clientX, e.clientY);
+      }}
+      onMouseMove={(e) => {
+        if (dragRef.current) moveDrawingDrag(e.clientX, e.clientY);
       }}
       onMouseUp={(e) => {
         const down = downRef.current;
         downRef.current = null;
         if (suppressClickRef.current) {
           suppressClickRef.current = false;
-          return; // overlay drag just ended: not a placement click
+          return; // a drawing was dragged: not a placement click
         }
         if (!down || e.button !== 0) return;
         const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
@@ -656,106 +710,17 @@ export function Chart(): JSX.Element {
         if (!pt) return;
         placeAt(snapClick(pt.t), pt.p);
       }}
+      onContextMenu={(e) => {
+        // Right-click on a drawing deletes it — the hit comes from the chart's
+        // own hit test, so the pixels you aim at are the pixels that count.
+        const id = engineRef.current?.hoveredId();
+        if (!id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        store.removeDrawing(id);
+      }}
     >
       <div ref={containerRef} className="chart" />
-      <div
-        className="execution-lines"
-        style={{ height: containerRef.current?.clientHeight ?? 0 }}
-      >
-        <svg
-          className="trade-links"
-          width="100%"
-          height={containerRef.current?.clientHeight ?? 0}
-          aria-hidden="true"
-        >
-          {pairTradeFills(fills, symbol).map((link, index) => {
-            const times = candleTimesRef.current;
-            const entryTime = nearestCandleTime(times, link.entryTimestamp);
-            const exitTime = nearestCandleTime(times, link.exitTimestamp);
-            if (entryTime === null || exitTime === null) return null;
-            const x1 = xFor(entryTime);
-            const y1 = yFor(link.entryPrice);
-            const x2 = xFor(exitTime);
-            const y2 = yFor(link.exitPrice);
-            if (x1 === null || y1 === null || x2 === null || y2 === null) return null;
-            const color = link.direction === "long" ? "#3d9a50" : "#d46666";
-            return (
-              <g key={`${link.entryTimestamp}-${link.exitTimestamp}-${index}`}>
-                <line
-                  x1={x1}
-                  y1={y1}
-                  x2={x2}
-                  y2={y2}
-                  stroke={color}
-                  strokeWidth="2"
-                  strokeDasharray="5 3"
-                  opacity="0.9"
-                />
-                <circle cx={x1} cy={y1} r="3" fill={color} />
-                <circle cx={x2} cy={y2} r="3" fill={color} />
-              </g>
-            );
-          })}
-        </svg>
-        {account?.positions.filter((position) => position.symbol === symbol).map((position) => {
-          const y = yFor(position.entryPrice);
-          if (y === null) return null;
-          // Anchor the entry where it actually happened when the server told
-          // us (entryTimeMs), so the line survives a timeframe switch and
-          // "откуда заходил" stays visible instead of floating.
-          const times = candleTimesRef.current;
-          const entryMs =
-            position.entryTimeMs && position.entryTimeMs > 0 ? position.entryTimeMs : null;
-          const snapped = entryMs === null ? null : nearestCandleTime(times, entryMs);
-          const x = snapped === null ? null : xFor(snapped);
-          const when = entryMs === null ? "" : " · " + formatTs(entryMs);
-          return (
-            <div key={`entry-${position.symbol}`}>
-              {x !== null && y !== null && (
-                <svg
-                  className="entry-anchor"
-                  width="100%"
-                  height={containerRef.current?.clientHeight ?? 0}
-                  aria-hidden="true"
-                >
-                  <line
-                    x1={x}
-                    y1={y}
-                    x2={x}
-                    y2={(containerRef.current?.clientHeight ?? 0) - 8}
-                    stroke={position.side === "short" ? "#d46666" : "#3d9a50"}
-                    strokeWidth="1"
-                    strokeDasharray="3 3"
-                    opacity="0.6"
-                  />
-                  <circle
-                    cx={x}
-                    cy={y}
-                    r="4"
-                    fill={position.side === "short" ? "#d46666" : "#3d9a50"}
-                  />
-                </svg>
-              )}
-              <div className="execution-line entry" style={{ top: y }}>
-                <span>
-                  {position.side.toUpperCase()} entry · {position.entryPrice.toFixed(2)}
-                  {when}
-                </span>
-              </div>
-            </div>
-          );
-        })}
-        {account?.open.filter((order) => order.symbol === symbol && order.triggerPrice !== null).map((order) => {
-          const trigger = order.triggerPrice;
-          if (trigger === null) return null;
-          const y = trigger === null ? null : yFor(trigger);
-          return y === null ? null : (
-            <div key={order.id} className="execution-line stop" style={{ top: y }}>
-              <span>STOP {order.side.toUpperCase()} · {trigger.toFixed(2)} · {order.remaining}</span>
-            </div>
-          );
-        })}
-      </div>
       {oiVisible && (
         <div
           ref={oiWrapRef}
@@ -811,7 +776,6 @@ export function Chart(): JSX.Element {
         </div>
       )}
       <DrawBar />
-      {renderOverlays()}
       <div className="coin-info">
         <div className="coin-sym">{symbol}</div>
         {hover && (
@@ -868,16 +832,6 @@ export function Chart(): JSX.Element {
 
   function snapClick(ms: number): number {
     return snapTime(candleTimes(), ms);
-  }
-
-  function xFor(ms: number): number | null {
-    const v = chartRef.current?.timeScale().timeToCoordinate(toTime(ms));
-    return typeof v === "number" ? v : null;
-  }
-
-  function yFor(price: number): number | null {
-    const v = barsRef.current?.priceToCoordinate(price);
-    return typeof v === "number" ? v : null;
   }
 
   /** Container-relative pixel -> bar time (exact inverse of timeToCoordinate). */
@@ -976,7 +930,6 @@ export function Chart(): JSX.Element {
     scaleSyncRafRef.current = window.requestAnimationFrame(() => {
       scaleSyncRafRef.current = 0;
       syncIndicatorsToMain();
-      setViewTick((n) => n + 1);
     });
   }
 
@@ -1043,6 +996,9 @@ export function Chart(): JSX.Element {
         previewRef.current = null;
         if (active !== "ruler") store.setTool("none");
       }
+      // The click landed: no more ghost frame to draw.
+      previewRef.current = null;
+      engineRef.current?.setGhost(null);
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error("[draw] failed", err);
@@ -1053,9 +1009,13 @@ export function Chart(): JSX.Element {
 
   function placeRuler(a: Pt, b: Pt): void {
     window.clearTimeout(rulerTimer.current);
-    setRuler({ a, b, shown: true });
+    rulerRef.current = { a, b, shown: true };
+    engineRef.current?.setRuler({ a, b });
     rulerTimer.current = window.setTimeout(() => {
-      setRuler((r) => (r ? { ...r, shown: false } : r));
+      const r = rulerRef.current;
+      if (!r) return;
+      r.shown = false;
+      engineRef.current?.fadeRuler(RULER_FADE_ANIM_MS);
     }, RULER_FADE_MS);
   }
 
@@ -1078,7 +1038,7 @@ export function Chart(): JSX.Element {
     subscribeSim(s.symbol, s.timeframe, s.exchange);
   }
 
-  // ---- drag existing drawings ----
+  // ---- dragging existing drawings (hit comes from the chart's hit test) ----
 
   /** Move-anchor of a drawing (time, price point that follows the cursor). */
   function anchorOf(d: Drawing): Pt {
@@ -1091,32 +1051,58 @@ export function Chart(): JSX.Element {
     }
   }
 
-  function onOverlayDown(e: React.PointerEvent, id: string): void {
-    if (e.button === 2) return; // right button = delete (contextmenu)
-    e.stopPropagation();
-    const d = getState().drawings.find((x) => x.id === id);
-    if (!d) return;
-    store.selectDrawing(id);
+  /**
+   * Begin dragging the drawing under the cursor. Scroll/scale are parked for
+   * the duration — the same trick the official vertical-line plugin uses — so
+   * the chart does not pan underneath the drawing being moved.
+   */
+  function startDrawingDrag(drawing: Drawing, clientX: number, clientY: number): void {
     const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const mt = xToMs(x);
-    const mp = yToPrice(y);
+    const chart = chartRef.current;
+    if (!rect || !chart) return;
+    const mt = xToMs(clientX - rect.left);
+    const mp = yToPrice(clientY - rect.top);
     if (mt === null || mp === null) return;
-    const anchor = anchorOf(d);
-    dragRef.current = { id, orig: d, offT: anchor.t - mt, offP: anchor.p - mp };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    const anchor = anchorOf(drawing);
+    dragRef.current = {
+      id: drawing.id,
+      orig: drawing,
+      offT: anchor.t - mt,
+      offP: anchor.p - mp,
+      moved: false,
+    };
+    const onMove = (event: PointerEvent): void => moveDrawingDrag(event.clientX, event.clientY);
+    const onUp = (): void => endDrawingDrag();
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+    window.addEventListener("pointercancel", onUp, { once: true });
+    dragCleanupRef.current = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    parkedChartOptionsRef.current = {
+      handleScroll: chart.options().handleScroll,
+      handleScale: chart.options().handleScale,
+    };
+    chart.applyOptions({ handleScroll: false, handleScale: false });
   }
 
-  function onOverlayMove(e: React.PointerEvent): void {
+  /** Put back the pan/zoom flags the drag parked. */
+  function restoreChartOptions(): void {
+    const parked = parkedChartOptionsRef.current;
+    if (!parked) return;
+    parkedChartOptionsRef.current = null;
+    chartRef.current?.applyOptions(parked);
+  }
+
+  function moveDrawingDrag(clientX: number, clientY: number): void {
     const drag = dragRef.current;
     if (!drag) return;
-    suppressClickRef.current = true; // a real drag: no placement click after it
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const mt = xToMs(e.clientX - rect.left);
-    const mp = yToPrice(e.clientY - rect.top);
+    const mt = xToMs(clientX - rect.left);
+    const mp = yToPrice(clientY - rect.top);
     if (mt === null || mp === null) return;
     const rows = candleTimes();
     // New anchor = cursor + grab offset, snapped to bars; shift = vs original.
@@ -1126,6 +1112,8 @@ export function Chart(): JSX.Element {
     const dT = nt - anchor.t;
     const dP = np - anchor.p;
     if (dT === 0 && dP === 0) return;
+    suppressClickRef.current = true; // a real drag: no placement click after it
+    drag.moved = true;
     const o = drag.orig;
     if (o.kind === "ray") {
       store.updateDrawing(drag.id, (x) =>
@@ -1151,282 +1139,34 @@ export function Chart(): JSX.Element {
     }
   }
 
-  function onOverlayUp(e: React.PointerEvent): void {
-    void e;
+  function endDrawingDrag(): void {
+    dragCleanupRef.current?.();
+    dragCleanupRef.current = null;
     const drag = dragRef.current;
     dragRef.current = null;
+    suppressClickRef.current = false;
+    restoreChartOptions();
     // A moved barrier re-points the replay clock (drag end only, not per move).
-    if (drag && suppressClickRef.current) {
+    if (drag && drag.moved) {
       const d = getState().drawings.find((x) => x.id === drag.id);
       if (d && d.kind === "vline") replayFrom(d.t);
     }
   }
-
-  // ---- HTML overlays (all drawings + ruler + ghost preview) ----
-
-  function overlayCommon(id: string): {
-    onPointerDown: (e: React.PointerEvent) => void;
-    onPointerMove: (e: React.PointerEvent) => void;
-    onPointerUp: (e: React.PointerEvent) => void;
-    onContextMenu: (e: React.MouseEvent) => void;
-  } {
-    return {
-      onPointerDown: (e) => onOverlayDown(e, id),
-      onPointerMove: onOverlayMove,
-      onPointerUp: onOverlayUp,
-      onContextMenu: (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        store.removeDrawing(id);
-      },
-    };
+}
+/**
+ * Which ghost shape the placement state machine should show: `pending` holds
+ * the clicks already placed, `mouse` the live cursor point.
+ */
+function ghostShape(tool: Tool, pending: Pt[], mouse: Pt): GhostShape | null {
+  if (pending.length === 0) return null;
+  if (tool === "zone") return { kind: "zone", a: pending[0], b: mouse };
+  if (tool === "ruler") return { kind: "ruler", a: pending[0], b: mouse };
+  if (tool === "position") {
+    const entry = pending[0];
+    if (pending.length === 1) return { kind: "position", entry, sl: mouse, tp: null };
+    return { kind: "position", entry, sl: pending[1], tp: mouse };
   }
-
-  function renderOverlays(): JSX.Element {
-    void viewTick; // reposition on pan/zoom/data/mousemove (bumped by subscriptions)
-    const items: JSX.Element[] = [];
-    for (const d of drawings) {
-      const el = drawingOverlay(d, false);
-      if (el) items.push(el);
-    }
-    const vp = profileOverlay();
-    if (vp) items.push(vp);
-    // Ghost preview while placing multi-click tools.
-    const ghost = ghostOverlay();
-    if (ghost) items.push(ghost);
-    const r = rulerRef.current;
-    if (r && r.shown) {
-      const el = rulerOverlay(r.a, r.b, "ruler");
-      if (el) items.push(el);
-    }
-    return <>{items}</>;
-  }
-
-  /**
-   * Fixed-range volume profile of the VISIBLE bars (right side of the chart,
-   * POC flagged with its price). Recomputed on every pan/zoom/data tick via
-   * viewTick, so it always matches the bars on screen.
-   */
-  function profileOverlay(): JSX.Element | null {
-    const rows = getState().candles;
-    if (rows.length < 2) return null;
-    const range = chartRef.current?.timeScale().getVisibleLogicalRange();
-    const { rows: levels, poc } = volumeProfile(
-      rows,
-      range ? range.from : 0,
-      range ? range.to : rows.length - 1,
-      VOLUME_PROFILE_LEVELS,
-    );
-    if (!levels.length || poc === null) return null;
-    const maxV = levels.reduce((m, r) => Math.max(m, r.volume), 0);
-    if (!(maxV > 0)) return null;
-    const layout = profileBarLayout(
-      levels.map((level) => level.price),
-      (price) => barsRef.current?.priceToCoordinate(price) ?? null,
-      containerRef.current?.clientHeight,
-    );
-    return (
-      <div
-        key="vp"
-        className="vp-profile"
-        style={{ right: chartRef.current?.priceScale("right").width() ?? 66 }}
-      >
-        {levels.map((r, i) => {
-          const barPosition = layout[i];
-          if (!barPosition) return null;
-          return (
-            <div
-              key={i}
-              className={"vp-row" + (r.poc ? " poc" : "")}
-              style={{ top: barPosition.top, height: barPosition.height }}
-            >
-              <div className="vp-bar" style={{ width: ((r.volume / maxV) * 100).toFixed(1) + "%" }} />
-              {r.poc && (
-                <div className="vp-poc">
-                  {r.price.toLocaleString("en-US", { maximumFractionDigits: 1 })}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    );
-  }
-
-  function drawingOverlay(d: Drawing, ghost: boolean): JSX.Element | null {
-    const sel = !ghost && d.id === selectedId ? " selected" : "";
-    const handlers = ghost ? {} : overlayCommon(d.id);
-    if (d.kind === "ray") {
-      const x = xFor(d.t0);
-      const y = yFor(d.price);
-      const w = containerRef.current?.clientWidth ?? 0;
-      if (x === null || y === null) return null;
-      return (
-        <div
-          key={d.id + (ghost ? "-g" : "")}
-          className={"ov-ray" + sel + (ghost ? " ghost" : "")}
-          style={{ left: x, top: y - 2, width: Math.max(8, w - x) }}
-          {...handlers}
-        >
-          <div className="ov-ray-dot" />
-        </div>
-      );
-    }
-    if (d.kind === "vline") {
-      const x = xFor(d.t);
-      if (x === null) return null;
-      return (
-        <div
-          key={d.id + (ghost ? "-g" : "")}
-          className={"ov-vline" + sel + (ghost ? " ghost" : "")}
-          style={{ left: x - 2 }}
-          {...handlers}
-        />
-      );
-    }
-    if (d.kind === "zone") {
-      const box = cornersBox(d.t1, d.p1, d.t2, d.p2);
-      if (!box) return null;
-      return (
-        <div
-          key={d.id + (ghost ? "-g" : "")}
-          className={"ov-zone" + sel + (ghost ? " ghost" : "")}
-          style={{
-            left: box.left, top: box.top, width: box.width, height: box.height,
-            borderColor: d.color,
-          }}
-          {...handlers}
-        />
-      );
-    }
-    if (d.kind === "note") {
-      const x = xFor(d.t0);
-      const y = yFor(d.price);
-      if (x === null || y === null) return null;
-      return (
-        <div
-          key={d.id + (ghost ? "-g" : "")}
-          className={"ov-note" + sel + (ghost ? " ghost" : "")}
-          style={{ left: x, top: y + 8 }}
-          {...handlers}
-        >
-          {d.title}
-        </div>
-      );
-    }
-    return positionOverlay(d, ghost);
-  }
-
-  function cornersBox(t1: number, p1: number, t2: number, p2: number): { left: number; top: number; width: number; height: number } | null {
-    const x1 = xFor(t1);
-    const x2 = xFor(t2);
-    const y1 = yFor(p1);
-    const y2 = yFor(p2);
-    if (x1 === null || x2 === null || y1 === null || y2 === null) return null;
-    const b = toBox(x1, y1, x2, y2);
-    // Allow very narrow horizontal spans (entry + TP on same bar) as long
-    // as the vertical span (price range) is visible.
-    if (b.height < 2) return null;
-    return b;
-  }
-
-  function positionOverlay(d: Extract<Drawing, { kind: "position" }>, ghost: boolean): JSX.Element | null {
-    const top = Math.max(d.entry, d.sl, d.tp);
-    const bottom = Math.min(d.entry, d.sl, d.tp);
-    const box = cornersBox(d.t1, top, d.t2, bottom);
-    if (!box) return null;
-    const bands = positionBands(top, bottom, d.entry, d.sl, d.tp);
-    const dir = positionDirection(d.entry, d.sl);
-    const rr = riskReward(d.entry, d.sl, d.tp);
-    const qty = positionSizeUsdt / d.entry;
-    const base = symbol.split("/")[0] ?? "";
-    const sel = !ghost && d.id === selectedId ? " selected" : "";
-    const handlers = ghost ? {} : overlayCommon(d.id);
-    return (
-      <div
-        key={d.id + (ghost ? "-g" : "")}
-        className={"ov-pos " + dir + sel + (ghost ? " ghost" : "")}
-        style={{ left: box.left, top: box.top, width: box.width, height: box.height }}
-        {...handlers}
-      >
-        {bands.map((b, i) => (
-          <div key={i} className={"ov-band " + b.cls} style={{
-            top: (b.from * 100).toFixed(2) + "%",
-            height: Math.max(0, (b.to - b.from) * 100).toFixed(2) + "%",
-          }} />
-        ))}
-        <div className="ov-pos-label">
-          {dir === "long" ? "LONG" : "SHORT"} {rr === null ? "—" : rr.toFixed(2) + "R"}
-          {" · "}{qty.toPrecision(4)} {base} ≈ ${positionSizeUsdt}
-        </div>
-      </div>
-    );
-  }
-
-  function rulerOverlay(a: Pt, b: Pt, key: string): JSX.Element | null {
-    const box = cornersBox(a.t, a.p, b.t, b.p);
-    if (!box) return null;
-    const times = candleTimes();
-    const stats = rulerStats(a, b, 60000);
-    const bars = countBars(times, a.t, b.t);
-    const text = formatRuler({ ...stats, bars });
-    return (
-      <div key={key}>
-        <div className="ov-ruler-box" style={{
-          left: box.left, top: box.top, width: box.width, height: box.height,
-        }} />
-        <div className="ov-ruler" style={{ left: box.left + box.width / 2, top: box.top }}>
-          {text}
-        </div>
-      </div>
-    );
-  }
-
-  /** Live ghost of the in-progress drawing + current mouse point. */
-  function ghostOverlay(): JSX.Element | null {
-    const active = toolRef.current;
-    const pend = pendingRef.current;
-    const mouse = previewRef.current;
-    if (active === "none" || pend.length === 0 || !mouse) return null;
-    if (active === "zone") {
-      const box = cornersBox(pend[0].t, pend[0].p, mouse.t, mouse.p);
-      if (!box) return null;
-      return (
-        <div key="ghost" className="ov-zone ghost" style={{
-          left: box.left, top: box.top, width: box.width, height: box.height,
-          borderColor: "#4a9ec4",
-        }} />
-      );
-    }
-    if (active === "ruler") {
-      return rulerOverlay(pend[0], mouse, "ghost-ruler");
-    }
-    if (active === "position") {
-      if (pend.length === 1) {
-        // Entry set, choosing SL: ghost entry->mouse band.
-        const top = Math.max(pend[0].p, mouse.p);
-        const bottom = Math.min(pend[0].p, mouse.p);
-        const box = cornersBox(pend[0].t, top, mouse.t, bottom);
-        if (!box) return null;
-        return (
-          <div key="ghost" className="ov-pos ghost" style={{
-            left: box.left, top: box.top, width: box.width, height: box.height,
-          }}>
-            <div className="ov-band sl" style={{ top: "0%", height: "100%" }} />
-          </div>
-        );
-      }
-      const [e, s] = pend;
-      const dir = positionDirection(e.p, s.p);
-      const ghostPos: Extract<Drawing, { kind: "position" }> = {
-        id: "ghost", kind: "position",
-        t1: e.t, t2: mouse.t, entry: e.p, sl: s.p, tp: mouse.p,
-        color: dir === "long" ? "#3d9a50" : "#d46666", title: "",
-      };
-      return positionOverlay(ghostPos, true);
-    }
-    return null;
-  }
+  return null;
 }
 
 function indicatorChartOptions(el: HTMLDivElement) {

@@ -299,23 +299,6 @@ td, th { padding: 3px 4px; }
 .progress > div { height: 100%; background: var(--accent); border-radius: 2px; }
 .chartwrap { position: relative; width: 100%; height: calc(100vh - 36px); min-height: 420px; }
 .chart { width: 100%; height: 100%; }
-.execution-lines {
-  position: absolute; z-index: 5; top: 0; left: 0; right: 72px;
-  pointer-events: none; overflow: hidden;
-}
-.trade-links { position: absolute; inset: 0 auto auto 0; overflow: hidden; pointer-events: none; }
-.entry-anchor { position: absolute; inset: 0 auto auto 0; overflow: hidden; pointer-events: none; }
-.execution-line {
-  position: absolute; left: 0; right: 0; border-top: 1px dashed;
-  opacity: 0.88; pointer-events: none;
-}
-.execution-line span {
-  position: absolute; right: 2px; top: -12px; padding: 1px 4px;
-  border-radius: 3px; background: rgba(11, 14, 19, 0.88);
-  font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap;
-}
-.execution-line.entry { border-color: #e0af68; color: #e0af68; }
-.execution-line.stop { border-color: #d46666; color: #d46666; }
 .coin-info {
   position: absolute; top: 12px; left: 14px; z-index: 5; pointer-events: none;
   background: rgba(11, 14, 19, 0.62); border: 1px solid var(--line);
@@ -339,61 +322,6 @@ td, th { padding: 3px 4px; }
 .tool-btn:hover { background: #2a3342; color: var(--text); }
 .tool-btn.active { background: rgba(74, 158, 196, 0.2); color: var(--accent); border-color: var(--accent); }
 .tool-btn.danger:hover { background: rgba(212, 102, 102, 0.2); color: var(--red); }
-/* HTML overlays for drawings (rays, vlines, zones, positions, ruler). */
-.ov-zone {
-  position: absolute; z-index: 4; cursor: move;
-  border: 2px dashed; background: rgba(74, 158, 196, 0.1); border-radius: 2px;
-}
-.ov-ray {
-  position: absolute; z-index: 4; cursor: move;
-  height: 0; border-top: 3px dashed #4a9ec4;
-}
-.ov-ray-dot {
-  position: absolute; left: -5px; top: -6px; width: 9px; height: 9px;
-  border-radius: 50%; background: #4a9ec4;
-}
-.ov-ray.selected { border-top-style: solid; filter: brightness(1.4); }
-.ov-vline {
-  position: absolute; z-index: 4; cursor: ew-resize;
-  top: 0; bottom: 26px; width: 3px; background: #e0af68;
-}
-.ov-vline.selected { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
-.ov-pos.selected { box-shadow: 0 0 0 2px var(--accent); }
-.ov-zone.ghost, .ov-pos.ghost { opacity: 0.55; pointer-events: none; }
-.ov-note {
-  position: absolute; z-index: 5; cursor: move;
-  background: rgba(224, 175, 104, 0.18); color: var(--text);
-  border: 1px solid #e0af68; border-radius: 4px;
-  padding: 2px 6px; font-size: 11px; white-space: nowrap; max-width: 220px;
-}
-.ov-note.selected { border-color: var(--accent); box-shadow: 0 0 5px var(--accent); }
-.ov-note.ghost { opacity: 0.55; pointer-events: none; }
-.ov-ruler-box {
-  position: absolute; z-index: 4; pointer-events: none;
-  border: 2px solid var(--accent); background: rgba(74, 158, 196, 0.12); border-radius: 2px;
-}
-.ov-pos { position: absolute; z-index: 4; pointer-events: none; border-radius: 2px; }
-.ov-pos.long { border: 1px solid var(--green); }
-.ov-pos.short { border: 1px solid var(--red); }
-.ov-band { position: absolute; left: 0; right: 0; }
-.ov-band.tp { background: rgba(61, 154, 80, 0.18); }
-.ov-band.sl { background: rgba(212, 102, 102, 0.18); }
-.ov-band.entry { height: 0 !important; border-top: 1px dashed var(--accent); }
-.ov-pos-label {
-  position: absolute; left: 6px; top: 4px; z-index: 1;
-  font-size: 11px; font-weight: 700; color: var(--text);
-  background: rgba(11, 14, 19, 0.75); border-radius: 5px; padding: 1px 7px;
-  font-variant-numeric: tabular-nums; white-space: nowrap;
-}
-.ov-ruler {
-  position: absolute; z-index: 5; pointer-events: none;
-  transform: translate(-50%, -130%);
-  font-size: 12px; font-weight: 700; color: var(--accent);
-  background: rgba(11, 14, 19, 0.8); border: 1px solid var(--line);
-  border-radius: 7px; padding: 3px 10px; white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-  transition: opacity 0.8s ease;
-}
 /* Setup-criteria chips in the chart's top-left overlay (clicks pass through). */
 .coin-chips {
   display: flex; flex-wrap: wrap; gap: 4px;
@@ -463,24 +391,6 @@ td, th { padding: 3px 4px; }
   font-size: 11px; font-weight: 700; color: #e0af68;
   background: rgba(11, 14, 19, 0.7); border-radius: 5px; padding: 1px 8px;
 }
-/* Fixed-range volume profile of the visible bars (right side, POC flagged).
- * Pointer-events none: panning/placement clicks pass through to the chart. */
-.vp-profile {
-  position: absolute; z-index: 4; pointer-events: none;
-  top: 0; bottom: 0; right: 66px; width: 150px;
-}
-.vp-row { position: absolute; right: 0; width: 100%; min-height: 1px; }
-.vp-bar {
-  position: absolute; right: 0; top: 1px; bottom: 1px;
-  background: rgba(74, 158, 196, 0.35); border-radius: 2px 0 0 2px;
-}
-.vp-row.poc .vp-bar { background: rgba(224, 175, 104, 0.55); }
-.vp-poc {
-  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
-  font-size: 10px; font-weight: 700; color: #e0af68;
-  background: rgba(11, 14, 19, 0.8); border-radius: 4px; padding: 0 5px;
-  font-variant-numeric: tabular-nums; white-space: nowrap;
-}
 .chart-workspace {
   display: grid; grid-template-rows: minmax(0, 1fr) 8px minmax(0, 1fr);
   gap: 3px; width: 100%; height: 100%; min-height: 0;
@@ -530,31 +440,6 @@ td, th { padding: 3px 4px; }
   background: var(--accent); box-shadow: 0 0 10px rgba(74, 158, 196, 0.5);
 }
 .mini-chart { width: 100%; height: 100%; }
-.mini-drawing-layer {
-  position: absolute; inset: 0; z-index: 3; overflow: hidden; pointer-events: none;
-}
-.mini-drawing {
-  position: absolute; box-sizing: border-box; pointer-events: none;
-}
-.mini-note {
-  background: rgba(224, 175, 104, 0.2); color: var(--text);
-  border: 1px solid #e0af68; border-radius: 4px;
-  padding: 1px 5px; white-space: nowrap; max-width: 160px; overflow: hidden;
-}
-.mini-ray { height: 0; border-top: 2px dashed; }
-.mini-vline { top: 0; bottom: 26px; width: 2px; opacity: 0.85; }
-.mini-zone {
-  border: 1px dashed; border-radius: 2px;
-}
-.mini-position {
-  border: 1px dashed #4a9ec4; background: rgba(74, 158, 196, 0.08);
-}
-.mini-position.long { background: linear-gradient(to bottom, rgba(61, 154, 80, 0.17) 0 50%, rgba(212, 102, 102, 0.16) 50%); }
-.mini-position.short { background: linear-gradient(to bottom, rgba(212, 102, 102, 0.16) 0 50%, rgba(61, 154, 80, 0.17) 50%); }
-.mini-position-entry {
-  position: absolute; left: 0; right: 0; height: 1px;
-  background: rgba(224, 175, 104, 0.9);
-}
 .mini-chart-status, .mini-chart-criteria {
   position: absolute; z-index: 4; top: 8px; left: 8px; pointer-events: none;
   padding: 3px 7px; border: 1px solid var(--line); border-radius: 5px;

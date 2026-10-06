@@ -1,6 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ColorType, CrosshairMode, createChart } from "lightweight-charts";
-import type { IChartApi, ISeriesApi, SeriesMarker, Time, UTCTimestamp } from "lightweight-charts";
+import {
+  BarSeries,
+  ColorType,
+  CrosshairMode,
+  LineSeries,
+  createChart,
+  createSeriesMarkers,
+} from "lightweight-charts";
+import type {
+  IChartApi,
+  ISeriesApi,
+  ISeriesMarkersPluginApi,
+  SeriesMarker,
+  Time,
+  UTCTimestamp,
+} from "lightweight-charts";
 import type { CandleRow, DiaryData, DiaryPosition, DiaryTrade } from "../types/protocol";
 import { formatTs } from "../types/protocol";
 import { apiUrl } from "../websocket/connection";
@@ -458,6 +472,8 @@ function DiaryChart({
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const lineSeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+  /** Markers are a plugin in v5: created once, fed on every diary change. */
+  const markersPluginRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
 
   useEffect(() => {
     const el = hostRef.current;
@@ -475,7 +491,7 @@ function DiaryChart({
       rightPriceScale: { borderColor: "#222c3b" },
       timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
     });
-    const series = chart.addBarSeries({
+    const series = chart.addSeries(BarSeries, {
       upColor: "#3d9a50",
       downColor: "#d46666",
       thinBars: false,
@@ -483,6 +499,7 @@ function DiaryChart({
     series.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(1) } });
     chartRef.current = chart;
     seriesRef.current = series;
+    markersPluginRef.current = createSeriesMarkers(series, []);
     const observer = new ResizeObserver(() => {
       chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
     });
@@ -492,6 +509,7 @@ function DiaryChart({
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
+      markersPluginRef.current = null;
       lineSeriesRef.current = [];
     };
   }, []);
@@ -576,7 +594,7 @@ function DiaryChart({
       : [];
     for (const t of segments) {
       const color = t.pnl >= 0 ? "#3d9a50" : "#d46666";
-      const line = chart.addLineSeries({
+      const line = chart.addSeries(LineSeries, {
         color,
         lineWidth: 2,
         lineStyle: 2, // dashed: it is a connection, not a market series
@@ -616,7 +634,7 @@ function DiaryChart({
     }
     markers.sort((a, b) => Number(a.time) - Number(b.time));
     try {
-      series.setMarkers(markers);
+      markersPluginRef.current?.setMarkers(markers);
     } catch {
       /* timestamp outside the loaded series: skip silently */
     }

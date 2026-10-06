@@ -1,5 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ColorType, CrosshairMode, createChart } from "lightweight-charts";
+import { useEffect, useMemo, useRef } from "react";
+import {
+  BarSeries,
+  ColorType,
+  CrosshairMode,
+  HistogramSeries,
+  createChart,
+} from "lightweight-charts";
 import type { AutoscaleInfo, IChartApi, ISeriesApi, UTCTimestamp } from "lightweight-charts";
 import type { CandleRow } from "../types/protocol";
 import type { Drawing } from "../state/store";
@@ -7,6 +13,7 @@ import { chartCriteriaKey, useSim } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import { nearestCandleTime, priceAxisFormat } from "./overlays";
 import { ChartCriteriaPicker } from "./ChartCriteriaPicker";
+import { DrawingEngine } from "./primitives/engine";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 
 export const CHART_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
@@ -44,7 +51,6 @@ export function MiniChart({
     () => aggregateCandles(candlesBase, timeframeMs(timeframe)),
     [candlesBase, timeframe],
   );
-  const [viewTick, setViewTick] = useState(0);
   const drawings = useSim((s) => s.drawings);
   const drawingsRef = useRef(drawings);
   drawingsRef.current = drawings;
@@ -52,6 +58,10 @@ export function MiniChart({
   const candleTimesRef = useRef(candleTimes);
   candleTimesRef.current = candleTimes;
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
+  /** Drawing primitives live on this chart's series, outside React's render. */
+  const engineRef = useRef<DrawingEngine | null>(null);
+  const positionSizeUsdtRef = useRef(positionSizeUsdt);
+  positionSizeUsdtRef.current = positionSizeUsdt;
 
   useEffect(() => {
     const el = hostRef.current;
@@ -69,14 +79,14 @@ export function MiniChart({
       rightPriceScale: { borderColor: "#222c3b" },
       timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
     });
-    const bars = chart.addBarSeries({
+    const bars = chart.addSeries(BarSeries, {
       upColor: "#3d9a50",
       downColor: "#d46666",
       thinBars: false,
       autoscaleInfoProvider: (base: () => AutoscaleInfo | null) =>
         autoscaleForDrawings(chart, base(), drawingsRef.current, candleTimesRef.current),
     });
-    const volume = chart.addHistogramSeries({
+    const volume = chart.addSeries(HistogramSeries, {
       priceScaleId: "",
       priceFormat: { type: "volume" },
     });
@@ -84,13 +94,20 @@ export function MiniChart({
     chartRef.current = chart;
     barsRef.current = bars;
     volumeRef.current = volume;
+    // Mirror of the main chart's drawings: same primitives, read-only layer.
+    const engine = new DrawingEngine({
+      chart,
+      series: bars,
+      times: () => candleTimesRef.current,
+      positionSizeUsdt: positionSizeUsdtRef.current,
+      symbol,
+    });
+    engineRef.current = engine;
+    engine.sync(drawingsRef.current, null);
     const observer = new ResizeObserver(() => {
       chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-      setViewTick((tick) => tick + 1);
     });
     observer.observe(el);
-    const onRange = (): void => setViewTick((tick) => tick + 1);
-    chart.timeScale().subscribeVisibleLogicalRangeChange(onRange);
     const crosshairListener = subscribeCrosshair(({ position, source }) => {
       if (source === panel) return;
       const currentChart = chartRef.current;
@@ -126,23 +143,13 @@ export function MiniChart({
       if (price !== null && Number.isFinite(timestamp)) publishCrosshair({ timestamp, price }, panel);
     };
     chart.subscribeCrosshairMove(onCrosshairMove);
-    let pointerRaf = 0;
-    const onPointerMove = (): void => {
-      if (pointerRaf) return;
-      pointerRaf = window.requestAnimationFrame(() => {
-        pointerRaf = 0;
-        setViewTick((tick) => tick + 1);
-      });
-    };
-    el.addEventListener("pointermove", onPointerMove);
     return () => {
       observer.disconnect();
-      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRange);
       crosshairListener();
       chart.unsubscribeCrosshairMove(onCrosshairMove);
       publishCrosshair(null, panel);
-      el.removeEventListener("pointermove", onPointerMove);
-      if (pointerRaf) window.cancelAnimationFrame(pointerRaf);
+      engine.destroy();
+      engineRef.current = null;
       chart.remove();
       chartRef.current = null;
       barsRef.current = null;
@@ -193,22 +200,17 @@ export function MiniChart({
     }
   }, [candles]);
 
-  const [, tickSetViewTick] = useState(0);
-  void tickSetViewTick;
-
+  // Store drawings -> this pane's primitives (same engine as the main chart).
   useEffect(() => {
-    let disposed = false;
-    const id = window.setInterval(() => {
-      if (!disposed) setViewTick((t) => t + 1);
-    }, 1000);
-    return () => {
-      disposed = true;
-      window.clearInterval(id);
-    };
-  }, []);
+    engineRef.current?.sync(drawings, null);
+  }, [drawings]);
+
+  // The position header chip (size + base asset) on mirrored drawings.
+  useEffect(() => {
+    engineRef.current?.setContext({ positionSizeUsdt, symbol });
+  }, [positionSizeUsdt, symbol]);
 
   const selectedCriteria = useSim((s) => s.chartCriteria[chartCriteriaKey(s.symbol, timeframe)] ?? []);
-  void viewTick;
 
   return (
     <section className="chart-pane">
@@ -235,17 +237,6 @@ export function MiniChart({
       </header>
       <div className="chart-pane-body">
         <div ref={hostRef} className="mini-chart" />
-        <div className="mini-drawing-layer">
-          {drawings.map((drawing) => drawOnMiniChart(
-            drawing,
-            candleTimes,
-            chartRef.current,
-            barsRef.current,
-            hostRef.current,
-            positionSizeUsdt,
-            symbol,
-          ))}
-        </div>
         {selectedCriteria.length > 0 && (
           <div className="mini-chart-criteria">
             {selectedCriteria.slice(0, 6).map((id) => (
@@ -287,8 +278,8 @@ function autoscaleForDrawings(
     extraPrices.push(...drawingPrices(drawing));
   }
   if (extraPrices.length === 0) return base;
-  const minValue = Math.min(base?.priceRange.minValue ?? Infinity, ...extraPrices);
-  const maxValue = Math.max(base?.priceRange.maxValue ?? -Infinity, ...extraPrices);
+  const minValue = Math.min(base?.priceRange?.minValue ?? Infinity, ...extraPrices);
+  const maxValue = Math.max(base?.priceRange?.maxValue ?? -Infinity, ...extraPrices);
   const padding = Math.max((maxValue - minValue) * 0.04, Math.abs(maxValue) * 0.0001, 1);
   return {
     priceRange: { minValue: minValue - padding, maxValue: maxValue + padding },
@@ -363,91 +354,4 @@ function aggregateCandles(rows: CandleRow[], stepMs: number): CandleRow[] {
   }
   if (bucketStart >= 0) out.push([bucketStart, o, h, l, c, v]);
   return out;
-}
-
-function drawOnMiniChart(
-  drawing: Drawing,
-  candleTimes: number[],
-  chart: IChartApi | null,
-  bars: ISeriesApi<"Bar"> | null,
-  host: HTMLDivElement | null,
-  positionSizeUsdt: number,
-  symbol: string,
-): JSX.Element | null {
-  if (!chart || !bars || !host || candleTimes.length === 0) return null;
-  const x = (timestamp: number): number | null => {
-    const nearest = nearestCandleTime(candleTimes, timestamp);
-    if (nearest === null) return null;
-    const value = chart.timeScale().timeToCoordinate(
-      Math.floor(nearest / 1000) as UTCTimestamp,
-    );
-    return typeof value === "number" ? value : null;
-  };
-  const y = (price: number): number | null => {
-    const value = bars.priceToCoordinate(price);
-    return typeof value === "number" ? value : null;
-  };
-  if (drawing.kind === "ray") {
-    const left = x(drawing.t0);
-    const top = y(drawing.price);
-    if (left === null || top === null || left > host.clientWidth) return null;
-    return <div key={drawing.id} className="mini-drawing mini-ray" style={{
-      left, top, width: Math.max(0, host.clientWidth - left), borderColor: drawing.color,
-    }} title={drawing.title} />;
-  }
-  if (drawing.kind === "note") {
-    const left = x(drawing.t0);
-    const top = y(drawing.price);
-    if (left === null || top === null || left > host.clientWidth || top > host.clientHeight) return null;
-    return <div key={drawing.id} className="mini-drawing mini-note" style={{
-      left, top: top + 8, borderColor: drawing.color,
-    }}>{drawing.title}</div>;
-  }
-  if (drawing.kind === "vline") {
-    const left = x(drawing.t);
-    if (left === null || left < 0 || left > host.clientWidth) return null;
-    return <div key={drawing.id} className="mini-drawing mini-vline" style={{
-      left, backgroundColor: drawing.color,
-    }} title={drawing.title} />;
-  }
-  const left = x(drawing.kind === "zone" ? drawing.t1 : drawing.t1);
-  const right = x(drawing.kind === "zone" ? drawing.t2 : drawing.t2);
-  const prices = drawing.kind === "zone"
-    ? [drawing.p1, drawing.p2]
-    : [drawing.entry, drawing.sl, drawing.tp];
-  const ys = prices.map(y);
-  const validYs = ys.filter((value): value is number => value !== null);
-  if (left === null || right === null || validYs.length !== ys.length) return null;
-  const top = Math.min(...validYs);
-  const bottom = Math.max(...validYs);
-  const rangeLeft = Math.min(left, right);
-  const rangeRight = Math.max(left, right);
-  if (
-    rangeRight < 0 ||
-    rangeLeft > host.clientWidth ||
-    top > host.clientHeight ||
-    bottom < 0
-  ) return null;
-  const projectedWidth = rangeRight - rangeLeft;
-  const width = Math.min(host.clientWidth, Math.max(6, projectedWidth));
-  const rectLeft = Math.max(0, Math.min(host.clientWidth - width, rangeLeft - (width - projectedWidth) / 2));
-  const height = Math.max(2, Math.min(host.clientHeight, bottom) - Math.max(0, top));
-  if (drawing.kind === "zone") {
-    return <div key={drawing.id} className="mini-drawing mini-zone" style={{
-      left: rectLeft, top: Math.max(0, top), width, height,
-      borderColor: drawing.color, backgroundColor: `${drawing.color}18`,
-    }} title={drawing.title} />;
-  }
-  const long = drawing.entry > drawing.sl;
-  const entryY = y(drawing.entry) ?? top;
-  const qty = positionSizeUsdt / drawing.entry;
-  const base = symbol.split("/")[0] ?? "";
-  return (
-    <div key={drawing.id} className={"mini-drawing mini-position " + (long ? "long" : "short")} style={{
-      left: rectLeft, top: Math.max(0, top), width, height,
-      borderColor: drawing.color,
-    }} title={`${drawing.title} · ${qty.toPrecision(4)} ${base}`}>
-      <span className="mini-position-entry" style={{ top: entryY - Math.max(0, top) }} />
-    </div>
-  );
 }
