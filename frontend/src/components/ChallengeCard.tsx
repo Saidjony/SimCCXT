@@ -75,7 +75,7 @@ export function ChallengeCard(): JSX.Element {
           <div className="board-table-scroll">
           <table className="grid-table board-table">
             <thead>
-              <tr><th>Ник</th><th>Риск</th><th>Капитал</th><th>Equity</th><th>Realized</th><th>Unrealized</th><th>PnL</th><th>R</th><th>Сделки</th><th>Рынок</th></tr>
+              <tr><th>Ник</th><th className="num">Риск</th><th className="num">Капитал</th><th className="num">Equity</th><th className="num">Realized</th><th className="num">Unrealized</th><th className="num">PnL</th><th className="num">R</th><th className="num">Сделки</th><th>Рынок</th></tr>
             </thead>
             <tbody>
               {board.map((e) => (

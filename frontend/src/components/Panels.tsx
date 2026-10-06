@@ -21,7 +21,7 @@ export function Account(): JSX.Element {
         <span>Updated <strong>{formatTs(account.time)}</strong></span>
       </div>
       <table className="grid-table narrow-table">
-        <thead><tr><th>Asset</th><th>Free</th><th>Locked</th><th>Total</th></tr></thead>
+        <thead><tr><th>Asset</th><th className="num">Free</th><th className="num">Locked</th><th className="num">Total</th></tr></thead>
         <tbody>
           {rows.map(([asset, b]) => (
             <tr key={asset}>
@@ -52,7 +52,7 @@ export function Positions(): JSX.Element {
       {positions.length === 0 && <div className="lbl">flat</div>}
       {positions.length > 0 && (
         <table className="grid-table">
-          <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Notional</th><th>Entry</th><th>Mark</th><th>uPnL</th><th>Realized</th><th>Lev.</th><th>Liq. price</th><th></th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Side</th><th className="num">Qty</th><th className="num">Notional</th><th className="num">Entry</th><th className="num">Mark</th><th className="num">uPnL</th><th className="num">Realized</th><th className="num">Lev.</th><th className="num">Liq. price</th><th className="num"></th></tr></thead>
           <tbody>
             {positions.map((p) => (
               <tr key={p.symbol + p.side}>
@@ -92,7 +92,7 @@ export function Orders(): JSX.Element {
       {orders.length === 0 && <div className="lbl">none open</div>}
       {orders.length > 0 && (
         <table className="grid-table">
-          <thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th>Filled</th><th>Remaining</th><th>Limit</th><th>Trigger</th><th>TIF</th><th>Flags</th><th>Status</th><th>Time</th><th></th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th className="num">Filled</th><th className="num">Remaining</th><th className="num">Limit</th><th className="num">Trigger</th><th>TIF</th><th>Flags</th><th>Status</th><th>Time</th><th className="num"></th></tr></thead>
           <tbody>
             {orders.map((o) => (
               <tr key={o.id}>
@@ -135,7 +135,7 @@ export function Trades(): JSX.Element {
       {fills.length === 0 && <div className="lbl">no fills yet</div>}
       {fills.length > 0 && (
         <table className="grid-table">
-          <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Type</th><th>Price</th><th>Qty</th><th>Notional</th><th>Fee</th><th>Liquidity</th><th>Order ID</th></tr></thead>
+          <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Type</th><th className="num">Price</th><th className="num">Qty</th><th className="num">Notional</th><th className="num">Fee</th><th>Liquidity</th><th>Order ID</th></tr></thead>
           <tbody>
             {fills.map((f) => (
               <tr key={f.id}>

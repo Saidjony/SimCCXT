@@ -19,6 +19,7 @@ import { chartCriteriaKey, getState, store, useSim } from "../state/store";
 import { sendSim, subscribeSim } from "../websocket/connection";
 import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
+import { SPEED_DOWN_CODES, SPEED_UP_CODES, nextSpeed } from "../replay/speed";
 import {
   countBars,
   cumulativeDelta,
@@ -298,6 +299,15 @@ export function Chart(): JSX.Element {
     const bump = (): void => setViewTick((n) => n + 1);
     chart.timeScale().subscribeVisibleLogicalRangeChange(bump);
 
+    // [ / ] (any keyboard layout: matched on e.code) walk the replay speed one
+    // rung. The server owns the clock, so this only sends the command — same
+    // path the dropdown takes.
+    const stepSpeed = (dir: 1 | -1): void => {
+      const speed = nextSpeed(getState().replay.speed, dir);
+      store.setReplaySpeed(speed); // optimistic: chained presses read this back
+      sendSim({ type: "replay", action: "set_speed", speed });
+    };
+
     const onKey = (e: KeyboardEvent): void => {
       const target = e.target as HTMLElement | null;
       if (target?.closest("input, textarea, select, button, a, summary, [contenteditable='true'], [role='button']")) {
@@ -322,6 +332,12 @@ export function Chart(): JSX.Element {
       } else if (!e.repeat && e.key === "Home") {
         e.preventDefault();
         sendSim({ type: "replay", action: "reset" });
+      } else if (!e.repeat && SPEED_UP_CODES.has(e.code)) {
+        e.preventDefault();
+        stepSpeed(1);
+      } else if (!e.repeat && SPEED_DOWN_CODES.has(e.code)) {
+        e.preventDefault();
+        stepSpeed(-1);
       }
     };
     window.addEventListener("keydown", onKey);

@@ -4,6 +4,7 @@ import { sendSim, subscribeSim } from "../websocket/connection";
 import type { FormEvent } from "react";
 import { formatTs } from "../types/protocol";
 import { Popover } from "./Popover";
+import { REPLAY_SPEEDS } from "../replay/speed";
 
 function toLocalInput(ms: number): string {
   const date = new Date(ms);
@@ -23,6 +24,12 @@ export function ReplayControls(): JSX.Element {
   });
   const [rangeError, setRangeError] = useState("");
   const pct = replay.total > 0 ? Math.round((replay.fed / replay.total) * 100) : 0;
+  // A speed the ladder does not list (server default, or an older client) must
+  // still be selectable, or the dropdown would render blank and hide what is
+  // actually running.
+  const speedOptions = REPLAY_SPEEDS.includes(replay.speed)
+    ? REPLAY_SPEEDS
+    : [...REPLAY_SPEEDS, replay.speed].sort((a, b) => a - b);
 
   useEffect(() => {
     setDraft({
@@ -78,14 +85,18 @@ export function ReplayControls(): JSX.Element {
         {replay.fed}/{replay.total} · {pct}%
       </span>
       <div className="progress replay-progress"><div style={{ width: pct + "%" }} /></div>
-      <label className="replay-speed">
+      <label className="replay-speed" title="Скорость реплея — также [ и ]">
         <span className="sr-only">Скорость реплея</span>
         <select
           value={String(replay.speed)}
-          onChange={(e) => sendSim({ type: "replay", action: "set_speed", speed: Number(e.target.value) })}
+          onChange={(e) => {
+            const speed = Number(e.target.value);
+            store.setReplaySpeed(speed);
+            sendSim({ type: "replay", action: "set_speed", speed });
+          }}
           aria-label="Скорость реплея"
         >
-          {[0.5, 1, 2, 4, 10].map((s) => (
+          {speedOptions.map((s) => (
             <option key={s} value={s}>{s}×</option>
           ))}
         </select>

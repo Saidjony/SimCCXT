@@ -595,6 +595,14 @@ export const store = {
   applyReplay(replay: ReplayState): void {
     set({ replay });
   },
+  /**
+   * Optimistic speed change. The server echoes its own idea of the speed back,
+   * but two quick hotkey presses must chain off the value the user just chose —
+   * reading the last (still stale) echo makes rapid presses collapse into one.
+   */
+  setReplaySpeed(speed: number): void {
+    set({ replay: { ...state.replay, speed } });
+  },
   setReplayWindow(replayWindow: ReplayWindow): void {
     if (
       !Number.isFinite(replayWindow.start_ms) ||

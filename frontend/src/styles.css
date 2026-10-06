@@ -143,6 +143,10 @@ body {
   padding: 6px 10px; border-bottom: 1px solid var(--line); z-index: 1;
 }
 .grid-table td { padding: 5px 10px; border-bottom: 1px solid #1a2230; font-variant-numeric: tabular-nums; }
+/* `.num` alone loses to `.grid-table thead th` on specificity, so numeric
+   headers stayed left-aligned while their cells are right-aligned — the data
+   looked shifted a column to the right of its own heading. */
+.grid-table thead th.num { text-align: right; }
 .grid-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.015); }
 .grid-table tbody tr:hover { background: rgba(74, 158, 196, 0.07); }
 .narrow-table { max-width: 640px; }
