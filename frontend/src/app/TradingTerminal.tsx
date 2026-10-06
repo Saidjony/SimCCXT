@@ -8,7 +8,6 @@ import { CoinList } from "../components/CoinList";
 import { ChallengeCard } from "../components/ChallengeCard";
 import { OrderPanel } from "../components/OrderPanel";
 import { BottomTerminal } from "../components/Panels";
-import { TradeReview } from "../components/TradeReview";
 import type { ExchangeId } from "../types/protocol";
 import { subscribeSim, sendSim } from "../websocket/connection";
 import { store } from "../state/store";
@@ -133,7 +132,19 @@ export function TradingTerminal(): JSX.Element {
           </select>
         </label>
         <ConnBadge />
-        {serverNick && <span className="nick-badge">вы: {serverNick}</span>}
+        {serverNick && (
+          <>
+            <span className="nick-badge">вы: {serverNick}</span>
+            {/* Your own trades, in exactly the view other participants see. */}
+            <a
+              className="btn b-dim"
+              href={`?trader=${encodeURIComponent(serverNick)}`}
+              title="Открыть свой дневник сделок"
+            >
+              Мои сделки
+            </a>
+          </>
+        )}
         <TopbarTools />
         <ReplayControls />
         {/* The toggle is last and takes the bar's free space (see .side-toggle),
@@ -164,7 +175,6 @@ export function TradingTerminal(): JSX.Element {
         >
           <OrderPanel />
           <CoinList />
-          <TradeReview />
           <ChallengeCard />
         </aside>
         )}

@@ -5,7 +5,7 @@ import type { CandleRow } from "../types/protocol";
 import type { Drawing } from "../state/store";
 import { chartCriteriaKey, useSim } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
-import { nearestCandleTime } from "./overlays";
+import { nearestCandleTime, priceAxisFormat } from "./overlays";
 import { ChartCriteriaPicker } from "./ChartCriteriaPicker";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 
@@ -165,6 +165,12 @@ export function MiniChart({
     const bars = barsRef.current;
     const volume = volumeRef.current;
     if (!bars || !volume) return;
+    // Tick size follows the price magnitude (see priceAxisFormat): a cheap pair
+    // must not be rounded to whole cents.
+    const lastCandle = candles[candles.length - 1];
+    if (lastCandle) {
+      bars.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(lastCandle[4]) } });
+    }
     bars.setData(candles.map(([ts, open, high, low, close]) => ({
       time: Math.floor(ts / 1000) as UTCTimestamp,
       open,

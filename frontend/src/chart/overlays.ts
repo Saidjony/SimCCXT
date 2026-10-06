@@ -132,6 +132,35 @@ export function formatRuler(s: RulerStats): string {
   return `${sign}${s.pct.toFixed(2)}% · ${s.bars} ${barsWord} · ${s.pts >= 0 ? "+" : ""}${s.pts.toFixed(1)} pts`;
 }
 
+/**
+ * Tick size for a price axis, derived from the price's own magnitude.
+ *
+ * lightweight-charts defaults `minMove` to 0.01, so on a 0.09 DOGE/USDT the
+ * axis can only step by whole cents: the labels read 0.08 / 0.09, the real
+ * price is invisible and the order ticket becomes unusable. The rule is
+ * "keep two decimals below the leading digit":
+ *
+ *   0.09 → 0.0001   0.9 → 0.001   8 → 0.01   80 → 0.1   80 000 → 1
+ *
+ * so every pair gets a readable axis — BTC keeps whole-unit ticks, DOGE gets
+ * four decimals. It is the SMALLEST allowed step; the library still picks a
+ * tidy multiple of it to suit the visible range.
+ */
+export function priceTick(price: number): number {
+  if (!Number.isFinite(price) || price <= 0) return 0.01;
+  const decimals = Math.max(0, 2 - Math.floor(Math.log10(price)));
+  // `10 ** -0` is 1, so no clamp is needed on the exponent side.
+  return decimals === 0 ? 1 : Math.pow(10, -decimals);
+}
+
+/** Precision + minMove pair for a `priceFormat`, from the series' last price. */
+export function priceAxisFormat(price: number): { precision: number; minMove: number } {
+  const minMove = priceTick(price);
+  const precision =
+    minMove >= 1 ? 0 : Math.max(0, Math.min(12, Math.round(-Math.log10(minMove))));
+  return { precision, minMove };
+}
+
 /** Russian plural for "bar" (chart hint uses timeframe bars). */
 export function barWord(n: number): string {
   const m10 = n % 10;

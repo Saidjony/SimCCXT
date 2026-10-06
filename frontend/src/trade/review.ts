@@ -76,11 +76,18 @@ export function toR(distance: number, riskPerUnit: number): number | null {
  * defined risk, so its R is meaningless and the size was a guess.
  */
 export function classifyExit(
-  trade: Pick<DiaryTrade, "entry_price" | "exit_price">,
+  trade: Pick<DiaryTrade, "entry_price" | "exit_price" | "exit_reason">,
   levels: { stop?: number | null; target?: number | null } = {},
   open = false,
 ): ExitKind {
   if (open) return "open";
+  // The server knows which protective order fired — trust it. A stop is a
+  // MARKET order, so on a wide bar it can fill far past its trigger (replay
+  // measured: trigger 79519, fill 79233) and price proximity alone would
+  // misreport that stop-out as a manual exit.
+  if (trade.exit_reason === "stop") return "stop";
+  if (trade.exit_reason === "take") return "target";
+  if (trade.exit_reason) return "manual";
   const { entry_price: entry, exit_price: exit } = trade;
   if (!Number.isFinite(entry) || !Number.isFinite(exit)) return "manual";
   const tol = Math.abs(entry) * LEVEL_TOLERANCE;
@@ -99,6 +106,9 @@ export interface ReviewRow {
   /** Excursion in R, when the trade had a defined risk. */
   mfeR: number | null;
   maeR: number | null;
+  /** The same excursion as a percent of the entry — works even with no stop. */
+  mfePct: number | null;
+  maePct: number | null;
   /** Favourable move that was given back: MFE minus what was actually taken. */
   gaveBackR: number | null;
   /**
@@ -114,6 +124,7 @@ const FLAG_SEVERITY: Record<string, number> = {
   "без стопа — риск не определён": 3,
   "закрыл до стопа: правило не выдержано": 3,
   "упущенная прибыль": 2,
+  "стоп исполнен с пробоем": 1,
   "держал дольше суток": 1,
 };
 
@@ -147,17 +158,26 @@ export function buildReview(
 
   for (const trade of ordered) {
     const ref = `${trade.entry_order_id}-${trade.exit_order_id}`;
-    const level = levels[ref] ?? {};
+    // Levels come from the caller when it tracked them, otherwise from the trade
+    // itself (the server records the stop/TP the trader planned).
+    const level = levels[ref] ?? {
+      stop: trade.stop_price ?? null,
+      target: trade.take_price ?? null,
+    };
     const kind = classifyExit(trade, level, openRefs.has(ref));
     const priorStreak = stopStreak.get(trade.symbol) ?? 0;
 
     let mfeR: number | null = null;
     let maeR: number | null = null;
+    let mfePct: number | null = null;
+    let maePct: number | null = null;
     let gaveBackR: number | null = null;
     const flags: string[] = [];
 
-    if (typeof level.stop === "number" && Number.isFinite(level.stop)) {
-      const riskPerUnit = Math.abs(trade.entry_price - level.stop);
+    // Excursion is measured whenever bars exist; R needs a planned stop, % does
+    // not. An unprotected trade therefore still shows "how far it went" — in
+    // percent — instead of a blank cell.
+    if (kind !== "open" && trade.entry_price > 0) {
       const { mfe, mae } = excursion(
         candlesFor(trade),
         trade.entry_time_ms,
@@ -165,11 +185,22 @@ export function buildReview(
         trade.side === "short" ? "short" : "long",
         trade.entry_price,
       );
-      mfeR = toR(mfe, riskPerUnit);
-      maeR = toR(mae, riskPerUnit);
-      if (mfeR !== null) {
-        // Favourable move minus what the trade actually returned, in R.
-        gaveBackR = Number((mfeR - trade.r).toFixed(6));
+      if (mfe > 0 || mae > 0) {
+        mfePct = Number(((mfe / trade.entry_price) * 100).toFixed(3));
+        maePct = Number(((mae / trade.entry_price) * 100).toFixed(3));
+      }
+      const hasStop = typeof level.stop === "number" && Number.isFinite(level.stop);
+      if (hasStop) {
+        const riskPerUnit = Math.abs(trade.entry_price - level.stop!);
+        mfeR = toR(mfe, riskPerUnit);
+        maeR = toR(mae, riskPerUnit);
+        if (mfeR !== null) {
+          // Realized R uses the SAME unit as the excursion (the planned stop
+          // distance × size), so the two are comparable even when the session
+          // has no fixed risk budget configured (the server's `r` is then 0).
+          const realizedR = toR(trade.pnl, riskPerUnit * trade.qty);
+          gaveBackR = realizedR !== null ? Number((mfeR - realizedR).toFixed(6)) : null;
+        }
       }
     }
 
@@ -179,6 +210,15 @@ export function buildReview(
     if (kind === "manual" && typeof level.stop === "number") {
       flags.push("закрыл до стопа: правило не выдержано");
     }
+    // A protective stop is a market order: on a wide bar it fills past its
+    // trigger. Worth saying out loud — that gap is the real cost of the stop.
+    if (kind === "stop" && typeof level.stop === "number" && trade.entry_price > 0) {
+      const slipPct = ((trade.exit_price - level.stop) / trade.entry_price) * 100;
+      if (Math.abs(slipPct) > 0.1) {
+        const sign = slipPct < 0 ? "−" : "+";
+        flags.push(`стоп исполнен с пробоем: ${sign}${Math.abs(slipPct).toFixed(2)}% от уровня`);
+      }
+    }
     if (gaveBackR !== null && gaveBackR > 1 && trade.pnl < 0) {
       flags.push("упущенная прибыль");
     }
@@ -187,9 +227,25 @@ export function buildReview(
       flags.push("держал дольше суток");
     }
 
-    flags.sort((a, b) => (FLAG_SEVERITY[b] ?? 0) - (FLAG_SEVERITY[a] ?? 0));
+    // Severity keys are prefixes (the slip flag carries a measured percentage).
+    const severity = (flag: string): number => {
+      const key = Object.keys(FLAG_SEVERITY).find((k) => flag.startsWith(k));
+      return key ? FLAG_SEVERITY[key] : 0;
+    };
+    flags.sort((a, b) => severity(b) - severity(a));
 
-    rows.push({ ref, trade, kind, mfeR, maeR, gaveBackR, priorStopStreak: priorStreak, flags });
+    rows.push({
+      ref,
+      trade,
+      kind,
+      mfeR,
+      maeR,
+      mfePct,
+      maePct,
+      gaveBackR,
+      priorStopStreak: priorStreak,
+      flags,
+    });
 
     stopStreak.set(
       trade.symbol,

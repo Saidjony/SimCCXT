@@ -156,29 +156,11 @@ body {
 .btn-sm { padding: 3px 10px; font-size: 12px; }
 .btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .close-market-btn { display: block; width: 100%; margin-top: 6px; font-weight: 600; letter-spacing: 0.2px; }
-/* Post-trade review of the current session. */
-.review-card { display: flex; flex-direction: column; gap: 8px; }
-.review-summary {
-  display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--muted);
-}
-.review-summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
-.review-line {
-  border: 1px solid var(--line); border-left-width: 3px; border-radius: 4px;
-  padding: 6px 8px; display: flex; flex-direction: column; gap: 4px;
-  background: #0d1117;
-}
-.review-line.stop { border-left-color: var(--red); }
-.review-line.target { border-left-color: var(--green); }
-.review-line.manual { border-left-color: #e0af68; }
-.review-line.open { border-left-color: var(--accent); }
-.review-line-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
-.review-kind { color: var(--muted); font-size: 11px; }
-.review-line-meta { font-size: 10px; }
-.review-flag { font-size: 11px; color: #e0af68; }
-.review-note {
-  width: 100%; resize: vertical; font-size: 11px; padding: 4px 6px;
-  background: #0b0e13; color: var(--text); border: 1px solid var(--line); border-radius: 3px;
-}
+/* Diary: how each trade ended, next to the numbers. */
+.exit-kind { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.exit-kind.stop { color: var(--red); }
+.exit-kind.target { color: var(--green); }
+.exit-kind.manual { color: #e0af68; }
 
 /* Panel toggle: the free space of the bar goes here, so the button always sits
    on the right edge (and an error message stays next to the controls it came

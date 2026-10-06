@@ -712,6 +712,13 @@ fn stop_loss_exit_lands_in_the_diary() {
     let trades = array(&d, "trades");
     assert_eq!(trades.len(), 1, "the stop closed the trade: {d}");
     assert_eq!(trades[0]["side"], "long");
+    // The fill itself says which level ended the trade. Price proximity cannot:
+    // a stop is a market order and may fill well past its trigger on a wide
+    // bar, which would otherwise be reported as a manual exit.
+    assert_eq!(
+        trades[0]["exit_reason"], "stop",
+        "the diary must say the stop closed it: {trades:?}"
+    );
     assert!(
         num(&trades[0], "exit_price") < num(&trades[0], "entry_price"),
         "a stop loss exits below the entry: {trades:?}"
@@ -738,7 +745,9 @@ fn diary_reports_the_protective_levels_the_trader_planned() {
     let (mut eng, _rx) = engine();
     open_trader(&mut eng, 1, "5m", NICK, RISK);
     let entry = last_price(&eng, 1);
-    let stop = entry * 0.98;
+    // Far below anything in the window: this case is a MANUAL close with the
+    // stop still armed, so the stop must never get a chance to fire.
+    let stop = entry * 0.5;
 
     market(&mut eng, 1, "buy", 0.1, Some(stop));
     assert_eq!(
@@ -749,6 +758,11 @@ fn diary_reports_the_protective_levels_the_trader_planned() {
 
     // Close by hand so the trade lands in the diary.
     jump(&mut eng, 1, 3_600_000, 2);
+    assert_eq!(
+        eng.sessions[&1].ex.fetch_open_orders(Some(SYM)).len(),
+        1,
+        "the stop must still be armed — this is about a manual close"
+    );
     market(&mut eng, 1, "sell", 0.1, None);
 
     let d = diary(&eng, NICK);
@@ -762,6 +776,10 @@ fn diary_reports_the_protective_levels_the_trader_planned() {
     assert!(
         t["take_price"].is_null(),
         "no TP was set, so it must be null rather than guessed: {t}"
+    );
+    assert!(
+        t["exit_reason"].is_null(),
+        "closed by hand while the stop was still armed — not a stop-out: {t}"
     );
 }
 
@@ -779,6 +797,8 @@ fn an_unprotected_entry_is_reported_without_levels() {
     let t = &array(&d, "trades")[0];
     assert!(t["stop_price"].is_null(), "no stop was set: {t}");
     assert!(t["take_price"].is_null(), "no TP was set: {t}");
+    // Closed by hand ⇒ no protective level, and the diary must not claim one.
+    assert!(t["exit_reason"].is_null(), "a manual exit has no level: {t}");
 }
 
 // ---------------------------------------------------------------------------

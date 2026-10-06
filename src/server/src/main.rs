@@ -337,6 +337,16 @@ struct Session {
     capital_usdt: f64,
     pending_protections: Vec<PendingProtection>,
     entry_protections: EntryProtections,
+    /// Protective order id → the level it implements (`"stop"` / `"take"`).
+    protection_kinds: HashMap<String, &'static str>,
+    /// Fill order id → the level that closed it.
+    ///
+    /// This cannot be recovered from prices: a protective stop is a MARKET
+    /// order, so on a 5m bar it can fill well past its trigger (measured in
+    /// replay: stop 79519 filled at 79233 — 0.36% away). Classifying by price
+    /// proximity would report that stop-out as a manual exit and claim the
+    /// trader broke their own rule when the market simply gapped through.
+    exit_reasons: HashMap<String, &'static str>,
     active_protections: Vec<(String, String, String)>,
     diary_meta: serde_json::Value, // client-pushed drawings/criteria to show in the diary
     oi: Vec<(i64, f64)>, // open-interest history (ts_ms, USDT value), context only
@@ -573,6 +583,17 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
         let side = fill["side"].as_str().unwrap_or_default().to_string();
         let order_id = fill["orderId"].as_str().unwrap_or_default().to_string();
         let source_order_id = s.ex.take_triggered_order_source(&order_id);
+        // If this fill came from a protective order, remember WHICH level it
+        // implemented: the diary needs the reason, and price proximity cannot
+        // supply it (a stop is a market order and may fill far past its trigger).
+        if let Some(kind) = s
+            .protection_kinds
+            .get(&order_id)
+            .copied()
+            .or_else(|| source_order_id.as_ref().and_then(|id| s.protection_kinds.get(id).copied()))
+        {
+            s.exit_reasons.insert(order_id.clone(), kind);
+        }
         let amount = fill["amount"].as_f64().unwrap_or(0.0);
         let pending_index = s.pending_protections.iter().position(|pending| {
             pending.symbol == symbol
@@ -615,6 +636,7 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
                     Ok(order) => {
                         if let Some(id) = order["id"].as_str() {
                             s.active_protections.push((symbol.clone(), entry_side.clone(), id.to_string()));
+                            s.protection_kinds.insert(id.to_string(), "stop");
                         }
                         events.push(json!({ "type": "order_update", "order": order }));
                     }
@@ -636,6 +658,7 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
                     Ok(order) => {
                         if let Some(id) = order["id"].as_str() {
                             s.active_protections.push((symbol.clone(), entry_side, id.to_string()));
+                            s.protection_kinds.insert(id.to_string(), "take");
                         }
                         events.push(json!({ "type": "order_update", "order": order }));
                     }
@@ -759,6 +782,8 @@ fn new_session(nick: String) -> Session {
         capital_usdt: 0.0,
         pending_protections: Vec::new(),
         entry_protections: EntryProtections::new(),
+        protection_kinds: HashMap::new(),
+        exit_reasons: HashMap::new(),
         active_protections: Vec::new(),
         diary_meta: json!({"drawings": [], "criteria": {}}),
         oi: Vec::new(),
@@ -1456,6 +1481,8 @@ impl Engine {
                     // The protective levels the trader planned for this entry,
                     // so the review can measure the outcome against the plan.
                     let plan = s.entry_protections.get(&t.entry_order_id);
+                    // Why it ended: the protective level that fired, if one did.
+                    let reason = s.exit_reasons.get(&t.exit_order_id).map(|k| json!(*k));
                     json!({
                         "symbol": t.symbol,
                         "side": t.side,
@@ -1478,6 +1505,7 @@ impl Engine {
                         "take_price": plan
                             .and_then(|p| p.get("take_price").cloned())
                             .unwrap_or(Value::Null),
+                        "exit_reason": reason.unwrap_or(Value::Null),
                     })
                 }).collect::<Vec<_>>(),
                 "positions": positions.iter().map(|p| {

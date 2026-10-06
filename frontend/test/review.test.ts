@@ -103,6 +103,30 @@ describe("classifyExit", () => {
   it("marks an unfinished trade as open", () => {
     assert.equal(classifyExit({ entry_price: 100, exit_price: 100 }, {}, true), "open");
   });
+
+  it("trusts the server's reason over price proximity", () => {
+    // A stop is a MARKET order: on a wide bar it can fill far past its trigger
+    // (measured in replay — trigger 79519, fill 79233). Without the explicit
+    // reason that stop-out would be reported as a manual exit and blamed on
+    // the trader.
+    assert.equal(
+      classifyExit({ entry_price: 100, exit_price: 91, exit_reason: "stop" }, { stop: 95 }),
+      "stop",
+      "0.4% past the trigger is still the stop doing its job",
+    );
+    assert.equal(
+      classifyExit({ entry_price: 100, exit_price: 115, exit_reason: "take" }, { target: 110 }),
+      "target",
+      "a gapped take-profit counts too",
+    );
+    assert.equal(
+      classifyExit({ entry_price: 100, exit_price: 100, exit_reason: "stop" }, {}),
+      "stop",
+      "the reason wins even with no recorded level",
+    );
+    // No reason recorded ⇒ fall back to the old price test.
+    assert.equal(classifyExit({ entry_price: 100, exit_price: 95.05 }, { stop: 95 }), "stop");
+  });
 });
 
 describe("buildReview", () => {
@@ -131,7 +155,9 @@ describe("buildReview", () => {
     const row = rows[0];
     assert.equal(row.mfeR, 6, "+30 over a 5-point risk = 6R");
     assert.equal(row.maeR, 0.2, "−1 over 5 = 0.2R");
-    assert.equal(row.gaveBackR, 6.5, "gave back 6R of favourable move while losing");
+    // Realized R comes from pnl / (stop distance × qty) = −5 / (5 × 1) = −1R —
+    // the same unit the excursion uses — so the whole swing was given back.
+    assert.equal(row.gaveBackR, 7, "6R of favourable move, and it ended −1R");
   });
 
   it("flags a trade that had no stop", () => {
@@ -148,6 +174,40 @@ describe("buildReview", () => {
     );
     assert.equal(rows[0].kind, "manual");
     assert.ok(rows[0].flags.includes("закрыл до стопа: правило не выдержано"));
+  });
+
+  it("falls back to percent when the entry had no stop", () => {
+    // No stop ⇒ no R (there is no defined risk), but "how far did it go" is
+    // still the question worth answering, so it is reported in percent.
+    const rows = buildReview(
+      [trade({ pnl: -3, r: 0 })],
+      () => [bar(T0, 100, 120, 90, 110), bar(T0 + 600_000, 110, 120, 90, 110)],
+      {},
+    );
+    const row = rows[0];
+    assert.equal(row.mfeR, null, "no stop means no R");
+    assert.equal(row.mfePct, 20, "+20 off a 100 entry");
+    assert.equal(row.maePct, 10, "−10 off a 100 entry");
+    assert.ok(row.flags.includes("без стопа — риск не определён"));
+  });
+
+  it("calls out a stop that filled past its trigger", () => {
+    // The market gapped through the level: 95 → 91 on a 100 entry is a 4% slip,
+    // which is a real cost of using a market stop and must not be hidden.
+    const rows = buildReview(
+      [trade({ exit_price: 91, pnl: -9, r: -1, exit_reason: "stop" })],
+      () => [bar(T0, 100, 101, 90, 92)],
+      { levels: { "e1-x1": { stop: 95 } } },
+    );
+    assert.equal(rows[0].kind, "stop", "the reason from the fill decides");
+    assert.ok(
+      rows[0].flags.some((f) => f.startsWith("стоп исполнен с пробоем: −4.00%")),
+      `the slip must be measured, got: ${rows[0].flags.join(" | ")}`,
+    );
+    assert.ok(
+      !rows[0].flags.includes("закрыл до стопа: правило не выдержано"),
+      "the trader followed the rule — the market gapped, they did not fold",
+    );
   });
 
   it("flags a losing trade that had been well in the profit", () => {

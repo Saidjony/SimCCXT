@@ -16,6 +16,28 @@ import {
   safeStats,
 } from "../trade/diary";
 import { criterionLabel } from "../trade/criteria";
+import { priceAxisFormat } from "../chart/overlays";
+import { buildReview } from "../trade/review";
+import type { ExitKind, ReviewRow } from "../trade/review";
+
+/** How a trade ended, in the trader's terms. */
+const KIND_LABEL: Record<ExitKind, string> = {
+  stop: "по стопу",
+  target: "по TP",
+  manual: "вручную",
+  open: "открыта",
+};
+
+/**
+ * How far the price went, in the unit the trade actually has: R when the entry
+ * carried a stop (so the risk is known), percent when it did not. Blank only
+ * when the bars for this symbol are not loaded.
+ */
+function fmtExcursion(r: number | null, pct: number | null, sign: "+" | "−"): string {
+  if (r !== null && Number.isFinite(r)) return `${sign}${r.toFixed(1)}R`;
+  if (pct !== null && Number.isFinite(pct)) return `${sign}${pct.toFixed(2)}%`;
+  return "—";
+}
 
 interface SortState {
   by: "time" | "r" | "pnl";
@@ -57,6 +79,15 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     else rows.sort((a, b) => m * (a.entry_time_ms - b.entry_time_ms));
     return rows;
   }, [visibleTrades, sort]);
+
+  // Per-trade post-mortem for the charted symbol: how far price went the
+  // trader's way before it hit them, and whether the exit followed their rule.
+  // Reuses the same logic as the review panel so both agree.
+  const reviewByRef = useMemo(() => {
+    const map = new Map<string, ReviewRow>();
+    for (const row of buildReview(visibleTrades, () => candles)) map.set(row.ref, row);
+    return map;
+  }, [visibleTrades, candles]);
 
   // Diary JSON (404 ⇒ the trader disconnected while we were loading).
   useEffect(() => {
@@ -317,6 +348,19 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
                 >
                   R {sortLabel(sort, "r")}
                 </th>
+                <th
+                  className="num"
+                  title="Насколько ход цены был в плюсе, пока сделка была открыта (в R)"
+                >
+                  Было в +
+                </th>
+                <th
+                  className="num"
+                  title="Насколько ход цены был против трейдера до выхода (в R)"
+                >
+                  Было в −
+                </th>
+                <th title="Как закрылась сделка: по своему стопу, по TP или вручную">Итог</th>
                 <th className="num">Комиссия</th>
               </tr>
             </thead>
@@ -324,6 +368,9 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
               {sortedTrades.map((t) => {
                 const ref = `${t.entry_order_id}-${t.exit_order_id}`;
                 const sel = ref === selectedRef;
+                // Only the charted symbol has bars loaded, so other symbols show
+                // "—" rather than a made-up excursion.
+                const review = reviewByRef.get(ref);
                 return (
                   <tr
                     key={ref}
@@ -344,6 +391,18 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
                     </td>
                     <td className={"num" + (t.r > 0 ? " pos" : t.r < 0 ? " neg" : "")}>
                       {(t.r > 0 ? "+" : "") + t.r.toFixed(2)}
+                    </td>
+                    {/* What the price actually did while the trade was open —
+                        in R when the entry had a stop (a defined risk), in
+                        percent otherwise; only the charted symbol has bars. */}
+                    <td className={"num" + ((review?.mfeR ?? 0) > 1 ? " pos" : "")}>
+                      {fmtExcursion(review?.mfeR ?? null, review?.mfePct ?? null, "+")}
+                    </td>
+                    <td className={"num" + ((review?.maeR ?? 0) > 1 ? " neg" : "")}>
+                      {fmtExcursion(review?.maeR ?? null, review?.maePct ?? null, "−")}
+                    </td>
+                    <td className={"exit-kind " + (review?.kind ?? "manual")}>
+                      {review ? KIND_LABEL[review.kind] : "—"}
                     </td>
                     <td className="num">{fmtPnl(-Math.abs(t.fee))}</td>
                   </tr>
@@ -421,6 +480,7 @@ function DiaryChart({
       downColor: "#d46666",
       thinBars: false,
     });
+    series.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(1) } });
     chartRef.current = chart;
     seriesRef.current = series;
     const observer = new ResizeObserver(() => {
@@ -450,6 +510,12 @@ function DiaryChart({
         close: c[4],
       })),
     );
+    // Tick size follows the price magnitude, so a 0.09 pair is not rounded to
+    // whole cents on the review chart either.
+    const lastCandle = candles[candles.length - 1];
+    if (lastCandle) {
+      series.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(lastCandle[4]) } });
+    }
 
     // Drop previous segment lines.
     for (const ls of lineSeriesRef.current) {

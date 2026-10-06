@@ -6,6 +6,8 @@ import {
   barWord,
   calcQty,
   riskAtStop,
+  priceAxisFormat,
+  priceTick,
   countBars,
   alignOiToCandles,
   cumulativeDelta,
@@ -195,6 +197,44 @@ describe("invertTime", () => {
 
   it("returns null without data", () => {
     assert.equal(invertTime(50, [], toCoord), null);
+  });
+});
+
+describe("priceTick", () => {
+  it("scales the axis step with the price magnitude", () => {
+    // The bug: lightweight-charts defaults minMove to 0.01, so DOGE at 0.09
+    // could only ever step by whole cents — "точную цену не видно" and the order
+    // ticket was unusable.
+    assert.equal(priceTick(0.09), 0.0001, "a sub-cent pair needs sub-cent steps");
+    assert.equal(priceTick(0.9), 0.001);
+    assert.equal(priceTick(8), 0.01);
+    assert.equal(priceTick(80), 0.1);
+    assert.equal(priceTick(80_000), 1);
+  });
+
+  it("keeps the tick a clean power of ten", () => {
+    for (const price of [0.00012, 0.09, 1, 1.05, 79_967.9, 123_456]) {
+      const tick = priceTick(price);
+      const exponent = Math.round(Math.log10(tick));
+      assert.ok(
+        Math.abs(tick - Math.pow(10, exponent)) < 1e-12,
+        `${price} → ${tick} must be a clean power of ten`,
+      );
+    }
+  });
+
+  it("falls back for a missing or broken price", () => {
+    assert.equal(priceTick(0), 0.01);
+    assert.equal(priceTick(Number.NaN), 0.01);
+    assert.equal(priceTick(-5), 0.01);
+  });
+
+  it("derives the decimals the axis must print", () => {
+    assert.deepEqual(priceAxisFormat(0.09), { precision: 4, minMove: 0.0001 });
+    // Whole units are as fine as BTC needs: labels stay 79 967 / 79 968, not
+    // "79967.000".
+    assert.deepEqual(priceAxisFormat(79_967.9), { precision: 0, minMove: 1 });
+    assert.equal(priceAxisFormat(0).precision, 2);
   });
 });
 

@@ -123,6 +123,10 @@ export interface DiaryTrade {
    *  not recorded). The review measures the outcome against these. */
   stop_price?: number | null;
   take_price?: number | null;
+  /** Which protective order closed the trade (`"stop"` / `"take"`), or null for
+   *  a manual exit. The server knows this from the fill; price proximity does
+   *  not — a stop is a market order and can fill far past its trigger. */
+  exit_reason?: "stop" | "take" | null;
   entry_order_id: string;
   exit_order_id: string;
 }

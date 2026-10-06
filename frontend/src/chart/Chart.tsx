@@ -28,6 +28,7 @@ import {
   nearestCandleTime,
   positionBands,
   positionDirection,
+  priceAxisFormat,
   pairTradeFills,
   profileBarLayout,
   riskReward,
@@ -1481,6 +1482,10 @@ function pushBars(
   full: boolean,
 ): void {
   if (!rows.length) return;
+  // Tick size follows the price magnitude: a 0.09 DOGE needs five decimals or
+  // the axis rounds to whole cents and the trader cannot read the price.
+  const last = rows[rows.length - 1];
+  bars.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(last[4]) } });
   if (full) {
     bars.setData(
       rows.map((r) => ({ time: toTime(r[0]), open: r[1], high: r[2], low: r[3], close: r[4] })),
@@ -1494,7 +1499,6 @@ function pushBars(
     );
     chart.timeScale().fitContent();
   } else {
-    const last = rows[rows.length - 1];
     bars.update({ time: toTime(last[0]), open: last[1], high: last[2], low: last[3], close: last[4] });
     volume.update({
       time: toTime(last[0]),
