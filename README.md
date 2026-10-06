@@ -125,7 +125,12 @@ chart retains OHLC bars, volume, drawings, crosshair, zoom/pan and fills markers
 sub-panes: `chart.addPane()`), not separate charts — one clock, one crosshair,
 one zoom and one time axis, split by the library's own draggable dividers. OI is
 revealed incrementally with replay candles, so samples the replay clock has not
-reached yet stay hidden; CVD is computed client-side over the visible series.
+reached yet stay hidden. The pane unions every OI grid cached for the symbol: a
+grid only reaches back a fixed number of steps from its download moment (five
+days at 5m), so an older coarse cache can still cover the history the replay
+starts on where a fresh fine one cannot — an empty pane would otherwise be the
+only thing a fine grid shows. CVD is computed client-side over the visible
+series.
 Each pane owns its legend chip and price axis, so indicator updates can never
 push or jitter the price pane. `Follow: ON` scrolls to the newest bar as replay
 advances; `OFF` preserves the manually selected view. Toggle panes with the
@@ -363,7 +368,10 @@ CCXT's unified exchange API, so the terminal loads no data itself:
 - Download: CCXT Rust is built with only the `binance`, `bybit` and `okx`
   features; no API keys are required for public OHLCV.
 - Open interest is requested through CCXT where the selected venue supports
-  unified open-interest history. Samples are cached per exchange and symbol.
+  unified open-interest history. Samples are cached per exchange and symbol;
+  every grid cached for the symbol is merged into one windowed series (finer
+  samples win on equal timestamps) and the legend names the grid the chart
+  asked for while that grid still contributes.
 - Online unsupported/invalid markets return a clear error instead of synthetic
   data. `--offline` disables downloads and uses deterministic synthetic data.
 - `Engine::new` defaults to `allow_net=false`, so unit tests remain offline.
