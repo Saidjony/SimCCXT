@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
@@ -941,6 +941,89 @@ fn coarsest_finer_cached_oi(
     None
 }
 
+/// OI grids a symbol may have on disk (see `oi_period`), finest first.
+const OI_GRIDS: [&str; 5] = ["5m", "15m", "1h", "4h", "1d"];
+
+/// Union the session's OI series with every other cached grid for this
+/// symbol, clipped to the replay window.
+///
+/// The chart asks for one grid — the one matching its timeframe — but a grid
+/// only reaches back `oi_points` steps (five days at 5m) and is anchored at
+/// download time, so at the reveal point it can sit entirely ahead of the
+/// clock while an older, coarser cache still covers the pre-revealed history.
+/// Real points from any grid beat a blank pane, so all of them go into the
+/// series: the finer grid wins where two grids sample the same instant, rows
+/// stay sorted by timestamp for the engine's replay-position slicing, and the
+/// legend keeps naming the grid the chart asked for as long as that grid's own
+/// samples are in the series — otherwise it names the finest grid that is.
+pub(super) fn merge_cached_oi(
+    exchange: &str,
+    symbol: &str,
+    data_dir: &Path,
+    loaded: Vec<(i64, f64)>,
+    loaded_period: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> (Vec<(i64, f64)>, String) {
+    let mut by_ts: BTreeMap<i64, (u64, f64)> = BTreeMap::new();
+    insert_oi_grid(&mut by_ts, loaded_period, loaded, start_ms, end_ms);
+    for period in OI_GRIDS {
+        if period == loaded_period {
+            continue;
+        }
+        let path = data_dir.join(oi_file(exchange, symbol, period));
+        if let Some(rows) = load_pairs_csv(&path) {
+            insert_oi_grid(&mut by_ts, period, rows, start_ms, end_ms);
+        }
+    }
+    // The legend names the requested grid whenever its own samples survived the
+    // window; a pane fed only by borrowed grids says which grid serves it.
+    let requested = if loaded_period.is_empty() {
+        None
+    } else {
+        Some(tf_step_ms(loaded_period))
+    };
+    let period = match requested {
+        Some(step) if by_ts.values().any(|(has, _)| *has == step) => loaded_period,
+        _ => by_ts
+            .values()
+            .map(|(step, _)| *step)
+            .min()
+            .and_then(|step| OI_GRIDS.iter().copied().find(|grid| tf_step_ms(grid) == step))
+            .unwrap_or(loaded_period),
+    };
+    let rows = by_ts
+        .into_iter()
+        .map(|(ts, (_, value))| (ts, value))
+        .collect();
+    (rows, period.to_string())
+}
+
+/// Clip one grid to the window and merge it in. An instant already sampled by
+/// an equal or finer grid (smaller step) keeps the sample it has.
+fn insert_oi_grid(
+    by_ts: &mut BTreeMap<i64, (u64, f64)>,
+    period: &str,
+    rows: Vec<(i64, f64)>,
+    start_ms: i64,
+    end_ms: i64,
+) {
+    use std::collections::btree_map::Entry;
+    let step = tf_step_ms(period);
+    for (ts, value) in rows {
+        if ts < start_ms || ts > end_ms || !value.is_finite() {
+            continue;
+        }
+        match by_ts.entry(ts) {
+            Entry::Occupied(slot) if slot.get().0 <= step => {}
+            Entry::Occupied(mut slot) => slot.get_mut().1 = value,
+            Entry::Vacant(slot) => {
+                slot.insert((step, value));
+            }
+        }
+    }
+}
+
 /// Make sure `symbol@timeframe` is loaded. Order: already in memory →
 /// disk cache → CCXT download (saved to cache) → synthetic fallback.
 /// Network is only attempted when `allow_net` (off in unit tests, and with
@@ -1192,6 +1275,74 @@ mod tests {
         assert_eq!(loaded.len(), 5);
         // 5m target: 15m is coarser, so no fallback.
         assert!(coarsest_finer_cached_oi("binance", "ETH/USDT", "5m", &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_cached_oi_borrows_the_older_grid_for_the_revealed_history() {
+        let dir = std::env::temp_dir().join(format!("simccxt-oimerge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hour = 3_600_000i64;
+        let start = 1_790_000_000_000i64;
+        let reveal = start + 24 * hour;
+        let end = start + 48 * hour;
+
+        // The requested 5m grid was downloaded late: every sample sits after
+        // the reveal point, so the clock filter would show nothing.
+        let fine: Vec<(i64, f64)> = (1..=12)
+            .map(|i| (reveal + i * 300_000, 100.0 + i as f64))
+            .collect();
+        save_pairs_csv(&dir.join(oi_file("binance", "BTC/USDT", "5m")), &fine).expect("save 5m");
+        // An older hourly cache covers the history the replay starts on. Its
+        // last row lands outside the window and must be clipped.
+        let coarse: Vec<(i64, f64)> = (0..=49)
+            .map(|m| (start + m * hour, if m == 25 { 1_000.0 } else { 50.0 + m as f64 }))
+            .collect();
+        save_pairs_csv(&dir.join(oi_file("binance", "BTC/USDT", "1h")), &coarse).expect("save 1h");
+
+        let (rows, period) =
+            merge_cached_oi("binance", "BTC/USDT", &dir, fine, "5m", start, end);
+
+        assert!(
+            rows.iter().any(|(ts, _)| *ts <= reveal),
+            "the pre-revealed history comes from the older grid: {} rows",
+            rows.len()
+        );
+        assert!(
+            rows.iter().any(|(ts, _)| *ts > reveal),
+            "the requested grid stays in: {rows:?}"
+        );
+        assert!(rows.windows(2).all(|w| w[0].0 < w[1].0), "sorted, no duplicates");
+        assert!(
+            rows.iter().all(|(ts, _)| (start..=end).contains(ts)),
+            "clipped to the replay window"
+        );
+        // The hour is also a 5m instant: the finer grid owns it.
+        let shared = rows.iter().find(|(ts, _)| *ts == start + 25 * hour).unwrap();
+        assert_eq!(shared.1, 112.0, "the finer grid wins a shared instant");
+        assert_eq!(period, "5m", "the legend keeps the grid the chart asked for");
+
+        // An hourly pane keeps saying 1h even with finer rows merged in.
+        let (rows, period) = merge_cached_oi(
+            "binance",
+            "BTC/USDT",
+            &dir,
+            coarse.clone(),
+            "1h",
+            start,
+            end,
+        );
+        assert_eq!(period, "1h");
+        assert!(
+            rows.iter().any(|(ts, _)| *ts > reveal),
+            "the borrowed finer grid is in the series too"
+        );
+
+        // Nothing requested and nothing finer: the coarse grid names itself.
+        std::fs::remove_file(dir.join(oi_file("binance", "BTC/USDT", "5m"))).ok();
+        let (rows, period) = merge_cached_oi("binance", "BTC/USDT", &dir, Vec::new(), "", start, end);
+        assert_eq!(period, "1h");
+        assert!(!rows.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

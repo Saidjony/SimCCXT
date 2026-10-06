@@ -11,7 +11,10 @@
     "test": "node --test test/"
   },
   "dependencies": {
-    "lightweight-charts": "4.2.3",
+    "@tradingview/lwc-plugin-vertical-line": "1.0.0",
+    "@tradingview/lwc-toolkit": "1.0.0",
+    "fancy-canvas": "2.1.0",
+    "lightweight-charts": "5.2.1",
     "react": "18.3.1",
     "react-dom": "18.3.1"
   },
@@ -22,5 +25,8 @@
     "@vitejs/plugin-react": "4.3.4",
     "typescript": "5.6.3",
     "vite": "^6.4.3"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
   }
 }

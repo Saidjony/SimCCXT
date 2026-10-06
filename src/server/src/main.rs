@@ -43,7 +43,8 @@ use simccxt_core::Symbol;
 use simccxt_exchange::{CreateOrderParams, Exchange};
 use crate::market_data::{
     apply_series_window, ensure_oi, ensure_series, ensure_series_window, mark_background_net,
-    oi_cache_hit, oi_period, tf_step_ms, warm_oi_cache, warm_series_cache, SeriesRequest,
+    merge_cached_oi, oi_cache_hit, oi_period, tf_step_ms, warm_oi_cache, warm_series_cache,
+    SeriesRequest,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, oneshot};
@@ -913,7 +914,22 @@ fn use_series(
     } else {
         reset_ms
     };
-    s.oi.retain(|(ts, _)| *ts >= start_ms && *ts <= end_ms);
+    // OI for this window comes from every cached grid, not just the one the
+    // timeframe asked for: a grid only reaches back `oi_points` steps from its
+    // download moment (five days at 5m), so at the reveal point it can start
+    // ahead of the clock while an older coarse cache still covers the
+    // pre-revealed history — the pane would otherwise render nothing.
+    let (oi, oi_period) = merge_cached_oi(
+        &exchange,
+        &symbol,
+        data_dir,
+        std::mem::take(&mut s.oi),
+        &s.oi_period,
+        start_ms,
+        end_ms,
+    );
+    s.oi = oi;
+    s.oi_period = oi_period;
     s.step_ms = step_ms;
     s.range_start_ms = start_ms;
     s.reveal_start_ms = reveal_start_ms;
@@ -2647,6 +2663,83 @@ mod tests {
         assert!(eng.sessions[&1].ex.is_paused(), "reset pauses");
         // The clock is back at the reveal point, ready to replay the same bars.
         assert!(eng.sessions[&1].ex.now_ms() < revealed_before);
+    }
+
+    #[test]
+    fn oi_pane_gets_samples_behind_the_replay_clock() {
+        // Regression: the OI grid is downloaded anchored at wall-clock "now"
+        // and only reaches back `oi_points` steps (five days at 5m), so at the
+        // reveal point every one of its samples sat ahead of the clock and the
+        // client's `ts <= replayNow` filter drew an empty pane — while an
+        // older, coarser cache still covered the history being replayed.
+        let dir = std::env::temp_dir().join(format!("simccxt-oi-reveal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock ahead of the epoch")
+            .as_millis() as i64;
+        let hour = 3_600_000i64;
+        // The requested grid, as a late download leaves it: five-minute rows
+        // hugging "now", every one of them ahead of the reveal point.
+        let fine: Vec<i64> = (12..288).map(|k| now - k * 300_000).collect();
+        // An older hourly cache reaching a month and a half back — past the
+        // window start, so the clipping below has something to cut.
+        let coarse: Vec<i64> = (0..60 * 24).map(|k| now - k * hour).collect();
+        std::fs::write(dir.join("BTCUSDT_oi_5m.csv"), oi_csv(&fine, 100.0)).unwrap();
+        std::fs::write(dir.join("BTCUSDT_oi_1h.csv"), oi_csv(&coarse, 50.0)).unwrap();
+
+        let (tx, mut rx) = broadcast::channel::<String>(1024);
+        let mut eng = Engine::new(tx);
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "5m"), &dir);
+        let _ = last_snapshot(&mut rx);
+
+        let s = &eng.sessions[&1];
+        let clock = s.ex.now_ms();
+        // The reveal point must sit well before the 5m rows, or the pane could
+        // be fed by the requested grid alone and the regression would hide.
+        assert!(
+            clock < now - 48 * hour,
+            "setup: the reveal point ({clock}) must precede the 5m rows ({})", now - 24 * hour
+        );
+        let window = s.range_start_ms..=s.range_end_ms;
+        let revealed: Vec<i64> = s
+            .oi
+            .iter()
+            .map(|(oi_ts, _)| *oi_ts)
+            .filter(|oi_ts| *oi_ts <= clock)
+            .collect();
+        assert!(
+            !revealed.is_empty(),
+            "the pane needs at least one sample the clock has passed (clock {clock}, {} rows)",
+            s.oi.len()
+        );
+        assert!(
+            revealed.iter().all(|oi_ts| coarse.contains(oi_ts)),
+            "everything behind the clock comes from the older grid: {revealed:?}"
+        );
+        assert!(
+            s.oi.iter().any(|(oi_ts, _)| *oi_ts > clock),
+            "the requested grid's own samples stay in"
+        );
+        assert!(
+            s.oi.iter().all(|(oi_ts, _)| window.contains(oi_ts)),
+            "rows outside the replay window are clipped"
+        );
+        assert!(
+            s.oi.windows(2).all(|w| w[0].0 < w[1].0),
+            "sorted by timestamp, no duplicates"
+        );
+        assert_eq!(s.oi_period, "5m", "the legend keeps the requested grid");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two-column `ts_ms,oi` cache file, shaped like `save_pairs_csv`'s.
+    fn oi_csv(ts: &[i64], value: f64) -> String {
+        let mut out = String::from("ts_ms,oi\n");
+        for t in ts {
+            out.push_str(&format!("{t},{value}\n"));
+        }
+        out
     }
 
     #[test]

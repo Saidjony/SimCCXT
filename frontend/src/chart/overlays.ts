@@ -316,28 +316,6 @@ export function nearestCandleTime(times: number[], timestamp: number): number | 
   return times[lo];
 }
 
-/** Align sparse OI samples to candle timestamps using the last known value. */
-export function alignOiToCandles(
-  rows: OhlcRow[],
-  samples: Array<[number, number]>,
-): Array<[number, number]> {
-  const ordered = samples
-    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value))
-    .slice()
-    .sort((a, b) => a[0] - b[0]);
-  const out: Array<[number, number]> = [];
-  let sampleIndex = 0;
-  let current: number | null = null;
-  for (const row of rows) {
-    while (sampleIndex < ordered.length && ordered[sampleIndex][0] <= row[0]) {
-      current = ordered[sampleIndex][1];
-      sampleIndex += 1;
-    }
-    if (current !== null) out.push([row[0], current]);
-  }
-  return out;
-}
-
 export interface ProfileBarPosition {
   top: number;
   height: number;
