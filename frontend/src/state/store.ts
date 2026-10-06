@@ -355,6 +355,13 @@ export interface SimState {
   /** Risk terminal: starting capital (reference) and fixed risk per trade. */
   initialCapitalUsdt: number;
   fixedRiskUsdt: number;
+  /**
+   * Venue commission rates (fractions) from the last snapshot. Risk-based
+   * sizing needs them: a tight stop means a big notional, and the fee on that
+   * notional is part of what a losing trade costs. Null until the first
+   * snapshot arrives.
+   */
+  feeRates: { maker: number; taker: number } | null;
   /** Right-panel coin list: add / remove / flag (pinned to the top). */
   watchlist: CoinEntry[];
   /** Setup checklist: selected criterion ids → chips on the chart overlay. */
@@ -449,6 +456,7 @@ let state: SimState = {
   positionSizeUsdt: 100,
   initialCapitalUsdt: 1000,
   fixedRiskUsdt: 10,
+  feeRates: null,
   watchlist: loadWatchlist(),
   criteria: loadCriteria(),
   chartCriteria: loadChartCriteria(),
@@ -552,6 +560,8 @@ export const store = {
       error: null,
       drawings,
       drawingsBySymbol,
+      // Risk-based sizing needs the venue's fee rates; keep the last known.
+      feeRates: account.fees ?? state.feeRates,
       // A selection points into the stashed set: drop it when coins change.
       selectedId: switching ? null : state.selectedId,
     });

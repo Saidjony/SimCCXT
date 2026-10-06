@@ -36,7 +36,7 @@ body {
 .exchange-picker select { padding: 4px 8px; border-color: #334155; font-weight: 600; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
 .dot.on { background: var(--green); }
-.topbar > .err { margin: 0 0 0 auto; }
+.topbar > .err { margin: 0; }
 /* Topbar cluster next to the nick: timeframe picker, hotkeys hint, warm-up. */
 .topbar-tools {
   display: flex; align-items: center; gap: 6px;
@@ -156,7 +156,34 @@ body {
 .btn-sm { padding: 3px 10px; font-size: 12px; }
 .btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .close-market-btn { display: block; width: 100%; margin-top: 6px; font-weight: 600; letter-spacing: 0.2px; }
-.side-toggle { padding: 3px 9px; }
+/* Post-trade review of the current session. */
+.review-card { display: flex; flex-direction: column; gap: 8px; }
+.review-summary {
+  display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--muted);
+}
+.review-summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.review-line {
+  border: 1px solid var(--line); border-left-width: 3px; border-radius: 4px;
+  padding: 6px 8px; display: flex; flex-direction: column; gap: 4px;
+  background: #0d1117;
+}
+.review-line.stop { border-left-color: var(--red); }
+.review-line.target { border-left-color: var(--green); }
+.review-line.manual { border-left-color: #e0af68; }
+.review-line.open { border-left-color: var(--accent); }
+.review-line-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
+.review-kind { color: var(--muted); font-size: 11px; }
+.review-line-meta { font-size: 10px; }
+.review-flag { font-size: 11px; color: #e0af68; }
+.review-note {
+  width: 100%; resize: vertical; font-size: 11px; padding: 4px 6px;
+  background: #0b0e13; color: var(--text); border: 1px solid var(--line); border-radius: 3px;
+}
+
+/* Panel toggle: the free space of the bar goes here, so the button always sits
+   on the right edge (and an error message stays next to the controls it came
+   from instead of stealing the gap). */
+.side-toggle { padding: 3px 9px; flex: 0 0 auto; margin-left: auto; }
 .card {
   background: linear-gradient(180deg, #161e2b 0%, var(--panel) 100%);
   border: 1px solid var(--line);
@@ -583,6 +610,8 @@ td, th { padding: 3px 4px; }
 .diary-nick { font-size: 20px; font-weight: 600; color: var(--text); }
 .diary-note { color: var(--muted); font-size: 13px; padding: 18px 0; }
 .diary-note.err { color: var(--red); }
+/* Partial candle coverage: some entry/exit markers fall outside the chart. */
+.diary-note.warn { color: #e0af68; padding: 6px 0 0; }
 .diary-stats {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   gap: 8px; margin-bottom: 14px;

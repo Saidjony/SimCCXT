@@ -6,13 +6,15 @@ import {
   chartRange,
   diaryMarkers,
   diarySymbols,
+  fmtChartTime,
   fmtPnl,
   fmtPrice,
+  markersOutsideCandles,
   overallR,
   safeStats,
   traderFromSearch,
 } from "../src/trade/diary.ts";
-import type { DiaryData, DiaryPosition, DiaryTrade } from "../src/types/protocol.ts";
+import type { CandleRow, DiaryData, DiaryPosition, DiaryTrade } from "../src/types/protocol.ts";
 import { apiBaseFrom } from "../src/types/protocol.ts";
 
 describe("traderFromSearch", () => {
@@ -88,13 +90,27 @@ describe("diaryMarkers", () => {
     assert.equal(m[1].kind, "exit");
     assert.ok(m[0].time_ms <= m[1].time_ms);
     assert.match(m[0].text, /ВХОД LONG/);
-    assert.match(m[1].text, /ВЫХОД \+10/);
+    assert.match(m[1].text, /ВЫХОД 110\.00/);
+    assert.match(m[1].text, /\+10/, "the exit label carries the PnL");
   });
 
   it("labels a short correctly", () => {
     const m = diaryMarkers([trade({ side: "short", direction: "sell→buy" })], [], "BTC/USDT");
     assert.match(m[0].text, /ВХОД SHORT/);
     assert.equal(m[0].side, "short");
+  });
+
+  it("labels every marker with its UTC time, so entry and exit are told apart", () => {
+    // The chart time axis is UTC, so the label must match it.
+    const m = diaryMarkers(
+      [trade({ entry_time_ms: Date.UTC(2026, 8, 5, 12, 5), exit_time_ms: Date.UTC(2026, 8, 7, 1, 55) })],
+      [],
+      "BTC/USDT",
+    );
+    assert.match(m[0].text, /09-05 12:05/, `entry label: ${m[0].text}`);
+    assert.match(m[1].text, /09-07 01:55/, `exit label: ${m[1].text}`);
+    assert.match(m[0].text, /100\.00/, "entry shows its price");
+    assert.match(m[1].text, /110\.00/, "exit shows its price");
   });
 
   it("adds an entry marker for an open position", () => {
@@ -125,6 +141,60 @@ describe("diarySymbols", () => {
 
   it("is empty for an empty diary", () => {
     assert.deepEqual(diarySymbols(data()), []);
+  });
+});
+
+describe("markersOutsideCandles", () => {
+  const candles = (...ts: number[]): CandleRow[] =>
+    ts.map((t) => [t, 1, 2, 0.5, 1.5, 10]);
+
+  it("returns null when every marker falls inside the loaded candles", () => {
+    assert.equal(
+      markersOutsideCandles(
+        [trade({ entry_time_ms: 2_000, exit_time_ms: 8_000 })],
+        [],
+        "BTC/USDT",
+        candles(1_000, 3_000, 5_000, 7_000, 9_000),
+      ),
+      null,
+    );
+  });
+
+  it("counts the markers the chart cannot draw", () => {
+    // The server's cache holds only a recent tail: the early trade is off-chart.
+    const got = markersOutsideCandles(
+      [
+        trade({ entry_time_ms: 1_000, exit_time_ms: 2_000 }),
+        trade({ entry_time_ms: 70_000, exit_time_ms: 90_000, entry_order_id: "e2", exit_order_id: "x2" }),
+      ],
+      [pos({ entry_time_ms: 95_000 })],
+      "BTC/USDT",
+      candles(50_000, 60_000, 70_000),
+    );
+    assert.ok(got);
+    // The first trade's entry AND exit (2), the second trade's exit only —
+    // its entry sits exactly on the last bar (1) — plus the position (1).
+    assert.equal(got.outside, 4);
+    assert.equal(got.total, 5);
+    assert.equal(got.from, 50_000);
+    assert.equal(got.to, 70_000);
+  });
+
+  it("returns null without candles or without markers", () => {
+    assert.equal(markersOutsideCandles([trade()], [], "BTC/USDT", []), null);
+    assert.equal(markersOutsideCandles([], [], "BTC/USDT", candles(1, 2)), null);
+  });
+
+  it("ignores trades of another symbol", () => {
+    assert.equal(
+      markersOutsideCandles(
+        [trade({ symbol: "ETH/USDT", entry_time_ms: 1, exit_time_ms: 2 })],
+        [],
+        "BTC/USDT",
+        candles(50_000, 60_000),
+      ),
+      null,
+    );
   });
 });
 
@@ -190,6 +260,13 @@ describe("stats guards", () => {
 });
 
 describe("formatters", () => {
+  it("fmtChartTime stamps in UTC, matching the chart's time axis", () => {
+    assert.equal(fmtChartTime(Date.UTC(2026, 8, 5, 12, 5)), "09-05 12:05");
+    assert.equal(fmtChartTime(Date.UTC(2026, 0, 1, 0, 0)), "01-01 00:00");
+    assert.equal(fmtChartTime(0), "", "unset times get no label");
+    assert.equal(fmtChartTime(NaN), "");
+  });
+
   it("fmtPrice keeps 2 decimals for normal prices", () => {
     assert.equal(fmtPrice(64120.5), "64120.50");
     assert.equal(fmtPrice(Number.NaN), "—");

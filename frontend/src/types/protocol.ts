@@ -67,6 +67,8 @@ export interface AccountSnapshot {
   balances: Record<string, BalanceLine>;
   positions: PositionLine[];
   open: OrderLine[];
+  /** Venue commission rates (fractions); clients size risk-based orders with them. */
+  fees?: { maker: number; taker: number };
   pnl: { realized: number; unrealized: number; fees: number };
 }
 
@@ -117,6 +119,10 @@ export interface DiaryTrade {
   entry_fee: number;
   exit_fee: number;
   fee: number;
+  /** Protective levels the trader planned for this entry (null = not set /
+   *  not recorded). The review measures the outcome against these. */
+  stop_price?: number | null;
+  take_price?: number | null;
   entry_order_id: string;
   exit_order_id: string;
 }

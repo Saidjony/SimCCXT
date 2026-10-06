@@ -464,6 +464,13 @@ impl Exchange {
             "balances": balances,
             "positions": positions,
             "open": orders,
+            // The venue's actual commission, so the client can size a trade by
+            // its true cost (price distance to the stop PLUS fees) instead of
+            // silently spending more than the trader's risk budget.
+            "fees": json!({
+                "maker": self.broker.fee_schedule().maker,
+                "taker": self.broker.fee_schedule().taker,
+            }),
             "pnl": json!({
                 "realized": realized_pnl,
                 "unrealized": unrealized_pnl,

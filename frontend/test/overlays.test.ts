@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   barWord,
   calcQty,
+  riskAtStop,
   countBars,
   alignOiToCandles,
   cumulativeDelta,
@@ -203,10 +204,57 @@ describe("calcQty", () => {
     assert.equal(calcQty(10, 100, 110), 1);
   });
 
+  it("keeps the whole budget inside the risk, commission included", () => {
+    // The regression: sizing on price distance alone overspends the budget,
+    // because a tight stop means a large notional and a large fee. A 1% stop on
+    // a $79 700 BTC with a $10 budget used to become a $1000 position, so the
+    // stop cost $15.91 instead of $10 (1.59R).
+    const RISK = 10, BTC = 79_704, TAKER = 0.0025;
+    for (const stopPct of [0.5, 1, 2, 3, 5]) {
+      const entry = BTC;
+      const sl = entry * (1 - stopPct / 100);
+      const qty = calcQty(RISK, entry, sl, TAKER);
+      assert.ok(qty !== null, `${stopPct}% stop must be sizeable`);
+      const worst = riskAtStop(qty, entry, sl, TAKER);
+      assert.ok(worst !== null, `${stopPct}% stop must have a worst case`);
+      assert.ok(
+        Math.abs(worst - RISK) < 1e-9,
+        `${stopPct}% stop: worst case ${worst} must equal the ${RISK} budget`,
+      );
+    }
+  });
+
+  it("shrinks the size as the fee grows", () => {
+    const noFee = calcQty(10, 100, 99, 0);
+    const withFee = calcQty(10, 100, 99, 0.0025);
+    assert.ok(noFee !== null && withFee !== null);
+    assert.ok(withFee < noFee, `fee must reduce size: ${withFee} vs ${noFee}`);
+  });
+
+  it("treats a missing fee rate as no fee", () => {
+    assert.equal(calcQty(10, 100, 90, 0), 1, "feeRate 0 = price distance only");
+  });
+
   it("blocks degenerate input", () => {
     assert.equal(calcQty(10, 100, 100), null);
     assert.equal(calcQty(0, 100, 90), null);
     assert.equal(calcQty(10, Number.NaN, 90), null);
+    assert.equal(calcQty(10, 100, 90, -0.1), 1, "a negative rate is treated as no fee");
+    assert.equal(calcQty(10, 100, 90, Number.NaN), 1);
+  });
+});
+
+describe("riskAtStop", () => {
+  it("is price distance plus the round-trip commission", () => {
+    // 1 unit at 100 with the stop at 99 loses 1, plus 0.1 entry + 0.1 exit fee.
+    assert.equal(riskAtStop(2, 100, 99, 0.0005), 2 * (1 + 2 * 100 * 0.0005));
+    assert.equal(riskAtStop(2, 100, 99), 2, "without a fee rate it is pure distance");
+  });
+
+  it("blocks degenerate input", () => {
+    assert.equal(riskAtStop(0, 100, 99), null);
+    assert.equal(riskAtStop(2, 100, 100), null);
+    assert.equal(riskAtStop(2, Number.NaN, 99), null);
   });
 
   it("pluralizes bars in Russian", () => {

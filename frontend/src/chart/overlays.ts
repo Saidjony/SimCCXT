@@ -219,15 +219,56 @@ export function formatCompactUsdt(v: number): string {
 }
 
 /**
- * Risk-based size: qty = riskUsdt / |entry - sl|.
+ * Risk-based size, fees included.
+ *
+ * The trader's risk budget must cover the WHOLE cost of being wrong: the price
+ * distance to the stop PLUS the round-trip commission. Sizing on price distance
+ * alone ("risk / |entry - stop|") silently overspends the budget, because a
+ * tight stop means a large notional and therefore a large fee: at a 1% stop on
+ * BTC a $10 risk became a $1000 position paying ~$5 of fees, i.e. a 1.6R loss
+ * on a "10 dollar" trade.
+ *
+ * With a taker fee of `feeRate` per side, one unit costs
+ * `|entry - sl| + 2 * entry * feeRate`, so:
+ *
+ *     qty = risk / (|entry - sl| + 2 * entry * feeRate)
+ *
+ * `feeRate` is a fraction (0.0025 = 0.25%); null/0 means fees are ignored.
  * Null when inputs are unusable (missing/degenerate stop) — entry is blocked.
  */
-export function calcQty(riskUsdt: number, entry: number, sl: number): number | null {
+export function calcQty(
+  riskUsdt: number,
+  entry: number,
+  sl: number,
+  feeRate = 0,
+): number | null {
   if (!(riskUsdt > 0) || !Number.isFinite(entry) || !Number.isFinite(sl)) return null;
   const dist = Math.abs(entry - sl);
   if (!(dist > 0)) return null;
-  const qty = riskUsdt / dist;
+  const fee = Number.isFinite(feeRate) && feeRate > 0 ? feeRate : 0;
+  const perUnit = dist + 2 * Math.abs(entry) * fee;
+  const qty = riskUsdt / perUnit;
   return Number.isFinite(qty) && qty > 0 ? qty : null;
+}
+
+/**
+ * What the trade costs if the stop is hit: the price distance plus the
+ * round-trip commission, in USDT. Null when inputs are unusable.
+ *
+ * This is the number the trader must compare with `riskUsdt` — it is what the
+ * diary's R is measured against, so anything else makes R a lie.
+ */
+export function riskAtStop(
+  qty: number,
+  entry: number,
+  sl: number,
+  feeRate = 0,
+): number | null {
+  if (!(qty > 0) || !Number.isFinite(entry) || !Number.isFinite(sl)) return null;
+  const dist = Math.abs(entry - sl);
+  if (!(dist > 0)) return null;
+  const fee = Number.isFinite(feeRate) && feeRate > 0 ? feeRate : 0;
+  return qty * (dist + 2 * Math.abs(entry) * fee);
 }
 
 export type OhlcRow = [number, number, number, number, number, number];

@@ -200,26 +200,171 @@ fn load_csv(path: &PathBuf) -> Option<Vec<OHLCV>> {
 }
 
 /// Write candles to the on-disk cache (`ts_ms,open,high,low,close,volume`).
+///
+/// Written to a sibling temp file and renamed into place, so a reader (or a
+/// second session downloading the same tail) never sees a half-written series.
 fn save_csv(path: &Path, candles: &[OHLCV]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let mut wtr = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
-    wtr.write_record(["ts_ms", "open", "high", "low", "close", "volume"])
-        .map_err(|e| e.to_string())?;
-    for c in candles {
-        wtr.write_record([
-            c.timestamp.timestamp_millis().to_string(),
-            c.open.to_string(),
-            c.high.to_string(),
-            c.low.to_string(),
-            c.close.to_string(),
-            c.volume.to_string(),
-        ])
-        .map_err(|e| e.to_string())?;
+    let tmp = tmp_sibling(path);
+    {
+        let mut wtr = csv::Writer::from_path(&tmp).map_err(|e| e.to_string())?;
+        wtr.write_record(["ts_ms", "open", "high", "low", "close", "volume"])
+            .map_err(|e| e.to_string())?;
+        for c in candles {
+            wtr.write_record([
+                c.timestamp.timestamp_millis().to_string(),
+                c.open.to_string(),
+                c.high.to_string(),
+                c.low.to_string(),
+                c.close.to_string(),
+                c.volume.to_string(),
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+        wtr.flush().map_err(|e| e.to_string())?;
     }
-    wtr.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// Temp path next to `path`, unique per writer (pid + a monotonic counter), so
+/// concurrent downloads of the same series cannot clobber each other.
+fn tmp_sibling(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "series".to_string());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()))
+}
+
+/// Convert the row-shaped candles the exchange exposes
+/// (`[ts_ms, open, high, low, close, volume]`) into `OHLCV` values.
+fn rows_as_candles(rows: &[Vec<f64>]) -> Vec<OHLCV> {
+    rows.iter()
+        .filter_map(|row| {
+            if row.len() < 6 {
+                return None;
+            }
+            Some(OHLCV::new(
+                DateTime::from_timestamp_millis(row[0] as i64)?,
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+            ))
+        })
+        .collect()
+}
+
+/// The base interval every derived timeframe is built from.
+///
+/// Downloading 5m once and aggregating covers 15m/1h/4h/1d from the same bars,
+/// so a pair costs ONE request instead of four, and every timeframe necessarily
+/// agrees on prices (they come from one source). 1m/1s are never derived: they
+/// are finer than the base and get their own download when asked for.
+pub(super) const BASE_TF: &str = "5m";
+
+/// Timeframes built from [`BASE_TF`] rather than downloaded.
+pub(super) fn is_derived_tf(tf: &str) -> bool {
+    matches!(tf, "15m" | "1h" | "4h" | "1d")
+}
+
+/// Roll `rows` up from `from_step` to `to_step`: open from the first bar of the
+/// bucket, close from the last, high/low the extremes, volume the sum. Buckets
+/// with no bars are skipped (no synthetic filler — a gap stays a gap).
+pub(super) fn aggregate_ohlcv(rows: &[OHLCV], from_step: u64, to_step: u64) -> Vec<OHLCV> {
+    if from_step == 0 || to_step == 0 || to_step <= from_step {
+        return rows.to_vec();
+    }
+    let mut out: Vec<OHLCV> = Vec::new();
+    let to = to_step as i64;
+    let mut bucket: Option<i64> = None;
+    let mut acc: Option<OHLCV> = None;
+    for row in rows {
+        let ms = row.timestamp.timestamp_millis();
+        let key = ms.div_euclid(to) * to;
+        if bucket != Some(key) {
+            if let (Some(_), Some(done)) = (bucket, acc.take()) {
+                out.push(done);
+            }
+            bucket = Some(key);
+            acc = Some(OHLCV::new(row.timestamp, row.open, row.high, row.low, row.close, row.volume));
+            continue;
+        }
+        if let Some(open) = acc.as_mut() {
+            open.high = open.high.max(row.high);
+            open.low = open.low.min(row.low);
+            open.close = row.close;
+            open.volume += row.volume;
+        }
+    }
+    if acc.is_some() {
+        out.extend(acc);
+    }
+    // Keep the bucket's opening timestamp, not the first bar's own timestamp,
+    // so the grid lines up with what a venue would report.
+    for candle in out.iter_mut() {
+        let ms = candle.timestamp.timestamp_millis();
+        candle.timestamp = DateTime::from_timestamp_millis(ms.div_euclid(to) * to)
+            .unwrap_or(candle.timestamp);
+    }
+    out
+}
+
+/// Which parts of `[start_ms, end_ms]` a cached series does not cover yet.
+///
+/// Returns `None` when the cache already spans the range, otherwise the
+/// missing ranges (usually a single tail). This is what keeps re-subscribing to
+/// a slightly later window from re-downloading the whole history.
+fn missing_ranges(
+    rows: &[OHLCV],
+    start_ms: i64,
+    end_ms: i64,
+    step: i64,
+) -> Option<Vec<(i64, i64)>> {
+    let mut gaps: Vec<(i64, i64)> = Vec::new();
+    match (rows.first(), rows.last()) {
+        (None, _) => gaps.push((start_ms, end_ms)),
+        (Some(first), last) => {
+            // Cache starts after the window: everything up to its first bar.
+            let f = first.timestamp.timestamp_millis();
+            if f > start_ms + step {
+                gaps.push((start_ms, f - step));
+            }
+            // Cache ends before the window: the tail.
+            if let Some(l) = last {
+                let l = l.timestamp.timestamp_millis();
+                if l < end_ms - step {
+                    gaps.push((l + step, end_ms));
+                }
+            }
+        }
+    }
+    gaps.retain(|(from, to)| to >= from);
+    if gaps.is_empty() {
+        None
+    } else {
+        Some(gaps)
+    }
+}
+
+/// Merge freshly downloaded bars into the cached series (sorted, de-duplicated).
+fn merge_candles(cached: &[OHLCV], fresh: Vec<OHLCV>) -> Vec<OHLCV> {
+    let mut all: Vec<OHLCV> = Vec::with_capacity(cached.len() + fresh.len());
+    all.extend_from_slice(cached);
+    all.extend(fresh);
+    all.sort_by_key(|c| c.timestamp);
+    all.dedup_by_key(|c| c.timestamp);
+    all
 }
 
 fn ccxt_runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -447,40 +592,69 @@ pub(super) fn ensure_series_window(
         end_ms,
     } = request;
     ensure_series(ex, exchange, symbol, timeframe, data_dir, allow_net, force_reload)?;
-    let rows = ex.fetch_ohlcv(symbol, timeframe, None, None);
     let step = tf_step_ms(timeframe) as i64;
-    let covered = rows.first().is_some_and(|row| row[0] as i64 <= start_ms + step)
-        && rows.last().is_some_and(|row| row[0] as i64 + step >= end_ms);
-    if covered {
-        return Ok(());
-    }
+    let cached = rows_as_candles(&ex.fetch_ohlcv(symbol, timeframe, None, None));
+    let gaps = match missing_ranges(&cached, start_ms, end_ms, step) {
+        None => return Ok(()),
+        Some(gaps) => gaps,
+    };
     if !allow_net {
         return Err(format!(
             "{exchange} {symbol} {timeframe}: requested dates are outside loaded history; enable network access or narrow the range"
         ));
     }
-    let path = data_dir.join(window_file(exchange, symbol, timeframe, start_ms, end_ms));
-    let candles = if let Some(candles) = load_csv(&path) {
-        candles
+
+    // Download ONLY the gaps (usually the tail) and merge into the one canonical
+    // per-series cache file. The old code wrote a separate day-keyed file per
+    // window, so every slightly different date range re-downloaded the whole
+    // history and left dozens of near-duplicate files behind.
+    //
+    // For a derived timeframe the download targets the 5m BASE (one file, one
+    // source of truth) and the result is aggregated back up — so topping up a
+    // 1h chart also improves the 15m/4h/1d views, and costs a single request.
+    let (fetch_tf, fetch_step) = if is_derived_tf(timeframe) {
+        (BASE_TF, tf_step_ms(BASE_TF) as i64)
     } else {
-        // Download the day-aligned window: the cache key is normalized in
-        // `window_file`, so every reconnect of the same window hits it.
-        let key_start = start_ms.div_euclid(86_400_000) * 86_400_000;
-        let key_end = end_ms.div_euclid(86_400_000) * 86_400_000 + 86_400_000;
-        let candles = download_series_window(exchange, symbol, timeframe, key_start, key_end)?;
-        save_csv(&path, &candles)?;
-        candles
+        (timeframe, step)
     };
-    if candles.is_empty() {
+    let path = data_dir.join(series_file(exchange, symbol, fetch_tf));
+    let mut merged: Vec<OHLCV> = if fetch_tf == timeframe {
+        cached
+    } else {
+        load_csv(&path).unwrap_or_default()
+    };
+    let mut downloaded = 0usize;
+    for (from, to) in gaps {
+        // Map the derived gap onto the base grid before asking for it.
+        let (from, to) = if fetch_tf == timeframe {
+            (from, to)
+        } else {
+            (from.div_euclid(fetch_step) * fetch_step, to)
+        };
+        let fresh = download_series_window(exchange, symbol, fetch_tf, from, to)?;
+        downloaded += fresh.len();
+        if fresh.is_empty() {
+            continue;
+        }
+        merged = merge_candles(&merged, fresh);
+    }
+    if merged.is_empty() {
         return Err(format!("{exchange} {symbol} {timeframe}: no candles in requested date range"));
     }
+    save_csv(&path, &merged)?;
     if let Ok(sym) = Symbol::parse(symbol) {
         ex.add_market(&sym, MarketKind::Linear);
     }
-    ex.load_candles(symbol, timeframe, candles);
+    let loaded = if fetch_tf == timeframe {
+        merged.clone()
+    } else {
+        aggregate_ohlcv(&merged, tf_step_ms(fetch_tf), tf_step_ms(timeframe))
+    };
+    ex.load_candles(symbol, timeframe, loaded.clone());
     log!(
-        "[engine] {exchange} {symbol} {timeframe}: range loaded and cached ({})",
-        path.display()
+        "[engine] {exchange} {symbol} {timeframe}: +{downloaded} {fetch_tf} bars merged into {} → {} {timeframe} bars",
+        path.display(),
+        loaded.len()
     );
     Ok(())
 }
@@ -783,6 +957,28 @@ pub(super) fn ensure_series(
     if !force_reload && !ex.fetch_ohlcv(symbol, tf, None, Some(1)).is_empty() {
         return Ok(());
     }
+    // 15m/1h/4h/1d are rolled up from the 5m base rather than downloaded: one
+    // request per pair instead of four, and every timeframe then agrees on
+    // prices because they share one source. The base cache is authoritative, so
+    // only ONE file per pair is ever written.
+    if is_derived_tf(tf) {
+        let base_path = data_dir.join(series_file(exchange, symbol, BASE_TF));
+        if let Some(base) = load_csv(&base_path) {
+            let derived = aggregate_ohlcv(&base, tf_step_ms(BASE_TF), tf_step_ms(tf));
+            if !derived.is_empty() {
+                let n = derived.len();
+                if let Ok(sym) = Symbol::parse(symbol) {
+                    ex.add_market(&sym, MarketKind::Linear);
+                }
+                ex.load_candles(symbol, tf, derived);
+                log!(
+                    "[engine] {exchange} {symbol} {tf}: {n} bars aggregated from {BASE_TF} ({})",
+                    base_path.display()
+                );
+                return Ok(());
+            }
+        }
+    }
     let path = data_dir.join(series_file(exchange, symbol, tf));
     if let Some(candles) = load_csv(&path) {
         let n = candles.len();
@@ -996,6 +1192,163 @@ mod tests {
         assert_eq!(loaded.len(), 5);
         // 5m target: 15m is coarser, so no fallback.
         assert!(coarsest_finer_cached_oi("binance", "ETH/USDT", "5m", &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derived_timeframes_roll_up_from_the_5m_base() {
+        let step5 = tf_step_ms("5m") as i64;
+        let base_ms = 1_789_000_000_000i64 - base_ms_remainder();
+        // 12 consecutive 5m bars with a known shape.
+        let rows: Vec<OHLCV> = (0..12)
+            .map(|i| {
+                let price = 100.0 + i as f64;
+                OHLCV::new(
+                    DateTime::from_timestamp_millis(base_ms + i * step5).unwrap(),
+                    price,
+                    price + 2.0,
+                    price - 1.0,
+                    price + 1.0,
+                    10.0,
+                )
+            })
+            .collect();
+
+        // 1h = 12 x 5m: exactly one bucket.
+        let hour = aggregate_ohlcv(&rows, tf_step_ms("5m"), tf_step_ms("1h"));
+        assert_eq!(hour.len(), 1, "12 five-minute bars make one hourly bar");
+        assert_eq!(hour[0].open, 100.0, "open comes from the first bar");
+        assert_eq!(hour[0].close, 112.0, "close from the last (100+11+1)");
+        assert_eq!(hour[0].high, 113.0, "high is the extreme");
+        assert_eq!(hour[0].low, 99.0, "low is the extreme");
+        assert_eq!(hour[0].volume, 120.0, "volume is summed");
+        assert_eq!(
+            hour[0].timestamp.timestamp_millis() % tf_step_ms("1h") as i64,
+            0,
+            "buckets land on the timeframe grid"
+        );
+
+        // 15m = 3 x 5m: four buckets.
+        let m15 = aggregate_ohlcv(&rows, tf_step_ms("5m"), tf_step_ms("15m"));
+        assert_eq!(m15.len(), 4);
+        assert!(m15.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
+
+        // Never invent bars for a gap, and never "downsample".
+        assert_eq!(aggregate_ohlcv(&rows, tf_step_ms("5m"), tf_step_ms("1m")).len(), rows.len());
+        assert_eq!(aggregate_ohlcv(&[], tf_step_ms("5m"), tf_step_ms("1h")).len(), 0);
+    }
+
+    /// Offset that puts `1_789_000_000_000` inside a whole 5m bar, so the test's
+    /// first bar starts on a clean bucket boundary.
+    fn base_ms_remainder() -> i64 {
+        1_789_000_000_000i64 % tf_step_ms("1h") as i64
+    }
+
+    #[test]
+    fn only_the_5m_base_and_the_requested_finer_grid_are_downloaded() {
+        // 15m/1h/4h/1d come from the 5m base; 1m/1s are finer, so they keep
+        // their own download.
+        for tf in ["15m", "1h", "4h", "1d"] {
+            assert!(is_derived_tf(tf), "{tf} must be aggregated");
+        }
+        for tf in ["1s", "1m", BASE_TF] {
+            assert!(!is_derived_tf(tf), "{tf} must not be aggregated");
+        }
+    }
+
+    #[test]
+    fn only_the_missing_part_of_a_window_is_requested() {
+        // Regression: the window loader used to re-download the WHOLE range
+        // whenever the cache fell short, which is what produced dozens of
+        // near-duplicate per-window files and slow first paints.
+        let step = 300_000i64;
+        let base = 1_789_000_000_000i64;
+        let cached: Vec<OHLCV> = (0..100)
+            .map(|i| {
+                OHLCV::new(
+                    DateTime::from_timestamp_millis(base + i * step).unwrap(),
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                )
+            })
+            .collect();
+        let last_cached = base + 99 * step;
+
+        // Fully covered: nothing to do.
+        assert_eq!(
+            missing_ranges(&cached, base, last_cached, step),
+            None,
+            "a window inside the cache must not download anything"
+        );
+
+        // Window runs past the cache: only the tail.
+        let gaps = missing_ranges(&cached, base, last_cached + 10 * step, step)
+            .expect("the tail is missing");
+        assert_eq!(gaps, vec![(last_cached + step, last_cached + 10 * step)]);
+
+        // Window starts before the cache: only the head.
+        let gaps = missing_ranges(&cached, base - 5 * step, last_cached, step)
+            .expect("the head is missing");
+        assert_eq!(gaps, vec![(base - 5 * step, base - step)]);
+
+        // Empty cache: the whole window.
+        assert_eq!(
+            missing_ranges(&[], base, last_cached, step),
+            Some(vec![(base, last_cached)])
+        );
+    }
+
+    #[test]
+    fn merging_downloaded_bars_never_duplicates_or_reorders() {
+        let step = 300_000i64;
+        let base = 1_789_000_000_000i64;
+        let bar = |ms: i64, close: f64| {
+            OHLCV::new(
+                DateTime::from_timestamp_millis(ms).unwrap(),
+                close,
+                close,
+                close,
+                close,
+                1.0,
+            )
+        };
+        let cached = vec![bar(base, 1.0), bar(base + step, 2.0)];
+        // A tail that overlaps the last cached bar (the venue re-sent it).
+        let fresh = vec![bar(base + step, 2.0), bar(base + 2 * step, 3.0)];
+        let merged = merge_candles(&cached, fresh);
+        assert_eq!(merged.len(), 3, "the overlapping bar appears once: {merged:?}");
+        assert!(merged.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
+        assert_eq!(merged[1].close, 2.0, "the cached value survives the merge");
+    }
+
+    #[test]
+    fn the_cache_write_is_atomic() {
+        // Readers (and a concurrent download) must never see a half-written
+        // series, so the CSV lands via a temp file + rename.
+        let dir = std::env::temp_dir().join(format!("simccxt-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SYM_5m.csv");
+        let rows = vec![OHLCV::new(
+            DateTime::from_timestamp_millis(1_789_000_000_000).unwrap(),
+            1.0,
+            2.0,
+            0.5,
+            1.5,
+            10.0,
+        )];
+        save_csv(&path, &rows).expect("save");
+        assert_eq!(load_csv(&path).map(|c| c.len()), Some(1));
+        // No temp leftovers behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

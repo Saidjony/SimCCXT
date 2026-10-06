@@ -244,6 +244,11 @@ impl Broker {
         self.fees = fees;
     }
 
+    /// The active fee schedule (read-only, for clients that size by risk).
+    pub fn fee_schedule(&self) -> FeeSchedule {
+        self.fees
+    }
+
     /// Set the margin mode.
     pub fn set_margin_mode(&mut self, mode: MarginMode) {
         self.portfolio.set_margin_mode(mode);
@@ -907,6 +912,26 @@ impl Broker {
         });
 
         for c in to_execute {
+            let triggered_market = matches!(
+                c.order_type,
+                OrderType::Stop | OrderType::TakeProfit | OrderType::TrailingStop
+            );
+            // A trigger ENTRY (a breakout order, not reduce-only) fills at its
+            // trigger price. The trader sized the position from that price, so
+            // filling at whatever the market happens to be would move the entry
+            // away from the planned risk by up to the whole bar's range.
+            // Protective exits (reduce_only) stay on the market: a stop-loss
+            // filling at its trigger would hide real slippage.
+            let fill_reference = if triggered_market && !c.reduce_only {
+                Some(c.trigger_price)
+            } else {
+                None
+            };
+            if let Some(reference) = fill_reference {
+                // Seed the reference book at the trigger so the market order
+                // settles there (same path a resting limit would take).
+                self.update_midpoint(&c.symbol.symbol, reference, 1e12);
+            }
             let request = BrokerOrderRequest {
                 symbol: c.symbol.clone(),
                 side: c.side,
@@ -1118,6 +1143,57 @@ mod tests {
         assert!(
             b.portfolio().position("BTC/USDT").is_none(),
             "reduce_only overbuy must close, not flip to long"
+        );
+    }
+
+    #[test]
+    fn trigger_entry_fills_at_its_trigger_price() {
+        // Regression: a breakout (stop) entry was executed as a market order at
+        // whatever the market was when the trigger fired, so the position opened
+        // away from the price the trader sized the risk from.
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+
+        let mut req = BrokerOrderRequest::market(btc(), Side::Buy, 1.0);
+        req.order_type = OrderType::Stop;
+        req.stop_price = Some(110.0);
+        let order = b.submit_order(req, ts()).unwrap();
+        assert_eq!(order.status, OrderStatus::New, "the trigger rests first");
+
+        // The market jumps past the trigger in one update.
+        b.on_price_update(&btc(), 130.0, ts());
+        let pos = b.portfolio().position("BTC/USDT").expect("the trigger opened a position");
+        assert!(
+            (pos.entry_price - 110.0).abs() < 1e-9,
+            "a trigger entry must fill at its trigger, got {}",
+            pos.entry_price
+        );
+    }
+
+    #[test]
+    fn protective_stop_still_fills_at_the_market() {
+        // The mirror image: a stop-LOSS filling at its trigger would hide real
+        // slippage, so reduce-only exits keep filling at the market.
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Buy, 1.0), ts()).unwrap();
+        // A sell needs a bid to reference (the replay seeds both sides itself).
+        b.engine_mut("BTC/USDT").unwrap().update_bid(100.0, 10.0);
+
+        let mut stop = BrokerOrderRequest::market(btc(), Side::Sell, 1.0);
+        stop.order_type = OrderType::Stop;
+        stop.stop_price = Some(90.0);
+        stop.reduce_only = true;
+        b.submit_order(stop, ts()).unwrap();
+
+        b.on_price_update(&btc(), 80.0, ts());
+        assert!(
+            b.portfolio().position("BTC/USDT").is_none(),
+            "the protective stop must have closed the position"
         );
     }
 

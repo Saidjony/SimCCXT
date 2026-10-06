@@ -336,6 +336,7 @@ struct Session {
     risk_usdt: f64,    // fixed risk per trade, sent by the frontend on join
     capital_usdt: f64,
     pending_protections: Vec<PendingProtection>,
+    entry_protections: EntryProtections,
     active_protections: Vec<(String, String, String)>,
     diary_meta: serde_json::Value, // client-pushed drawings/criteria to show in the diary
     oi: Vec<(i64, f64)>, // open-interest history (ts_ms, USDT value), context only
@@ -345,6 +346,10 @@ struct Session {
     reveal_start_ms: i64,
     range_end_ms: i64,
 }
+
+/// Protective levels the trader set, keyed by entry order id. Session-scoped:
+/// this powers the in-session post-trade review, not a permanent journal.
+type EntryProtections = HashMap<String, Value>;
 
 struct PendingProtection {
     symbol: String,
@@ -505,6 +510,24 @@ fn replay_json(s: &Session) -> Value {
     })
 }
 
+/// Rewind the replay clock to the window's reveal point: the last visible bar
+/// before revealing starts. Shared by `reset` and by `play` at the end of the
+/// series, so both land on exactly the same bar.
+fn rewind_to_reveal(s: &mut Session) {
+    let rows = s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None);
+    let ts_ms = rows
+        .iter()
+        .find(|row| (row[0] as i64) >= s.reveal_start_ms)
+        .map(|row| row[0] as i64 - s.step_ms as i64)
+        .or_else(|| rows.first().map(|row| row[0] as i64))
+        .unwrap_or_else(|| s.ex.now_ms());
+    if let Some(ts) = DateTime::from_timestamp_millis(ts_ms) {
+        s.ex.reset(ts);
+    }
+    s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ts_ms);
+    s.fed = 0;
+}
+
 fn ack_replay(s: &Session, request_id: Option<String>) -> Value {
     let mut v = replay_json(s);
     v["request_id"] = json!(request_id);
@@ -560,6 +583,23 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
         if let Some(index) = pending_index {
             let protect_amount = amount.min(s.pending_protections[index].remaining);
             let stop_price = s.pending_protections[index].stop_price;
+            // Remember what the trader protected this entry with. The diary
+            // cannot derive it from fills, and a post-trade review that guesses
+            // its own stop price is worthless — the whole point is comparing the
+            // outcome against the plan the trader actually wrote down.
+            let entry_order_id = s.pending_protections[index].entry_order_id.clone();
+            let planned = s
+                .entry_protections
+                .entry(entry_order_id.clone())
+                .or_insert_with(|| {
+                    json!({ "stop_price": Value::Null, "take_price": Value::Null })
+                });
+            if stop_price > 0.0 {
+                planned["stop_price"] = json!(stop_price);
+            }
+            if let Some(tp) = s.pending_protections[index].take_price {
+                planned["take_price"] = json!(tp);
+            }
             let take_price = s.pending_protections[index].take_price;
             let entry_side = s.pending_protections[index].entry_side.clone();
             let protect_side = if entry_side == "buy" { "sell" } else { "buy" };
@@ -718,6 +758,7 @@ fn new_session(nick: String) -> Session {
         risk_usdt: 0.0,
         capital_usdt: 0.0,
         pending_protections: Vec::new(),
+        entry_protections: EntryProtections::new(),
         active_protections: Vec::new(),
         diary_meta: json!({"drawings": [], "criteria": {}}),
         oi: Vec::new(),
@@ -1279,6 +1320,14 @@ impl Engine {
                     let s = self.session(to);
                     match action.as_str() {
                         "play" => {
+                            // Pressing play at the end of the series used to be a
+                            // no-op: the clock advanced past the last bar, no new
+                            // bar arrived, and the graph just sat there. Rewind to
+                            // the reveal point instead, so "play" always plays.
+                            if s.ex.replay_done(&s.symbol, &s.timeframe) {
+                                rewind_to_reveal(s);
+                                evs.push(snapshot_json(s, None));
+                            }
                             s.ex.resume();
                             s.last_step = std::time::Instant::now();
                         }
@@ -1308,26 +1357,24 @@ impl Engine {
                             evs.extend(d);
                         }
                         "reset" => {
-                            let rows = s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None);
-                            let ts_ms = timestamp_ms.unwrap_or_else(|| {
-                                rows.iter()
-                                    .find(|row| (row[0] as i64) >= s.reveal_start_ms)
-                                    .map(|row| row[0] as i64 - s.step_ms as i64)
-                                    .or_else(|| rows.first().map(|row| row[0] as i64))
-                                    .unwrap_or_else(|| s.ex.now_ms())
-                            });
-                            if let Some(ts) = DateTime::from_timestamp_millis(ts_ms) {
-                                s.ex.reset(ts);
+                            match timestamp_ms {
+                                Some(ms) => {
+                                    if let Some(ts) = DateTime::from_timestamp_millis(ms) {
+                                        s.ex.reset(ts);
+                                        s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ms);
+                                    }
+                                }
+                                None => rewind_to_reveal(s),
                             }
-                            s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ts_ms);
-                            // Sync the cursor to the new clock (the client follows
-                            // up with subscribe -> full snapshot). Broadcasting
-                            // every live bar as deltas here would be a burst of
-                            // thousands of messages; deltas resume from here.
+                            // The client's bar list only ever shrinks on a snapshot;
+                            // `replay_state` alone leaves every already-revealed bar
+                            // on screen, so a reset looked like a no-op. Send the
+                            // snapshot that truncates the chart back to the new
+                            // clock, then resume revealing bar by bar.
+                            let snap = snapshot_json(s, request_id.clone());
                             s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
                             s.last_step = std::time::Instant::now();
-                            evs.push(account_json(s));
-                            evs.push(replay_json(s));
+                            evs.push(snap);
                         }
                         "set_speed" => {
                             if let Some(v) = speed {
@@ -1406,6 +1453,9 @@ impl Engine {
                 "type": "diary",
                 "nick": nick,
                 "trades": trades.iter().map(|t| {
+                    // The protective levels the trader planned for this entry,
+                    // so the review can measure the outcome against the plan.
+                    let plan = s.entry_protections.get(&t.entry_order_id);
                     json!({
                         "symbol": t.symbol,
                         "side": t.side,
@@ -1422,6 +1472,12 @@ impl Engine {
                         "fee": t.fee,
                         "entry_order_id": t.entry_order_id,
                         "exit_order_id": t.exit_order_id,
+                        "stop_price": plan
+                            .and_then(|p| p.get("stop_price").cloned())
+                            .unwrap_or(Value::Null),
+                        "take_price": plan
+                            .and_then(|p| p.get("take_price").cloned())
+                            .unwrap_or(Value::Null),
                     })
                 }).collect::<Vec<_>>(),
                 "positions": positions.iter().map(|p| {
@@ -1574,6 +1630,28 @@ impl Engine {
             json!({"type": "candles", "symbol": symbol, "error":
                    format!("{exchange} {symbol} {timeframe}: no cached candles (offline)"),
                    "candles": []})
+        } else if start_ms > 0 && end_ms > start_ms {
+            // The diary asks for an explicit window. The canonical per-series
+            // cache holds only a recent tail (e.g. 5000 bars), which would cut
+            // the trader's older trades off the chart — and the client cannot
+            // draw an entry/exit marker for a bar it never received. Load the
+            // window itself (window cache, topped up via CCXT when missing).
+            match ensure_series_window(
+                &mut ex,
+                market_data::SeriesRequest {
+                    exchange,
+                    symbol,
+                    timeframe,
+                    data_dir,
+                    allow_net: self.allow_net,
+                    force_reload: false,
+                    start_ms,
+                    end_ms,
+                },
+            ) {
+                Ok(()) => Value::Null,
+                Err(e) => json!({"type": "candles", "symbol": symbol, "error": e, "candles": []}),
+            }
         } else {
             match ensure_series(
                 &mut ex,
@@ -1594,7 +1672,28 @@ impl Engine {
                 let t = r[0] as i64;
                 (start_ms <= 0 || t >= start_ms) && (end_ms <= 0 || t <= end_ms)
             });
-            result = json!({"type": "candles", "symbol": symbol, "timeframe": timeframe, "candles": rows});
+            // Tell the client what it actually got: a window that falls short of
+            // the requested range must be visible, not silently short. A whole
+            // bar of slack on each side, since the first/last candle of a
+            // requested range is rarely aligned to a bar boundary.
+            let step = tf_step_ms(timeframe) as i64;
+            let covered = rows.first().map(|r| r[0] as i64).unwrap_or(0);
+            let covered_end = rows.last().map(|r| r[0] as i64).unwrap_or(0);
+            let partial = covered > 0
+                && ((start_ms > 0 && covered > start_ms + step)
+                    || (end_ms > 0 && covered_end + step < end_ms));
+            result = json!({
+                "type": "candles", "symbol": symbol, "timeframe": timeframe,
+                "candles": rows,
+                "start_ms": covered, "end_ms": covered_end,
+                "partial": partial,
+            });
+            if partial {
+                log!(
+                    "[candles] {exchange} {symbol} {timeframe}: served {covered}..{covered_end}, \
+                     short of the requested {start_ms}..{end_ms}"
+                );
+            }
         }
         let _ = reply.send(result);
     }
@@ -2454,6 +2553,128 @@ mod tests {
     fn test_data_dir() -> &'static Path {
         // No cache files here: every series is deterministic synthetic data.
         Path::new("/nonexistent-simccxt-session-test")
+    }
+
+    /// Drain the bus, returning the last `snapshot` (or null). Keeps draining
+    /// across `Lagged`: a run that emits thousands of deltas overflows the
+    /// channel, and the interesting message may sit behind the gap.
+    fn last_snapshot(rx: &mut broadcast::Receiver<String>) -> Option<Value> {
+        let mut found = None;
+        loop {
+            match rx.try_recv() {
+                Ok(raw) => {
+                    let v: Value = serde_json::from_str(&raw).expect("valid json");
+                    if v["type"] == "snapshot" {
+                        found = Some(v);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Empty) => return found,
+                Err(broadcast::error::TryRecvError::Closed) => return found,
+            }
+        }
+    }
+
+    #[test]
+    fn reset_truncates_the_chart_and_replays_again() {
+        // Regression: `reset` only sent `replay_state`, which never shrinks the
+        // client's bar list — every already-revealed bar stayed on the chart, so
+        // the reset looked like a no-op. It must send a snapshot.
+        let (tx, mut rx) = broadcast::channel::<String>(1024);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "5m"), data);
+        while eng.sessions[&1].ex.now_ms() < eng.sessions[&1].reveal_start_ms + 20_000 {
+            eng.handle_command(
+                1,
+                ClientCmd::Replay {
+                    action: "step".into(),
+                    steps: Some(300),
+                    speed: None,
+                    step_ms: None,
+                    timestamp_ms: None,
+                    request_id: None,
+                },
+                data,
+            );
+        }
+        let revealed_before = eng.sessions[&1].ex.now_ms();
+        assert!(revealed_before > 0);
+        let _ = last_snapshot(&mut rx);
+
+        eng.handle_command(1, replay_cmd("reset"), data);
+
+        let snapshot = last_snapshot(&mut rx).expect("reset must send a snapshot");
+        let bars = snapshot["candles"].as_array().expect("snapshot has candles");
+        assert!(!bars.is_empty(), "reset must leave the revealed history on screen: {snapshot}");
+        // Candle rows are JSON numbers parsed from f64, so read them as f64.
+        let first = bars[0][0].as_f64().expect("bar timestamp") as i64;
+        let last = bars[bars.len() - 1][0].as_f64().expect("bar timestamp") as i64;
+        assert!(first <= last, "bars stay chronological: {first}..{last}");
+        assert!(
+            last <= revealed_before,
+            "the snapshot must stop at the reset point: {last} > {revealed_before}"
+        );
+        assert!(eng.sessions[&1].ex.is_paused(), "reset pauses");
+        // The clock is back at the reveal point, ready to replay the same bars.
+        assert!(eng.sessions[&1].ex.now_ms() < revealed_before);
+    }
+
+    #[test]
+    fn play_at_the_end_rewinds_instead_of_freezing() {
+        // Regression: pressing play once the series was consumed was a no-op —
+        // the clock advanced past the last bar and no candle ever arrived.
+        let (tx, mut rx) = broadcast::channel::<String>(1024);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "5m"), data);
+
+        // Run the whole series out.
+        for _ in 0..40 {
+            eng.handle_command(
+                1,
+                ClientCmd::Replay {
+                    action: "step".into(),
+                    steps: Some(500),
+                    speed: None,
+                    step_ms: None,
+                    timestamp_ms: None,
+                    request_id: None,
+                },
+                data,
+            );
+        }
+        let session = &eng.sessions[&1];
+        assert!(
+            session.ex.replay_done(&session.symbol, &session.timeframe),
+            "the scenario must reach the end of the series"
+        );
+        let _ = last_snapshot(&mut rx);
+
+        eng.handle_command(
+            1,
+            ClientCmd::Replay {
+                action: "play".into(),
+                steps: None,
+                speed: Some(4.0),
+                step_ms: None,
+                timestamp_ms: None,
+                request_id: None,
+            },
+            data,
+        );
+
+        let session = &eng.sessions[&1];
+        assert!(
+            !session.ex.replay_done(&session.symbol, &session.timeframe),
+            "play at the end must rewind, not leave the clock past the last bar"
+        );
+        assert!(!session.ex.is_paused(), "play resumes");
+        assert!(
+            last_snapshot(&mut rx).is_some(),
+            "the client needs a snapshot to shrink its chart back"
+        );
     }
 
     #[test]

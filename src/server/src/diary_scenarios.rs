@@ -730,6 +730,57 @@ fn stop_loss_exit_lands_in_the_diary() {
     fills_balance_the_diary(&eng, 1, &d, true);
 }
 
+#[test]
+fn diary_reports_the_protective_levels_the_trader_planned() {
+    // The in-session review compares the outcome against the plan, and a plan
+    // cannot be guessed from fills: the stop and TP the trader set must ride
+    // along with the trade.
+    let (mut eng, _rx) = engine();
+    open_trader(&mut eng, 1, "5m", NICK, RISK);
+    let entry = last_price(&eng, 1);
+    let stop = entry * 0.98;
+
+    market(&mut eng, 1, "buy", 0.1, Some(stop));
+    assert_eq!(
+        eng.sessions[&1].ex.fetch_open_orders(Some(SYM)).len(),
+        1,
+        "the stop is armed, so the plan exists"
+    );
+
+    // Close by hand so the trade lands in the diary.
+    jump(&mut eng, 1, 3_600_000, 2);
+    market(&mut eng, 1, "sell", 0.1, None);
+
+    let d = diary(&eng, NICK);
+    let trades = array(&d, "trades");
+    assert_eq!(trades.len(), 1, "the round trip closed: {d}");
+    let t = &trades[0];
+    assert!(
+        (num(t, "stop_price") - stop).abs() < 1e-9,
+        "the stop the trader set must reach the diary: {t}"
+    );
+    assert!(
+        t["take_price"].is_null(),
+        "no TP was set, so it must be null rather than guessed: {t}"
+    );
+}
+
+#[test]
+fn an_unprotected_entry_is_reported_without_levels() {
+    // No stop at all: the review must see that (it IS the finding), not a
+    // fabricated level that would make R look defined.
+    let (mut eng, _rx) = engine();
+    open_trader(&mut eng, 1, "5m", NICK, RISK);
+    market(&mut eng, 1, "buy", 0.1, None);
+    jump(&mut eng, 1, 3_600_000, 2);
+    market(&mut eng, 1, "sell", 0.1, None);
+
+    let d = diary(&eng, NICK);
+    let t = &array(&d, "trades")[0];
+    assert!(t["stop_price"].is_null(), "no stop was set: {t}");
+    assert!(t["take_price"].is_null(), "no TP was set: {t}");
+}
+
 // ---------------------------------------------------------------------------
 // The participants board
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import { CoinList } from "../components/CoinList";
 import { ChallengeCard } from "../components/ChallengeCard";
 import { OrderPanel } from "../components/OrderPanel";
 import { BottomTerminal } from "../components/Panels";
+import { TradeReview } from "../components/TradeReview";
 import type { ExchangeId } from "../types/protocol";
 import { subscribeSim, sendSim } from "../websocket/connection";
 import { store } from "../state/store";
@@ -135,6 +136,9 @@ export function TradingTerminal(): JSX.Element {
         {serverNick && <span className="nick-badge">вы: {serverNick}</span>}
         <TopbarTools />
         <ReplayControls />
+        {/* The toggle is last and takes the bar's free space (see .side-toggle),
+            so it always lands on the right edge. */}
+        {error && <span className="err">{error}</span>}
         <button
           className="btn b-dim side-toggle"
           onClick={toggleSide}
@@ -143,7 +147,6 @@ export function TradingTerminal(): JSX.Element {
         >
           ☰
         </button>
-        {error && <span className="err">{error}</span>}
       </header>
       <div className="toprow">
         <main className="main">
@@ -161,6 +164,7 @@ export function TradingTerminal(): JSX.Element {
         >
           <OrderPanel />
           <CoinList />
+          <TradeReview />
           <ChallengeCard />
         </aside>
         )}

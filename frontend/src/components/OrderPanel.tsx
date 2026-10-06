@@ -2,7 +2,7 @@ import { useState } from "react";
 import { nextRequestId, sendSim } from "../websocket/useSimSocket";
 import { store, useSim } from "../state/store";
 import type { ClientMessage } from "../types/protocol";
-import { calcQty } from "../chart/overlays";
+import { calcQty, riskAtStop } from "../chart/overlays";
 
 function num(v: string): number | null {
   const n = Number(v);
@@ -27,6 +27,9 @@ export function OrderPanel(): JSX.Element {
   const lastPrice = useSim((s) => s.lastPrice);
   const initialCapitalUsdt = useSim((s) => s.initialCapitalUsdt);
   const fixedRiskUsdt = useSim((s) => s.fixedRiskUsdt);
+  const feeRates = useSim((s) => s.feeRates);
+  // A stop is executed as a market order, so budget the taker rate.
+  const taker = feeRates?.taker ?? 0;
   const inChallenge = useSim((s) => s.inChallenge);
   const base = symbol.split("/")[0] ?? "";
   const positions = useSim((s) => s.account?.positions ?? []);
@@ -73,7 +76,7 @@ export function OrderPanel(): JSX.Element {
       msg.stop_price = t;
     }
     if (entry === null) return;
-    const qty = calcQty(fixedRiskUsdt, entry, sl);
+    const qty = calcQty(fixedRiskUsdt, entry, sl, taker);
     if (qty === null) return;
     msg.quantity = qty;
     msg.stop_loss_price = sl;
@@ -88,18 +91,29 @@ export function OrderPanel(): JSX.Element {
   };
   const entry = entryPreview();
   const sl = num(stop);
-  const qty = entry !== null && sl !== null ? calcQty(fixedRiskUsdt, entry, sl) : null;
+  const qty = entry !== null && sl !== null ? calcQty(fixedRiskUsdt, entry, sl, taker) : null;
   const ready = qty !== null;
+  // What the trade actually costs if the stop is hit, fees included. Equals the
+  // risk budget by construction — the panel shows it so the trader can see that
+  // "риск $10" really means ~$10, not $15 after the commission.
+  const worst = entry !== null && sl !== null && qty !== null
+    ? riskAtStop(qty, entry, sl, taker)
+    : null;
   const validLongStop = kind === "market"
     ? lastPrice > 0 && sl !== null && sl < lastPrice
     : entry !== null && sl !== null && sl < entry;
   const validShortStop = kind === "market"
     ? lastPrice > 0 && sl !== null && sl > lastPrice
     : entry !== null && sl !== null && sl > entry;
+  // Worst case if the stop is hit: the trader's whole budget, commission
+  // included (sizing divides by price distance + fees, so this equals it).
   const preview =
-    qty !== null
-      ? `≈ ${qty.toPrecision(4)} ${base} · риск $${fixedRiskUsdt}`
-      : "укажи стоп — без него вход запрещён";
+    qty !== null && worst !== null
+      ? `≈ ${qty.toPrecision(4)} ${base} · по стопу −$${worst.toFixed(2)} ` +
+        `(${(taker * 100).toFixed(2)}% комиссия × 2 уже учтены)`
+      : qty !== null
+        ? `≈ ${qty.toPrecision(4)} ${base} · риск $${fixedRiskUsdt}`
+        : "укажи стоп — без него вход запрещён";
 
   return (
     <div className="card">

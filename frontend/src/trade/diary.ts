@@ -37,6 +37,22 @@ export function fmtPrice(p: number): string {
   return Math.abs(p) >= 1 ? p.toFixed(2) : p.toPrecision(6);
 }
 
+/**
+ * Short UTC stamp for chart labels: "MM-DD HH:MM". Chart time axes are UTC,
+ * so a local stamp here would disagree with the axis the trader reads.
+ * (Mirrors `formatTs` in types/protocol.ts, which cannot be imported here:
+ * that module pulls runtime imports node --test cannot resolve.)
+ */
+export function fmtChartTime(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const d = new Date(ms);
+  const p = (n: number): string => (n < 10 ? "0" + n : "" + n);
+  return (
+    p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) + " " +
+    p(d.getUTCHours()) + ":" + p(d.getUTCMinutes())
+  );
+}
+
 /** Signed money with thousands separators (empty for non-finite). */
 export function fmtPnl(n: number): string {
   if (!Number.isFinite(n)) return "—";
@@ -64,7 +80,7 @@ export function diaryMarkers(
       side: t.side,
       kind: "entry",
       price: t.entry_price,
-      text: `ВХОД ${t.side === "long" ? "LONG" : "SHORT"} · ${fmtPrice(t.entry_price)}`,
+      text: `ВХОД ${t.side === "long" ? "LONG" : "SHORT"} ${fmtPrice(t.entry_price)} · ${fmtChartTime(t.entry_time_ms)}`,
       ref,
     });
     out.push({
@@ -72,7 +88,7 @@ export function diaryMarkers(
       side: t.side,
       kind: "exit",
       price: t.exit_price,
-      text: `ВЫХОД ${fmtPnl(t.pnl)} · ${fmtPrice(t.exit_price)}`,
+      text: `ВЫХОД ${fmtPrice(t.exit_price)} · ${fmtChartTime(t.exit_time_ms)} · ${fmtPnl(t.pnl)}`,
       ref,
     });
   }
@@ -83,12 +99,37 @@ export function diaryMarkers(
       side: p.side,
       kind: "entry",
       price: p.entry_price,
-      text: `ВХОД ${p.side === "long" ? "LONG" : "SHORT"} · ${fmtPrice(p.entry_price)}`,
+      text: `ВХОД ${p.side === "long" ? "LONG" : "SHORT"} ${fmtPrice(p.entry_price)} · ${fmtChartTime(p.entry_time_ms)}`,
       ref: `pos-${p.symbol}`,
     });
   }
   out.sort((a, b) => a.time_ms - b.time_ms || (a.kind === b.kind ? 0 : a.kind === "entry" ? -1 : 1));
   return out;
+}
+
+/**
+ * Entry/exit markers the loaded candles cannot show, because their timestamp
+ * falls outside the loaded span. The chart drops such markers silently
+ * (lightweight-charts rejects times outside the series), so the page must say
+ * it out loud instead of showing a chart that looks like the trader never
+ * traded.
+ *
+ * Returns the count plus the covered span, or null when everything is inside.
+ */
+export function markersOutsideCandles(
+  trades: DiaryTrade[],
+  positions: DiaryPosition[],
+  symbol: string,
+  candles: ReadonlyArray<readonly number[]>,
+): { outside: number; total: number; from: number; to: number } | null {
+  const times = candles.map((c) => c[0]);
+  if (times.length === 0) return null;
+  const from = times[0];
+  const to = times[times.length - 1];
+  const marks = diaryMarkers(trades, positions, symbol);
+  if (marks.length === 0) return null;
+  const outside = marks.filter((m) => m.time_ms < from || m.time_ms > to).length;
+  return outside > 0 ? { outside, total: marks.length, from, to } : null;
 }
 
 /** Symbols that have trades or an open position, in first-seen order. */

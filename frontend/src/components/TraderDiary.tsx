@@ -8,8 +8,10 @@ import {
   chartRange,
   diaryMarkers,
   diarySymbols,
+  fmtChartTime,
   fmtPnl,
   fmtPrice,
+  markersOutsideCandles,
   overallR,
   safeStats,
 } from "../trade/diary";
@@ -104,6 +106,18 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     () => (diary ? chartRange(trades, positions, activeSymbol, diary.range) : null),
     [diary, trades, positions, activeSymbol],
   );
+
+  // The server may serve a window shorter than asked (its cache holds a recent
+  // tail). Markers outside it cannot be drawn — say which ones, rather than
+  // leaving the trader looking at a chart that looks like they never traded.
+  const offscreen = useMemo(
+    () => markersOutsideCandles(trades, positions, activeSymbol, candles),
+    [trades, positions, activeSymbol, candles],
+  );
+  const offscreenNote = offscreen
+    ? `Часть входов и выходов (${offscreen.outside} из ${offscreen.total}) лежит вне загруженных свечей — ` +
+      `график покрывает ${fmtChartTime(offscreen.from)} … ${fmtChartTime(offscreen.to)}`
+    : "";
   useEffect(() => {
     if (!diary || !activeSymbol) return;
     let alive = true;
@@ -121,7 +135,11 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     fetch(`${apiUrl()}/api/candles?${params.toString()}`)
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return (await res.json()) as { candles?: CandleRow[]; error?: string };
+        return (await res.json()) as {
+          candles?: CandleRow[];
+          error?: string;
+          partial?: boolean;
+        };
       })
       .then((data) => {
         if (!alive) return;
@@ -206,7 +224,7 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
         positions={positions}
         symbol={activeSymbol}
         candles={candles}
-        note={candleError}
+        note={candleError || offscreenNote}
         selectedRef={selectedRef}
       />
 
@@ -444,16 +462,58 @@ function DiaryChart({
     lineSeriesRef.current = [];
 
     const times = candles.map((c) => c[0]);
-    for (const t of trades) {
-      if (t.symbol !== symbol) continue;
-      if (times.length === 0) break;
-      if (t.entry_time_ms > times[times.length - 1] || t.exit_time_ms < times[0]) continue;
-      const ref = `${t.entry_order_id}-${t.exit_order_id}`;
-      const isSel = selectedRef === ref;
-      const color = selectedRef && !isSel ? "#4a5462" : t.pnl >= 0 ? "#3d9a50" : "#d46666";
+
+    const fitTo = (lo: number, hi: number) => {
+      const pad = Math.max((hi - lo) * 0.15, 1_800_000);
+      try {
+        chart.timeScale().setVisibleRange({
+          from: Math.floor((lo - pad) / 1000) as UTCTimestamp,
+          to: Math.floor((hi + pad) / 1000) as UTCTimestamp,
+        });
+      } catch {
+        chart.timeScale().fitContent();
+      }
+    };
+
+    // A clicked row zooms to its own trade.
+    const selected = selectedRef
+      ? trades.find((t) => `${t.entry_order_id}-${t.exit_order_id}` === selectedRef)
+      : undefined;
+
+    if (times.length > 0) {
+      if (selected) {
+        fitTo(selected.entry_time_ms, selected.exit_time_ms);
+      } else {
+        // Open on the trader's actions, not on the whole replay window: with 60
+        // days of 5m bars on screen every entry/exit collapses into one pixel and
+        // the chart looks empty. Fall back to the full series if they never
+        // traded.
+        const marks = diaryMarkers(trades, positions, symbol).map((m) => m.time_ms);
+        if (marks.length > 0) fitTo(Math.min(...marks), Math.max(...marks));
+        else chart.timeScale().fitContent();
+      }
+    }
+
+    // Connect entry→exit ONLY for the selected trade. A segment per trade
+    // spans the whole chart and reads as a trendline, drowning the very markers
+    // the trader is looking for; on click it is the one thing that explains the
+    // move, so show it then.
+    const segments = selectedRef
+      ? trades.filter(
+          (t) =>
+            t.symbol === symbol &&
+            `${t.entry_order_id}-${t.exit_order_id}` === selectedRef &&
+            times.length > 0 &&
+            t.entry_time_ms <= times[times.length - 1] &&
+            t.exit_time_ms >= times[0],
+        )
+      : [];
+    for (const t of segments) {
+      const color = t.pnl >= 0 ? "#3d9a50" : "#d46666";
       const line = chart.addLineSeries({
         color,
-        lineWidth: isSel ? 3 : 2,
+        lineWidth: 2,
+        lineStyle: 2, // dashed: it is a connection, not a market series
         priceLineVisible: false,
         lastValueVisible: false,
         crosshairMarkerVisible: false,
@@ -483,7 +543,9 @@ function DiaryChart({
             : m.side === "long" ? "aboveBar" : "belowBar",
         color,
         shape: (m.kind === "entry") === (m.side === "long") ? "arrowUp" : "arrowDown",
-        text: isSel ? `» ${m.text}` : m.text,
+        // Unselected markers stay short so a busy chart is still readable; the
+        // selected one spells out what happened.
+        text: isSel || !selectedRef ? m.text : "",
       });
     }
     markers.sort((a, b) => Number(a.time) - Number(b.time));
@@ -493,30 +555,17 @@ function DiaryChart({
       /* timestamp outside the loaded series: skip silently */
     }
 
-    if (selectedRef) {
-      const sel = trades.find((t) => `${t.entry_order_id}-${t.exit_order_id}` === selectedRef);
-      if (sel) {
-        const padMs = Math.max((sel.exit_time_ms - sel.entry_time_ms) * 0.3, 1_800_000);
-        try {
-          chart.timeScale().setVisibleRange({
-            from: Math.floor((sel.entry_time_ms - padMs) / 1000) as UTCTimestamp,
-            to: Math.floor((sel.exit_time_ms + padMs) / 1000) as UTCTimestamp,
-          });
-          return;
-        } catch {
-          /* outside the visible data: fall back to fitContent below */
-        }
-      }
-    }
-    if (candles.length > 0) chart.timeScale().fitContent();
+    // A selected row zooms to that trade (set above, before the markers).
   }, [candles, trades, positions, symbol, selectedRef]);
 
   return (
     <div className="diary-chart-wrap">
       <div className="diary-chart" ref={hostRef} />
-      {candles.length === 0 && (
+      {candles.length === 0 ? (
         <div className="diary-note">{note || `Нет свечей для ${symbol || "символа"}.`}</div>
-      )}
+      ) : note ? (
+        <div className="diary-note warn">{note}</div>
+      ) : null}
     </div>
   );
 }
