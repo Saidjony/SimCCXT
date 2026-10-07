@@ -1,0 +1,222 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]: simccxt
+    - generic [ref=e6]:
+      - generic [ref=e7]: Биржа
+      - combobox "Биржа данных" [ref=e8]:
+        - option "Binance" [selected]
+        - option "Bybit"
+        - option "OKX"
+    - generic [ref=e10]: connected
+    - generic [ref=e11]:
+      - generic "Таймфрейм основного графика" [ref=e12]:
+        - generic [ref=e13]: ТФ
+        - combobox "Таймфрейм графика" [ref=e14]:
+          - option "1m"
+          - option "5m" [selected]
+          - option "15m"
+          - option "1h"
+          - option "4h"
+          - option "1d"
+      - button "Горячие клавиши" [ref=e15] [cursor=pointer]: ⌨
+    - generic "Replay controls" [ref=e16]:
+      - generic [ref=e17]:
+        - button "Запустить реплей" [ref=e18] [cursor=pointer]: ▶
+        - button "Следующий бар" [ref=e19] [cursor=pointer]: "+1"
+        - button "Сбросить реплей" [ref=e20] [cursor=pointer]: ⏮
+      - generic "0 из 0 баров" [ref=e21]: 0/0 · 0%
+      - generic "Скорость реплея — также [ и ]" [ref=e23]:
+        - generic [ref=e24]: Скорость реплея
+        - combobox "Скорость реплея" [ref=e25]:
+          - option "0.5×"
+          - option "1×" [selected]
+          - option "2×"
+          - option "4×"
+          - option "10×"
+      - button "Настроить даты реплея" [ref=e26] [cursor=pointer]: Даты
+      - generic "1970-01-01 00:00:00" [ref=e27]: Пауза
+    - button "Скрыть/показать боковую панель" [ref=e28] [cursor=pointer]: ☰
+  - generic [ref=e29]:
+    - main [ref=e30]:
+      - generic [ref=e31]:
+        - generic [ref=e32]:
+          - generic [ref=e33]:
+            - strong [ref=e34]: Основной график
+            - generic [ref=e35]: BTC/USDT
+            - combobox "Таймфрейм верхнего графика" [ref=e36]:
+              - option "1m"
+              - option "5m" [selected]
+              - option "15m"
+              - option "1h"
+              - option "4h"
+              - option "1d"
+            - group [ref=e37]:
+              - generic "Критерии · 0" [ref=e38] [cursor=pointer]
+            - button "Развернуть график" [ref=e39] [cursor=pointer]: ⛶
+          - generic [ref=e41]:
+            - table [ref=e44]:
+              - row [ref=e45]:
+                - cell
+                - cell [ref=e46]
+                - cell [ref=e50]
+              - row [ref=e54]:
+                - cell [ref=e55]
+              - row [ref=e57]:
+                - cell
+                - cell [ref=e58]
+                - cell [ref=e62]
+              - row [ref=e66]:
+                - cell [ref=e67]
+              - row [ref=e69]:
+                - cell
+                - cell [ref=e70]:
+                  - link "Charting by TradingView" [ref=e74] [cursor=pointer]:
+                    - /url: https://www.tradingview.com/?utm_medium=lwc-link&utm_campaign=lwc-chart&utm_source=localhost/
+                - cell [ref=e79]
+              - row [ref=e83]:
+                - cell
+                - cell [ref=e84]
+                - cell [ref=e88]
+            - generic [ref=e91]:
+              - button "Луч-уровень (1 клик)" [ref=e92] [cursor=pointer]
+              - 'button "Барьер реплея (1 клик): бары справа скроются, play покажет по одному" [ref=e95] [cursor=pointer]'
+              - button "Зона-прямоугольник (2 клика)" [ref=e97] [cursor=pointer]
+              - 'button "Позиция long/short + TP/SL (3 клика: вход, стоп, тейк)" [ref=e100] [cursor=pointer]'
+              - button "Линейка (2 клика, гаснет)" [ref=e104] [cursor=pointer]
+              - button "Текстовая заметка (1 клик)" [ref=e110] [cursor=pointer]
+              - button "Удалить все рисунки" [ref=e113] [cursor=pointer]
+            - generic: BTC/USDT
+            - generic [ref=e116]:
+              - button "OI" [ref=e117] [cursor=pointer]
+              - button "CVD" [ref=e118] [cursor=pointer]
+              - 'button "Follow: ON" [ref=e119] [cursor=pointer]'
+              - button "🧲" [ref=e120] [cursor=pointer]
+              - button "📸" [ref=e121] [cursor=pointer]
+        - separator "Изменить высоту графиков" [ref=e122]
+        - generic [ref=e123]:
+          - generic [ref=e124]:
+            - generic [ref=e125]:
+              - strong [ref=e126]: 1 час
+              - generic [ref=e127]: BTC/USDT
+              - combobox "Таймфрейм 1 час" [ref=e128]:
+                - option "1m"
+                - option "5m"
+                - option "15m"
+                - option "1h" [selected]
+                - option "4h"
+                - option "1d"
+              - group [ref=e129]:
+                - generic "Критерии · 0" [ref=e130] [cursor=pointer]
+              - button "Развернуть график" [ref=e131] [cursor=pointer]: ⛶
+            - table [ref=e135]:
+              - row [ref=e136]:
+                - cell
+                - cell [ref=e137]:
+                  - link "Charting by TradingView" [ref=e141] [cursor=pointer]:
+                    - /url: https://www.tradingview.com/?utm_medium=lwc-link&utm_campaign=lwc-chart&utm_source=localhost/
+                - cell [ref=e146]
+              - row [ref=e150]:
+                - cell
+                - cell [ref=e151]
+                - cell [ref=e155]
+          - separator "Изменить ширину нижних графиков" [ref=e158]
+          - generic [ref=e159]:
+            - generic [ref=e160]:
+              - strong [ref=e161]: День
+              - generic [ref=e162]: BTC/USDT
+              - combobox "Таймфрейм День" [ref=e163]:
+                - option "1m"
+                - option "5m"
+                - option "15m"
+                - option "1h"
+                - option "4h"
+                - option "1d" [selected]
+              - group [ref=e164]:
+                - generic "Критерии · 0" [ref=e165] [cursor=pointer]
+              - button "Развернуть график" [ref=e166] [cursor=pointer]: ⛶
+            - table [ref=e170]:
+              - row [ref=e171]:
+                - cell
+                - cell [ref=e172]:
+                  - link "Charting by TradingView" [ref=e176] [cursor=pointer]:
+                    - /url: https://www.tradingview.com/?utm_medium=lwc-link&utm_campaign=lwc-chart&utm_source=localhost/
+                - cell [ref=e181]
+              - row [ref=e185]:
+                - cell
+                - cell [ref=e186]
+                - cell [ref=e190]
+    - complementary [ref=e194]:
+      - generic [ref=e195]:
+        - heading "Сделка" [level=4] [ref=e196]
+        - generic [ref=e197]:
+          - generic [ref=e198]: Капитал
+          - textbox "капитал, USDT" [disabled] [ref=e199]: "1000"
+          - generic [ref=e200]: Риск
+          - textbox "риск, USDT" [disabled] [ref=e201]: "10"
+        - generic [ref=e202]:
+          - combobox "тип входа" [ref=e203]:
+            - option "Рынок" [selected]
+            - option "Лимит"
+            - option "Стоп"
+          - combobox "time in force" [ref=e204]:
+            - option "GTC" [selected]
+            - option "IOC"
+            - option "FOK"
+          - generic [ref=e205]:
+            - checkbox "post-only" [ref=e206]
+            - text: post-only
+        - generic [ref=e207]:
+          - generic [ref=e208]: Стоп-лосс
+          - textbox "цена стопа" [ref=e209]
+          - generic [ref=e210]: TP
+          - textbox "цена TP (опц.)" [ref=e211]
+        - generic [ref=e212]:
+          - button "BUY" [disabled] [ref=e213]
+          - button "SELL" [disabled] [ref=e214]
+        - generic [ref=e215]: укажи стоп — без него вход запрещён · риск за раунд зафиксирован
+      - generic [ref=e216]:
+        - generic "свернуть" [ref=e217] [cursor=pointer]:
+          - heading "▾ Рынок" [level=4] [ref=e218]:
+            - generic [ref=e219]: ▾
+            - text: Рынок
+        - generic [ref=e220]:
+          - generic "показать BTC/USDT" [ref=e221] [cursor=pointer]:
+            - button "поставить флаг" [ref=e222]
+            - generic [ref=e225]: BTC/USDT
+            - generic [ref=e226]: —
+            - button "×" [ref=e227]
+          - generic "показать ETH/USDT" [ref=e228] [cursor=pointer]:
+            - button "поставить флаг" [ref=e229]
+            - generic [ref=e232]: ETH/USDT
+            - button "×" [ref=e233]
+          - generic "показать SOL/USDT" [ref=e234] [cursor=pointer]:
+            - button "поставить флаг" [ref=e235]
+            - generic [ref=e238]: SOL/USDT
+            - button "×" [ref=e239]
+          - generic "показать XRP/USDT" [ref=e240] [cursor=pointer]:
+            - button "поставить флаг" [ref=e241]
+            - generic [ref=e244]: XRP/USDT
+            - button "×" [ref=e245]
+        - generic [ref=e246]:
+          - textbox "добавить монету" [ref=e247]:
+            - /placeholder: DOGE/USDT
+          - button "+" [ref=e248] [cursor=pointer]
+        - generic [ref=e249]: BTC/USDT · last 0 · ● live
+      - generic [ref=e250]:
+        - heading [level=4] [ref=e252]:
+          - button "▾ Челлендж" [expanded] [ref=e253] [cursor=pointer]:
+            - generic [ref=e254]: ▾
+            - text: Челлендж
+        - generic [ref=e255]:
+          - textbox "ник для челленджа" [ref=e257]:
+            - /placeholder: твой ник (пусто = рандомный)
+          - generic [ref=e258]: пока пусто — участники появятся здесь
+  - generic [ref=e260]:
+    - generic [ref=e261]:
+      - button "Account" [ref=e262] [cursor=pointer]
+      - button "Positions" [ref=e263] [cursor=pointer]
+      - button "Orders" [ref=e264] [cursor=pointer]
+      - button "Trades" [ref=e265] [cursor=pointer]
+    - generic [ref=e267]:
+      - heading "Positions" [level=4] [ref=e268]
+      - generic [ref=e269]: flat

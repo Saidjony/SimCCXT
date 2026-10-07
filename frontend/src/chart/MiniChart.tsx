@@ -294,6 +294,8 @@ function drawingTimeBounds(drawing: Drawing): [number, number] {
     case "zone":
     case "position": return [drawing.t1, drawing.t2];
     case "note": return [drawing.t0, drawing.t0];
+    case "arrow": return [drawing.t0, drawing.t1];
+    case "brush": return drawing.points.length ? [drawing.points[0].t, drawing.points[drawing.points.length - 1].t] : [0, 0];
   }
 }
 
@@ -304,6 +306,8 @@ function drawingPrices(drawing: Drawing): number[] {
     case "zone": return [drawing.p1, drawing.p2];
     case "position": return [drawing.entry, drawing.sl, drawing.tp];
     case "note": return [drawing.price];
+    case "arrow": return [drawing.price, drawing.price1];
+    case "brush": return drawing.points.map((pt) => pt.p);
   }
 }
 

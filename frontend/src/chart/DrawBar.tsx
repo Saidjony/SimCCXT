@@ -59,6 +59,24 @@ function NoteIcon(): JSX.Element {
   );
 }
 
+function ArrowIcon(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+      <line x1="4" y1="20" x2="18" y2="6" />
+      <polyline points="18 12 18 6 12 6" />
+    </svg>
+  );
+}
+
+function BrushIcon(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M5 19c4 0 5-4 8-7l4-4 2 2-4 4c-2 3-6 6-10 5z" />
+      <line x1="14" y1="9" x2="16" y2="11" />
+    </svg>
+  );
+}
+
 function TrashIcon(): JSX.Element {
   return (
     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
@@ -77,6 +95,8 @@ const TOOLS: { id: Exclude<Tool, "none">; title: string; Icon: () => JSX.Element
   { id: "position", title: "Позиция long/short + TP/SL (3 клика: вход, стоп, тейк)", Icon: PositionIcon },
   { id: "ruler", title: "Линейка (2 клика, гаснет)", Icon: RulerIcon },
   { id: "note", title: "Текстовая заметка (1 клик)", Icon: NoteIcon },
+  { id: "arrow", title: "Стрелка (2 клика: от А до Б)", Icon: ArrowIcon },
+  { id: "brush", title: "Ручка — свободный мазок (зажать и рисовать)", Icon: BrushIcon },
 ];
 
 /** Drawing toolbar docked top-right inside the chart. Icon-only buttons. */

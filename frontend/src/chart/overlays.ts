@@ -184,16 +184,17 @@ export function countBars(times: number[], t1: number, t2: number): number {
 /** Snap a timestamp to the nearest bar (drag magnet). */
 export function snapTime(times: number[], ms: number): number {
   if (!times.length) return ms;
-  let best = times[0];
-  let bd = Math.abs(ms - best);
-  for (const t of times) {
-    const d = Math.abs(ms - t);
-    if (d < bd) {
-      bd = d;
-      best = t;
-    }
+  if (ms <= times[0]) return times[0];
+  const last = times[times.length - 1];
+  if (ms >= last) return last;
+  let lo = 0;
+  let hi = times.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= ms) lo = mid;
+    else hi = mid;
   }
-  return best;
+  return ms - times[lo] <= times[hi] - ms ? times[lo] : times[hi];
 }
 
 /**

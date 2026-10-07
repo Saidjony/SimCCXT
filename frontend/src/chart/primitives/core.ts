@@ -18,11 +18,28 @@ import type {
   IPrimitivePaneRenderer,
   IPrimitivePaneView,
   ISeriesApi,
+  ITimeScaleApi,
   PrimitivePaneViewZOrder,
   SeriesOptionsMap,
+  Time,
   UTCTimestamp,
 } from "lightweight-charts";
 import { nearestCandleTime } from "../overlays";
+
+/**
+ * Magnet mode: when on, the price coordinate snaps to the nearest OHLC value
+ * of the bar under the cursor (TradingView-style magnet). Time always snaps
+ * to the bar. The Chart component syncs this from its state.
+ */
+let magnetEnabled = false;
+
+export function setMagnetMode(v: boolean): void {
+  magnetEnabled = v;
+}
+
+export function isMagnetEnabled(): boolean {
+  return magnetEnabled;
+}
 
 /** Palette mirrored from styles.css so canvas and UI speak one colour language. */
 export const C = {
@@ -104,10 +121,12 @@ export function makeConv(
 ): Conv {
   return {
     x(ms) {
-      const snapped = nearestCandleTime(times(), ms);
+      const rows = times();
+      if (rows.length === 0) return null;
+      const snapped = nearestCandleTime(rows, ms);
       if (snapped === null) return null;
       const coord = chart.timeScale().timeToCoordinate(toTime(snapped));
-      return typeof coord === "number" ? coord : null;
+      return typeof coord === "number" ? (coord as Coordinate) : null;
     },
     y(price) {
       const coord = series.priceToCoordinate(price);

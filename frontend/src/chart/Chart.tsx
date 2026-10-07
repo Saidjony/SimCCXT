@@ -37,11 +37,12 @@ import {
 import { DrawBar } from "./DrawBar";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 import type { SharedCrosshair } from "./crosshairSync";
+import type { BarPrice } from "lightweight-charts";
 import { followLatest } from "./rangeSync";
 import { DrawingEngine } from "./primitives/engine";
 import type { GhostShape } from "./primitives/ghost";
 import { PaneLabelPrimitive } from "./primitives/paneLabel";
-
+import { setMagnetMode } from "./primitives/core";
 function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
 }
@@ -100,6 +101,8 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
   position: "3 клика — вход, стоп, тейк · drag — двигать",
   ruler: "2 клика — замер-прямоугольник (гаснет через 4 с)",
   note: "1 клик — текстовая заметка в этой точке · drag — двигать",
+  arrow: "2 клика — стрелка от точки А до Б",
+  brush: "зажать и рисовать — свободный мазок (как в Paint)",
 };
 
 /**
@@ -152,6 +155,8 @@ export function Chart(): JSX.Element {
     Partial<ReturnType<IChartApi["options"]>> | null
   >(null);
   /** Mouse-down anchor for manual click detection (pan-safe placement). */
+  const [magnet, setMagnet] = useState(false);
+  const brushPointsRef = useRef<Array<{ t: number; p: number }>>([]); // freehand stroke points
   const downRef = useRef<{ x: number; y: number; button: number } | null>(null);
   /** Set when a drawing was actually dragged: suppress the click that follows. */
   const suppressClickRef = useRef(false);
@@ -187,6 +192,23 @@ export function Chart(): JSX.Element {
   const oiLabel = marketData.oi.length === 0
     ? "OI · нет данных"
     : "OI · " + (oiPeriod || "история");
+
+  // Magnet: exact cursor coordinates when on (see core.ts magnetEnabled).
+  useEffect(() => setMagnetMode(magnet), [magnet]);
+
+  // Brush: freeze pan/zoom while the tool is armed so the chart stays still
+  // during a freehand stroke. The frozen state follows the TOOL, not mouse
+  // events — it restores the moment the tool is disarmed (Escape, another
+  // tool, or stroke end), so it can never get stuck.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (tool === "brush") {
+      chart.applyOptions({ handleScroll: false, handleScale: false });
+    } else {
+      chart.applyOptions({ handleScroll: true, handleScale: true });
+    }
+  }, [tool]);
 
   // Create the chart once.
   useEffect(() => {
@@ -351,6 +373,12 @@ export function Chart(): JSX.Element {
         pendingRef.current = [];
         previewRef.current = null;
         engineRef.current?.setGhost(null);
+        // Cancel any in-progress drag/stroke: stuck drag + parked pan/zoom
+        // would otherwise leave the chart unresponsive.
+        if (dragRef.current) endDrawingDrag();
+        if (brushPointsRef.current.length) {
+          brushPointsRef.current = [];
+        }
       } else if (!e.repeat && e.key === " ") {
         e.preventDefault();
         sendSim({ type: "replay", action: getState().replay.paused ? "play" : "pause" });
@@ -369,6 +397,16 @@ export function Chart(): JSX.Element {
       }
     };
     window.addEventListener("keydown", onKey);
+
+    // Safety net: if the window loses focus mid-drag/mid-stroke, finish
+    // neither — but never leave a stuck drag or parked pan/zoom behind.
+    const onBlur = (): void => {
+      if (dragRef.current) endDrawingDrag();
+      if (brushPointsRef.current.length) {
+        brushPointsRef.current = [];
+      }
+    };
+    window.addEventListener("blur", onBlur);
 
     // Hover readout + ghost-preview mouse tracking (local, no roundtrip).
     // Stays live even during a programmatic sync: only the bus publish is
@@ -391,11 +429,34 @@ export function Chart(): JSX.Element {
       // `point` is local to the pane under the cursor: only the price pane can
       // turn a y into a price, the indicator panes would extrapolate nonsense.
       const onPricePane = param.paneIndex === undefined || param.paneIndex === 0;
-      const price = param.point && onPricePane ? bars.coordinateToPrice(param.point.y) : null;
+      let price = param.point && onPricePane ? bars.coordinateToPrice(param.point.y) : null;
       const timestamp = param.time === undefined ? null : timeToMs(param.time);
+      // Magnet: snap crosshair price to nearest OHLC of the bar under cursor
+      if (magnet && price !== null && timestamp !== null && data) {
+        const candidates = [data.open, data.high, data.low, data.close].filter(
+          (v): v is number => typeof v === "number"
+        );
+        if (candidates.length > 0) {
+          let best = candidates[0];
+          let bd = Math.abs(price - best);
+          for (const c of candidates) {
+            const d = Math.abs(price - c);
+            if (d < bd) {
+              bd = d;
+              best = c;
+            }
+          }
+          price = best as BarPrice;
+        }
+      }
       const position = price !== null && timestamp !== null && Number.isFinite(timestamp)
         ? { timestamp, price }
         : null;
+      // Magnet: snap crosshair visually to nearest OHLC on the price pane
+      if (magnet && onPricePane && price !== null && timestamp !== null) {
+        applyingCrosshairRef.current = true;
+        chart.setCrosshairPosition(price, toTime(timestamp), bars);
+      }
       if (applyingCrosshairRef.current) {
         pendingPublishRef.current = { position, source: "main" };
       } else {
@@ -414,7 +475,7 @@ export function Chart(): JSX.Element {
       const active = toolRef.current;
       if (
         onPricePane &&
-        (active === "zone" || active === "position" || active === "ruler") &&
+        (active === "zone" || active === "position" || active === "ruler" || active === "arrow") &&
         pendingRef.current.length > 0 &&
         param.point &&
         param.time !== undefined
@@ -422,7 +483,10 @@ export function Chart(): JSX.Element {
         const price = barsRef.current?.coordinateToPrice(param.point.y) ?? null;
         const ms = timeToMs(param.time as Time);
         if (price !== null && ms !== null) {
-          previewRef.current = { t: snapClick(ms), p: price };
+          previewRef.current = (() => {
+            const sc = snapClick(ms, price);
+            return { t: sc.t, p: sc.p };
+          })();
           engineRef.current?.setGhost(
             ghostShape(active, pendingRef.current, previewRef.current),
           );
@@ -445,6 +509,7 @@ export function Chart(): JSX.Element {
     return () => {
       window.clearTimeout(rulerTimer.current);
       window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", onBlur);
       crosshairListener();
       publishCrosshair(null, "main");
       ro.disconnect();
@@ -651,7 +716,19 @@ export function Chart(): JSX.Element {
       onMouseDown={(e) => {
         if (e.button !== 0) return;
         downRef.current = { x: e.clientX, y: e.clientY, button: e.button };
-        // With a tool armed the next click places a drawing: never a drag.
+        // Freehand brush: start recording points on mouse down.
+        if (toolRef.current === "brush") {
+          const pt = pointFromEvent(e);
+          if (!pt) return;
+          brushPointsRef.current = (() => {
+            const sc = snapClick(pt.t, pt.p);
+            return [{ t: sc.t, p: sc.p }];
+          })();
+          return;
+        }
+        // A tool is armed: the click places a drawing, never drags one.
+        if (toolRef.current !== "none") return;
+        // A tool is armed: the click places a drawing, never drags one.
         if (toolRef.current !== "none") return;
         const id = engineRef.current?.hoveredId() ?? null;
         if (!id) return;
@@ -662,10 +739,34 @@ export function Chart(): JSX.Element {
       }}
       onMouseMove={(e) => {
         if (dragRef.current) moveDrawingDrag(e.clientX, e.clientY);
+        if (toolRef.current === "brush" && brushPointsRef.current.length > 0) {
+          const pt = pointFromEvent(e);
+          if (pt) {
+            brushPointsRef.current.push((() => {
+              const sc = snapClick(pt.t, pt.p);
+              return { t: sc.t, p: sc.p };
+            })());
+            // Live ghost preview: show the stroke as it is being drawn.
+            engineRef.current?.setGhost({ kind: "brush", points: brushPointsRef.current });
+          }
+        }
       }}
       onMouseUp={(e) => {
         const down = downRef.current;
         downRef.current = null;
+        // Finish a freehand brush stroke FIRST: a stroke always moves > 6px,
+        // so it must be saved before the pan/click suppression checks below.
+        if (toolRef.current === "brush") {
+          const pts = brushPointsRef.current;
+          brushPointsRef.current = [];
+          engineRef.current?.setGhost(null);
+          if (pts.length > 1) {
+            store.addDrawing({ kind: "brush", points: pts, color: "#4a9ec4", title: "ручка" });
+            store.setTool("none");
+          }
+          suppressClickRef.current = false;
+          return;
+        }
         if (suppressClickRef.current) {
           suppressClickRef.current = false;
           return; // a drawing was dragged: not a placement click
@@ -681,7 +782,8 @@ export function Chart(): JSX.Element {
         }
         const pt = pointFromEvent(e);
         if (!pt) return;
-        placeAt(snapClick(pt.t), pt.p);
+        const sc = snapClick(pt.t, pt.p);
+        placeAt(sc.t, sc.p);
       }}
       onContextMenu={(e) => {
         // Right-click on a drawing deletes it — the hit comes from the chart's
@@ -739,6 +841,22 @@ export function Chart(): JSX.Element {
         >
           Follow: {follow ? "ON" : "OFF"}
         </button>
+        <button
+          className={`btn b-dim ${magnet ? "b-acc" : ""}`}
+          title="Магнит (чёткое чтение цены с курсора)"
+          onClick={() => setMagnet(!magnet)}
+        >
+          🧲 {magnet ? "ON" : "OFF"}
+        </button>
+        <button
+          className="btn b-dim"
+          title="Скриншот (v5.2.1 takeScreenshot)"
+          onClick={() => {
+            try { chartRef.current?.takeScreenshot?.(); } catch {}
+          }}
+        >
+          📸
+        </button>
       </div>
     </div>
   );
@@ -746,20 +864,53 @@ export function Chart(): JSX.Element {
   // ---- coordinate helpers ----
 
   function candleTimes(): number[] {
-    return getState().candles.map((r) => r[0]);
+    // Cached per candlesVersion change (line 534/467): this runs on every
+    // mousemove during drag/brush — a full map over ~17k candles per event
+    // froze the page under a paint-style stroke.
+    return candleTimesRef.current;
   }
 
-  function snapClick(ms: number): number {
-    return snapTime(candleTimes(), ms);
+  function snapClick(ms: number, price: number): { t: number; p: number } {
+    // Time always snaps to the bar. Magnet: price snaps to the nearest
+    // OHLC value of the bar under the cursor (TradingView-style magnet).
+    const t = snapTime(candleTimes(), ms);
+    if (!magnet) return { t, p: price };
+    const candles = getState().candles;
+    if (!candles.length) return { t, p: price };
+    const times = candleTimes();
+    // binary search for the bar index
+    let lo = 0;
+    let hi = times.length - 1;
+    if (t <= times[0]) lo = hi = 0;
+    else if (t >= times[times.length - 1]) lo = hi = times.length - 1;
+    else {
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (times[mid] <= t) lo = mid;
+        else hi = mid;
+      }
+      lo = t - times[lo] <= times[hi] - t ? lo : hi;
+    }
+    const [, open, high, low, close] = candles[lo];
+    const candidates = [open, high, low, close];
+    let best = candidates[0];
+    let bd = Math.abs(price - best);
+    for (const c of candidates) {
+      const d = Math.abs(price - c);
+      if (d < bd) {
+        bd = d;
+        best = c;
+      }
+    }
+    return { t, p: best };
   }
 
   /** Container-relative pixel -> bar time (exact inverse of timeToCoordinate). */
   function xToMs(x: number): number | null {
     const ts = chartRef.current?.timeScale();
     if (!ts) return null;
-    const rows = getState().candles;
-    if (!rows.length) return null;
-    const times = rows.map((r) => r[0]);
+    const times = candleTimes();
+    if (!times.length) return null;
     return invertTime(x, times, (ms) => {
       const v = ts.timeToCoordinate(toTime(ms));
       return typeof v === "number" ? v : null;
@@ -889,6 +1040,13 @@ export function Chart(): JSX.Element {
             color: dir === "long" ? "#3d9a50" : "#d46666",
             title: (dir === "long" ? "LONG " : "SHORT ") + (rr === null ? "—" : rr.toFixed(2) + "R"),
           });
+        } else if (active === "arrow") {
+          const [a, b] = pend;
+          store.addDrawing({
+            kind: "arrow", t0: a.t, price: a.p, t1: b.t, price1: b.p,
+            color: "#4a9ec4",
+            title: "стрелка",
+          });
         } else if (active === "ruler") {
           const [a, b] = pend;
           placeRuler(a, b);
@@ -949,6 +1107,8 @@ export function Chart(): JSX.Element {
       case "zone": return { t: Math.min(d.t1, d.t2), p: Math.max(d.p1, d.p2) };
       case "position": return { t: Math.min(d.t1, d.t2), p: d.entry };
       case "note": return { t: d.t0, p: d.price };
+      case "arrow": return { t: d.t0, p: d.price };
+      case "brush": return d.points.length ? { t: d.points[0].t, p: d.points[0].p } : { t: 0, p: 0 };
     }
   }
 
@@ -972,7 +1132,15 @@ export function Chart(): JSX.Element {
       offP: anchor.p - mp,
       moved: false,
     };
-    const onMove = (event: PointerEvent): void => moveDrawingDrag(event.clientX, event.clientY);
+    const onMove = (event: PointerEvent): void => {
+      // If the button was already released (e.g. mouseup outside the window),
+      // finish the drag here instead of getting stuck in drag mode forever.
+      if (event.buttons === 0) {
+        endDrawingDrag();
+        return;
+      }
+      moveDrawingDrag(event.clientX, event.clientY);
+    };
     const onUp = (): void => endDrawingDrag();
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp, { once: true });
@@ -1037,6 +1205,17 @@ export function Chart(): JSX.Element {
           ? { ...x, t1: snapTime(rows, o.t1 + dT), t2: snapTime(rows, o.t2 + dT),
               entry: o.entry + dP, sl: o.sl + dP, tp: o.tp + dP }
           : x);
+    } else if (o.kind === "arrow") {
+      store.updateDrawing(drag.id, (x) =>
+        x.kind === "arrow"
+          ? { ...x, t0: snapTime(rows, o.t0 + dT), t1: snapTime(rows, o.t1 + dT),
+              price: o.price + dP, price1: o.price1 + dP }
+          : x);
+    } else if (o.kind === "brush") {
+      store.updateDrawing(drag.id, (x) =>
+        x.kind === "brush"
+          ? { ...x, points: o.points.map((pt) => ({ t: snapTime(rows, pt.t + dT), p: pt.p + dP })) }
+          : x);
     }
   }
 
@@ -1061,6 +1240,7 @@ export function Chart(): JSX.Element {
 function ghostShape(tool: Tool, pending: Pt[], mouse: Pt): GhostShape | null {
   if (pending.length === 0) return null;
   if (tool === "zone") return { kind: "zone", a: pending[0], b: mouse };
+  if (tool === "arrow") return { kind: "arrow", a: pending[0], b: mouse };
   if (tool === "ruler") return { kind: "ruler", a: pending[0], b: mouse };
   if (tool === "position") {
     const entry = pending[0];
