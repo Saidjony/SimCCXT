@@ -430,29 +430,34 @@ export function Chart(): JSX.Element {
       // turn a y into a price, the indicator panes would extrapolate nonsense.
       const onPricePane = param.paneIndex === undefined || param.paneIndex === 0;
       let price = param.point && onPricePane ? bars.coordinateToPrice(param.point.y) : null;
-      const timestamp = param.time === undefined ? null : timeToMs(param.time);
-      // Magnet: snap crosshair price to nearest OHLC of the bar under cursor
-      if (magnet && price !== null && timestamp !== null && data) {
-        const candidates = [data.open, data.high, data.low, data.close].filter(
-          (v): v is number => typeof v === "number"
-        );
-        if (candidates.length > 0) {
-          let best = candidates[0];
-          let bd = Math.abs(price - best);
-          for (const c of candidates) {
-            const d = Math.abs(price - c);
-            if (d < bd) {
-              bd = d;
-              best = c;
+      let timestamp = param.time === undefined ? null : timeToMs(param.time);
+      // Magnet: snap crosshair to bar (time) and OHLC (price) on price pane
+      if (magnet && onPricePane && timestamp !== null) {
+        // snap time to nearest bar
+        timestamp = snapTime(candleTimes(), timestamp);
+        // snap price to nearest OHLC of that bar
+        if (price !== null && data) {
+          const candidates = [data.open, data.high, data.low, data.close].filter(
+            (v): v is number => typeof v === "number"
+          );
+          if (candidates.length > 0) {
+            let best = candidates[0];
+            let bd = Math.abs(price - best);
+            for (const c of candidates) {
+              const d = Math.abs(price - c);
+              if (d < bd) {
+                bd = d;
+                best = c;
+              }
             }
+            price = best as BarPrice;
           }
-          price = best as BarPrice;
         }
       }
       const position = price !== null && timestamp !== null && Number.isFinite(timestamp)
         ? { timestamp, price }
         : null;
-      // Magnet: snap crosshair visually to nearest OHLC on the price pane
+      // Magnet: snap crosshair visually to bar time + OHLC price on price pane
       if (magnet && onPricePane && price !== null && timestamp !== null) {
         applyingCrosshairRef.current = true;
         chart.setCrosshairPosition(price, toTime(timestamp), bars);
@@ -851,8 +856,17 @@ export function Chart(): JSX.Element {
         <button
           className="btn b-dim"
           title="Скриншот (v5.2.1 takeScreenshot)"
-          onClick={() => {
-            try { chartRef.current?.takeScreenshot?.(); } catch {}
+          onClick={async () => {
+            try {
+              const canvas = await chartRef.current?.takeScreenshot?.(true, true);
+              if (canvas) {
+                const dataUrl = canvas.toDataURL("image/png");
+                const a = document.createElement("a");
+                a.href = dataUrl;
+                a.download = `simccxt-${Date.now()}.png`;
+                a.click();
+              }
+            } catch {}
           }}
         >
           📸
