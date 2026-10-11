@@ -24,17 +24,21 @@ export type Drawing =
   | { id: string; kind: "vline"; t: number; color: string; title: string }
   | { id: string; kind: "zone"; t1: number; p1: number; t2: number; p2: number; color: string; title: string }
   | { id: string; kind: "position"; t1: number; t2: number; entry: number; sl: number; tp: number; color: string; title: string }
-  | { id: string; kind: "note"; t0: number; price: number; color: string; title: string };
+  | { id: string; kind: "note"; t0: number; price: number; color: string; title: string }
+  | { id: string; kind: "arrow"; t0: number; price: number; t1: number; price1: number; color: string; title: string }
+  | { id: string; kind: "brush"; points: Array<{ t: number; p: number }>; color: string; title: string };
 
-export type Tool = "none" | "ray" | "vline" | "zone" | "position" | "ruler" | "note";
+export type Tool = "none" | "ray" | "vline" | "zone" | "position" | "ruler" | "note" | "arrow" | "brush";
 
 /** A drawing without its id (id is assigned by the store). Distributive over the union. */
 export type NewDrawing =
   | { kind: "ray"; t0: number; price: number; color: string; title: string }
+  | { kind: "arrow"; t0: number; price: number; t1: number; price1: number; color: string; title: string }
   | { kind: "vline"; t: number; color: string; title: string }
   | { kind: "zone"; t1: number; p1: number; t2: number; p2: number; color: string; title: string }
   | { kind: "position"; t1: number; t2: number; entry: number; sl: number; tp: number; color: string; title: string }
-  | { kind: "note"; t0: number; price: number; color: string; title: string };
+  | { kind: "note"; t0: number; price: number; color: string; title: string }
+  | { kind: "brush"; points: Array<{ t: number; p: number }>; color: string; title: string };
 
 // ---------------------------------------------------------------------------
 // Watchlist: the right-panel coin list. Persisted per browser (localStorage);

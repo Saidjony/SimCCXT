@@ -22,6 +22,8 @@ import { DrawingPrimitive } from "./base";
 import { NotePrimitive } from "./note";
 import { PositionPrimitive } from "./position";
 import { RayPrimitive } from "./ray";
+import { ArrowPrimitive } from "./arrow";
+import { BrushPrimitive } from "./brush";
 import { RulerPrimitive, type RulerShape } from "./ruler";
 import { ZonePrimitive } from "./zone";
 import { GhostPrimitive, type GhostShape } from "./ghost";
@@ -228,6 +230,10 @@ export class DrawingEngine {
         return new PositionPrimitive(this._host);
       case "note":
         return new NotePrimitive(this._host);
+      case "arrow":
+        return new ArrowPrimitive(this._host);
+      case "brush":
+        return new BrushPrimitive(this._host);
       case "vline":
         return new BarrierPrimitive(drawing);
     }

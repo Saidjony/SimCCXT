@@ -15,6 +15,8 @@ import { drawZone, zoneGeometry } from "./zone";
 export type GhostShape =
   | { kind: "zone"; a: Pt; b: Pt }
   | { kind: "ruler"; a: Pt; b: Pt }
+  | { kind: "arrow"; a: Pt; b: Pt }
+  | { kind: "brush"; points: Pt[] }
   | { kind: "position"; entry: Pt; sl: Pt | null; tp: Pt | null };
 
 const GHOST_ALPHA = 0.55;
@@ -36,6 +38,54 @@ export class GhostPrimitive extends TransientPrimitive {
       target.useBitmapCoordinateSpace((scope) =>
         drawZone(scope, g, "#4a9ec4", false, GHOST_ALPHA),
       );
+      return;
+    }
+    if (shape.kind === "arrow") {
+      const x0 = conv.x(shape.a.t);
+      const y0 = conv.y(shape.a.p);
+      const x1 = conv.x(shape.b.t);
+      const y1 = conv.y(shape.b.p);
+      if (x0 === null || y0 === null || x1 === null || y1 === null) return;
+      target.useBitmapCoordinateSpace((scope) => {
+        const i = scope.context;
+        i.globalAlpha = GHOST_ALPHA;
+        i.strokeStyle = "#4a9ec4";
+        i.lineWidth = 2;
+        i.beginPath();
+        i.moveTo(x0, y0);
+        i.lineTo(x1, y1);
+        i.stroke();
+        const angle = Math.atan2(y1 - y0, x1 - x0);
+        const len = 12;
+        i.beginPath();
+        i.moveTo(x1, y1);
+        i.lineTo(x1 - len * Math.cos(angle - 0.5), y1 - len * Math.sin(angle - 0.5));
+        i.moveTo(x1, y1);
+        i.lineTo(x1 - len * Math.cos(angle + 0.5), y1 - len * Math.sin(angle + 0.5));
+        i.stroke();
+        i.globalAlpha = 1;
+      });
+      return;
+    }
+    if (shape.kind === "brush") {
+      if (shape.points.length < 2) return;
+      target.useBitmapCoordinateSpace((scope) => {
+        const i = scope.context;
+        i.globalAlpha = GHOST_ALPHA;
+        i.strokeStyle = "#4a9ec4";
+        i.lineWidth = 2;
+        i.beginPath();
+        for (let idx = 0; idx < shape.points.length; idx++) {
+          const pt = shape.points[idx];
+          const x = conv.x(pt.t);
+          const y = conv.y(pt.p);
+          if (x === null || y === null) continue;
+          if (idx === 0) i.moveTo(x, y);
+          else i.lineTo(x, y);
+        }
+        i.stroke();
+        i.globalAlpha = 1;
+      });
       return;
     }
     if (shape.kind === "ruler") {
