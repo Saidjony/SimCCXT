@@ -5,27 +5,64 @@ import { getState, store } from "../state/store";
 
 export { nextRequestId, sendSim } from "./connection";
 
+/** Fresh session: identity, challenge entry, series. Called after
+ *  `session_state` says there is nothing to restore. */
+function initSession(): void {
+  // Restore identity: login (stored nick or empty = server random nick),
+  // then rejoin the challenge with the stored risk/capital.
+  sendSim({ type: "login", name: getState().nick });
+  sendSim({
+    type: "challenge",
+    join: true,
+    risk_usdt: getState().fixedRiskUsdt,
+    capital_usdt: getState().initialCapitalUsdt,
+  });
+  subscribeSim(getState().symbol, getState().timeframe, getState().exchange);
+}
+
 function route(m: ServerMessage): void {
   const me = getState().clientId;
   const to = (m as { to?: number }).to;
   if (typeof to === "number" && me !== null && to !== me) return; // other client
   switch (m.type) {
     case "welcome":
+      // Just the socket id; the session is bound by `attach` (sent on open)
+      // and answered with `session_state`.
       store.setClientId(m.client_id);
-      subscribeSim(getState().symbol, getState().timeframe, getState().exchange);
-      // Restore identity: login (stored nick or empty = server random nick),
-      // then rejoin the challenge when the user opted in before.
-      // Every session joins the shared board with the stored risk (the "видно
-      // всем" opt-in checkbox was removed; there is no "leave" anymore).
-      sendSim({ type: "login", name: getState().nick });
-      sendSim({
-        type: "challenge",
-        join: true,
-        risk_usdt: getState().fixedRiskUsdt,
-        capital_usdt: getState().initialCapitalUsdt,
-      });
+      break;
+    case "session_state":
+      // The server kept this tab's session (reload/reconnect): adopt its
+      // risk/capital/nick and let the snapshot that follows restore the
+      // series, clock and account. Otherwise start a fresh session.
+      // On a fresh session the server has not joined yet — keep the local
+      // opt-in and let the `challenge` below establish it. A restored session
+      // carries the authoritative flag.
+      store.restoreChallenge(
+        m.risk_usdt,
+        m.capital_usdt,
+        m.restored ? m.in_challenge : getState().inChallenge,
+      );
+      if (m.nick) store.applyLogin(m.nick);
+      if (m.restored && m.has_series) {
+        // Adopt the running session's window (the snapshot that follows
+        // carries its candles and clock). Keep the local one when the server
+        // has no resolved range yet.
+        if (m.start_ms > 0 && m.reveal_start_ms > 0 && m.end_ms > m.start_ms) {
+          store.setReplayWindow({
+            start_ms: m.start_ms,
+            reveal_start_ms: m.reveal_start_ms,
+            end_ms: m.end_ms,
+          });
+        }
+      } else {
+        initSession();
+      }
+      break;
+    case "loading":
+      store.setSeriesLoading(`${m.symbol} ${m.timeframe}: загрузка истории…`);
       break;
     case "snapshot":
+      store.setSeriesLoading(null);
       store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period, m.fills);
       break;
     case "candle":
@@ -81,6 +118,7 @@ function route(m: ServerMessage): void {
       store.finishPreload(m.done, m.total, m.failed);
       break;
     case "error":
+      store.setSeriesLoading(null);
       store.setError(m.message);
       break;
     case "pong":

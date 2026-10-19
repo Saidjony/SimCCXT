@@ -67,8 +67,36 @@ export function preloadSim(
   store.startPreload(symbols.length * timeframes.length);
 }
 
-/** Silence longer than this (with a live socket) means the link is dead. */
-const WATCHDOG_MS = 25000;
+/** Silence longer than this (with a live socket) means the link is dead.
+ *  The server sends a connection-level keepalive every 5 s, independent of
+ *  the engine thread, so a long CCXT load no longer looks like a dead link. */
+const WATCHDOG_MS = 45000;
+
+/**
+ * Stable per-tab session token. A reload keeps it (sessionStorage survives a
+ * reload, dies with the tab), so the server can park the session — account,
+ * fills, PnL, replay clock — and hand it back instead of starting from zero.
+ */
+const TOKEN_KEY = "simccxt.session-token.v1";
+
+export function sessionToken(): string {
+  try {
+    const saved = window.sessionStorage.getItem(TOKEN_KEY);
+    if (saved) return saved;
+  } catch {
+    // private mode: fall through to an in-memory token
+  }
+  const random =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  try {
+    window.sessionStorage.setItem(TOKEN_KEY, random);
+  } catch {
+    // ignore
+  }
+  return random;
+}
 
 let seq = 0;
 export function nextRequestId(): string {
@@ -98,14 +126,10 @@ class Connection {
     if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
       this.connect();
     } else if (this.ws.readyState === WebSocket.OPEN) {
-      // Reused live socket (StrictMode remount): ask Rust for a fresh snapshot.
-      this.send({
-        type: "subscribe",
-        symbol: getState().symbol,
-        timeframe: getState().timeframe,
-        exchange: getState().exchange,
-        ...getState().replayWindow,
-      });
+      // Reused live socket (StrictMode remount): re-confirm the session. The
+      // server answers with `session_state`; the router decides whether a
+      // snapshot is needed. Never resets the replay clock.
+      this.send({ type: "attach", token: sessionToken() });
     }
     this.startWatchdog();
   }
@@ -134,8 +158,15 @@ class Connection {
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.retryMs = 1000;
+      // Fresh liveness window: a reconnect after a long offline stint must
+      // not be judged by the age of the previous session's last message.
+      this.lastMsg = Date.now();
       store.setStatus("open");
       store.clearError();
+      // First frame on every (re)connect: bind this socket to the tab's
+      // session token. A reload therefore resumes the same account instead
+      // of starting a fresh one.
+      this.send({ type: "attach", token: sessionToken() });
     };
     ws.onmessage = (ev: MessageEvent) => {
       if (this.ws !== ws) return;

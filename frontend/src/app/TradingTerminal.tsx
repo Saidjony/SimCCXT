@@ -58,6 +58,7 @@ export function TradingTerminal(): JSX.Element {
   const symbol = useSim((s) => s.symbol);
   const timeframe = useSim((s) => s.timeframe);
   const exchange = useSim((s) => s.exchange);
+  const seriesLoading = useSim((s) => s.seriesLoading);
 
   // Resizable side rail width (px), persisted across reloads.
   const [sideHidden, setSideHidden] = useState<boolean>(() => {
@@ -132,14 +133,19 @@ export function TradingTerminal(): JSX.Element {
           </select>
         </label>
         <ConnBadge />
+        {seriesLoading && <span className="lbl loading-note">{seriesLoading}</span>}
         {serverNick && (
           <>
             <span className="nick-badge">вы: {serverNick}</span>
-            {/* Your own trades, in exactly the view other participants see. */}
+            {/* Your own trades, in exactly the view other participants see.
+                New tab on purpose: in-place navigation would close this
+                socket and the diary needs a live (or parked) session. */}
             <a
               className="btn b-dim"
               href={`?trader=${encodeURIComponent(serverNick)}`}
-              title="Открыть свой дневник сделок"
+              target="_blank"
+              rel="noopener"
+              title="Открыть свой дневник сделок в новой вкладке"
             >
               Мои сделки
             </a>
