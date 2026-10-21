@@ -13,4 +13,4 @@ simccxt-order-engine = { path = "../order-engine" }
 simccxt-portfolio = { path = "../portfolio" }
 simccxt-wallet = { path = "../wallet" }
 serde = { version = "1.0", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }

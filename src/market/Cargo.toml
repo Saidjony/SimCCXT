@@ -10,4 +10,4 @@ license = "MIT"
 simccxt-core = { path = "../core" }
 simccxt-clock = { path = "../clock" }
 serde = { version = "1.0", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }

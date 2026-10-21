@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { TradingTerminal } from "./TradingTerminal";
 import { TraderDiary } from "../components/TraderDiary";
-import { preloadSim } from "../websocket/connection";
+import { lookupMarketsSim, preloadSim } from "../websocket/connection";
 import { CHART_TIMEFRAMES } from "../chart/MiniChart";
 import { getState, useSim } from "../state/store";
 import { traderFromSearch } from "../trade/diary";
@@ -9,9 +9,9 @@ import { traderFromSearch } from "../trade/diary";
 /**
  * Background market-data loader.
  *
- * When the socket is open, ask Rust to warm the disk caches for the whole
+ * When the socket is open, ask Rust to warm its memory and disk caches for the whole
  * watchlist x every timeframe at once, so clicking any coin or any timeframe
- * resolves from disk instead of waiting for a download. This is deliberately
+ * resolves from cache instead of waiting for a download. This is deliberately
  * a `preload` and not a burst of `subscribe`s: a subscribe switches the
  * session's live series and answers with a full snapshot, so a burst would
  * fight the chart the user is actually looking at.
@@ -32,13 +32,21 @@ export function useBackgroundPreload(): void {
     // Debounced: adding coins in a row must not queue one warm-up per keystroke.
     const timer = window.setTimeout(() => {
       const state = getState();
-      preloadSim(
+      const symbols = state.watchlist.map((coin) => coin.symbol);
+      preloadSim(symbols, CHART_TIMEFRAMES, state.exchange);
+      lookupMarketsSim(symbols, state.exchange);
+    }, 400);
+    const refresh = window.setInterval(() => {
+      const state = getState();
+      lookupMarketsSim(
         state.watchlist.map((coin) => coin.symbol),
-        CHART_TIMEFRAMES,
         state.exchange,
       );
-    }, 400);
-    return () => window.clearTimeout(timer);
+    }, 30_000);
+    return () => {
+      window.clearTimeout(timer);
+      window.clearInterval(refresh);
+    };
   }, [status, symbols, exchange, startMs, endMs]);
 }
 

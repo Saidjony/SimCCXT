@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useRef, useSyncExternalStore } from "react";
 import type {
   AccountSnapshot,
   CandleRow,
@@ -47,6 +47,12 @@ export type NewDrawing =
 export interface CoinEntry {
   symbol: string;
   flagged: boolean;
+}
+
+export interface MarketQuote {
+  exchange: ExchangeId | null;
+  last: number;
+  error?: string;
 }
 
 function loadExchange(): ExchangeId {
@@ -243,7 +249,7 @@ function persistChartCriteria(criteria: Record<string, string[]>): void {
 // ---------------------------------------------------------------------------
 // Challenge identity: display nick (+ whether we publish on the shared
 // board). Passwordless by design; the server assigns a random nick per
-// session and accepts an override. Persisted per browser, restored on connect.
+// session when no nick is provided; the confirmed nick is persisted per browser.
 // ---------------------------------------------------------------------------
 
 const USER_KEY = "simccxt.user.v1";
@@ -271,6 +277,53 @@ function persistUser(name: string, inChallenge: boolean): void {
     window.localStorage.setItem(USER_KEY, JSON.stringify({ name, inChallenge }));
   } catch {
     // storage unavailable: identity still works for this page load
+  }
+}
+
+const FILL_HISTORY_KEY = "simccxt.trade-history.v1";
+const FILL_HISTORY_LIMIT = 500;
+
+function loadFillHistory(): FillLine[] {
+  try {
+    const raw = window.localStorage.getItem(FILL_HISTORY_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((value): value is FillLine => {
+      if (!value || typeof value !== "object") return false;
+      const fill = value as Partial<FillLine>;
+      return typeof fill.id === "string"
+        && typeof fill.symbol === "string"
+        && (fill.side === "buy" || fill.side === "sell")
+        && typeof fill.type === "string"
+        && [fill.price, fill.amount, fill.cost, fill.fee, fill.timestamp].every(
+          (number) => typeof number === "number" && Number.isFinite(number),
+        )
+        && typeof fill.orderId === "string"
+        && typeof fill.datetime === "string"
+        && typeof fill.maker === "boolean";
+    }).slice(0, FILL_HISTORY_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function fillKey(fill: FillLine): string {
+  return `${fill.id}|${fill.symbol}|${fill.timestamp}|${fill.price}|${fill.amount}`;
+}
+
+function mergeFills(...groups: FillLine[][]): FillLine[] {
+  const unique = new Map<string, FillLine>();
+  for (const fill of groups.flat()) unique.set(fillKey(fill), fill);
+  return [...unique.values()]
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, FILL_HISTORY_LIMIT);
+}
+
+function persistFillHistory(fills: FillLine[]): void {
+  try {
+    window.localStorage.setItem(FILL_HISTORY_KEY, JSON.stringify(fills));
+  } catch {
+    // The live trade table remains available for this page load.
   }
 }
 
@@ -368,6 +421,8 @@ export interface SimState {
   feeRates: { maker: number; taker: number } | null;
   /** Right-panel coin list: add / remove / flag (pinned to the top). */
   watchlist: CoinEntry[];
+  /** Latest public ticker and source venue for each watchlist symbol. */
+  marketQuotes: Record<string, MarketQuote>;
   /** Setup checklist: selected criterion ids → chips on the chart overlay. */
   criteria: string[];
   /** Independent checklist selection for each chart panel. */
@@ -445,7 +500,7 @@ let state: SimState = {
   fullReset: false,
   lastPrice: 0,
   account: null,
-  fills: [],
+  fills: loadFillHistory(),
   lastOrder: null,
   replay: initialReplay,
   replayWindow: loadReplayWindow(),
@@ -462,6 +517,7 @@ let state: SimState = {
   fixedRiskUsdt: 10,
   feeRates: null,
   watchlist: loadWatchlist(),
+  marketQuotes: {},
   criteria: loadCriteria(),
   chartCriteria: loadChartCriteria(),
   nick: loadUser().name,
@@ -496,16 +552,48 @@ function get(): SimState {
   return state;
 }
 
-/** useSyncExternalStore selector helper (one subscription, per-field select).
- *
- * getSnapshot must return a CACHED value: it is the stable `state` reference
- * itself (only replaced on set()). Selection happens during render, so
- * selectors may freely build fresh arrays (e.g. `s.account?.positions ?? []`)
- * without tripping React's infinite-loop guard.
- */
+function sameSelection(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length > 128) return false;
+    return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+  }
+  if (
+    a === null
+    || b === null
+    || typeof a !== "object"
+    || typeof b !== "object"
+    || Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)
+  ) return false;
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const keys = Object.keys(aRecord);
+  return keys.length === Object.keys(bRecord).length
+    && keys.every((key) => Object.hasOwn(bRecord, key) && Object.is(aRecord[key], bRecord[key]));
+}
+
+/** Selector-aware subscription: unrelated store patches do not rerender every panel. */
 export function useSim<T>(sel: (s: SimState) => T): T {
-  const snap = useSyncExternalStore(subscribe, get, get);
-  return sel(snap);
+  const selectorRef = useRef(sel);
+  selectorRef.current = sel;
+  const selectionRef = useRef<{ value: T } | null>(null);
+  const getSelection = useCallback((): T => {
+    const next = selectorRef.current(state);
+    const previous = selectionRef.current;
+    if (previous && sameSelection(previous.value, next)) return previous.value;
+    selectionRef.current = { value: next };
+    return next;
+  }, []);
+  const subscribeSelection = useCallback((notify: () => void): (() => void) => {
+    let current = getSelection();
+    return subscribe(() => {
+      const next = getSelection();
+      if (Object.is(current, next)) return;
+      current = next;
+      notify();
+    });
+  }, [getSelection]);
+  return useSyncExternalStore(subscribeSelection, getSelection, getSelection);
 }
 
 let drawingSeq = 1;
@@ -539,6 +627,7 @@ export const store = {
     fills: FillLine[] = [],
   ): void {
     const selectedExchange = EXCHANGE_IDS.includes(exchange) ? exchange : state.exchange;
+    const mergedFills = mergeFills(state.fills, fills);
     // Coin switch: stash the active coin's drawings, pull in the incoming
     // coin's own set (empty if never drawn on). Same coin (replay reset,
     // reconnect, timeframe change): drawings stay untouched — they are
@@ -560,7 +649,7 @@ export const store = {
       replay,
       oi,
       oiPeriod,
-      fills: fills.slice(0, 500),
+      fills: mergedFills,
       error: null,
       drawings,
       drawingsBySymbol,
@@ -570,6 +659,42 @@ export const store = {
       selectedId: switching ? null : state.selectedId,
     });
     persistExchange(selectedExchange);
+    persistFillHistory(mergedFills);
+  },
+  applyLocalUpdate(
+    candlesDelta: CandleRow[],
+    account: AccountSnapshot,
+    replay: ReplayState,
+    fills: FillLine[] = [],
+  ): void {
+    let candles = state.candles;
+    let candlesChanged = false;
+    for (const candle of candlesDelta) {
+      const last = candles[candles.length - 1];
+      if (last && candle[0] < last[0]) continue;
+      if (last && candle[0] === last[0]) {
+        if (!candlesChanged) candles = candles.slice();
+        candles[candles.length - 1] = candle;
+        candlesChanged = true;
+      } else {
+        if (!candlesChanged) candles = candles.slice();
+        candles.push(candle);
+        candlesChanged = true;
+      }
+    }
+    const mergedFills = mergeFills(state.fills, fills);
+    const fillsChanged = mergedFills.length !== state.fills.length
+      || mergedFills.some((fill, index) => fillKey(fill) !== fillKey(state.fills[index]));
+    set({
+      candles,
+      candlesVersion: candlesChanged ? state.candlesVersion + 1 : state.candlesVersion,
+      lastPrice: candlesChanged ? candles[candles.length - 1][4] : state.lastPrice,
+      account,
+      replay,
+      fills: fillsChanged ? mergedFills : state.fills,
+      feeRates: account.fees ?? state.feeRates,
+    });
+    if (fillsChanged) persistFillHistory(mergedFills);
   },
   consumedReset(): void {
     if (state.fullReset) set({ fullReset: false });
@@ -592,6 +717,25 @@ export const store = {
   },
   applyMarket(last: number): void {
     set({ lastPrice: last });
+  },
+  applyMarketLookup(
+    quotes: Array<{ symbol: string; exchange: ExchangeId; last: number }>,
+    failures: Array<{ symbol: string; error: string }>,
+  ): void {
+    const marketQuotes = { ...state.marketQuotes };
+    for (const quote of quotes) {
+      if (Number.isFinite(quote.last) && quote.last > 0) {
+        marketQuotes[quote.symbol] = { exchange: quote.exchange, last: quote.last };
+      }
+    }
+    for (const failure of failures) {
+      marketQuotes[failure.symbol] = {
+        exchange: null,
+        last: 0,
+        error: failure.error,
+      };
+    }
+    set({ marketQuotes });
   },
   applyAccount(account: AccountSnapshot): void {
     set({ account });
@@ -626,8 +770,10 @@ export const store = {
     set({ lastOrder: order, error: null });
   },
   applyFill(fill: FillLine): void {
-    if (state.fills.some((f) => f.id === fill.id)) return;
-    set({ fills: [fill, ...state.fills].slice(0, 500) });
+    const fills = mergeFills([fill], state.fills);
+    if (fills.length === state.fills.length && fills.every((item, i) => item === state.fills[i])) return;
+    set({ fills });
+    persistFillHistory(fills);
   },
   setError(message: string): void {
     set({ error: message });
@@ -708,7 +854,12 @@ export const store = {
   },
   /** Server confirmed the effective nick (echo of login_ok). */
   applyLogin(nick: string): void {
-    if (state.serverNick !== nick) set({ serverNick: nick });
+    if (state.nick.trim() === "") {
+      set({ nick, serverNick: nick });
+      persistUser(nick, state.inChallenge);
+    } else if (state.serverNick !== nick) {
+      set({ serverNick: nick });
+    }
   },
   setInChallenge(v: boolean): void {
     if (state.inChallenge === v) return;

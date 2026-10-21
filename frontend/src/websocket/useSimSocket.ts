@@ -1,7 +1,15 @@
 import { useEffect } from "react";
 import type { ServerMessage } from "../types/protocol";
-import { getConnection, sendSim, subscribeSim } from "./connection";
+import { getConnection, sendServer, sendSim, subscribeSim } from "./connection";
 import { getState, store } from "../state/store";
+import { apiUrl } from "./connection";
+import {
+  initializeLocalEngine,
+  isLocalEngineActive,
+  isLocalEngineInitializing,
+  isLocalSnapshotCurrent,
+  requestLocalSync,
+} from "../replay/localEngine";
 
 export { nextRequestId, sendSim } from "./connection";
 
@@ -12,8 +20,10 @@ function route(m: ServerMessage): void {
   switch (m.type) {
     case "welcome":
       store.setClientId(m.client_id);
+      requestLocalSync(true);
       subscribeSim(getState().symbol, getState().timeframe, getState().exchange);
-      // Restore identity: login (stored nick or empty = server random nick),
+      // Restore the browser's stored nick; login_ok persists a generated nick
+      // the first time an anonymous browser connects.
       // then rejoin the challenge when the user opted in before.
       // Every session joins the shared board with the stored risk (the "видно
       // всем" opt-in checkbox was removed; there is no "leave" anymore).
@@ -26,10 +36,22 @@ function route(m: ServerMessage): void {
       });
       break;
     case "snapshot":
-      store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period, m.fills);
+      if (isLocalEngineInitializing() && !isLocalSnapshotCurrent(m)) {
+        sendServer({ type: "replay", action: "pause" });
+        break;
+      }
+      if (isLocalSnapshotCurrent(m)) {
+        sendServer({ type: "replay", action: "pause" });
+        break;
+      }
+      if (!isLocalEngineActive()) {
+        store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period, m.fills);
+      }
+      sendServer({ type: "replay", action: "pause" });
+      void initializeLocalEngine(m, apiUrl(), sendSim);
       break;
     case "candle":
-      if (m.symbol === getState().symbol && (!m.exchange || m.exchange === getState().exchange)) {
+      if (!isLocalEngineActive() && m.symbol === getState().symbol && (!m.exchange || m.exchange === getState().exchange)) {
         store.applyCandle(m.candle);
       }
       break;
@@ -37,19 +59,19 @@ function route(m: ServerMessage): void {
       store.applyOi(m.samples);
       break;
     case "market_update":
-      store.applyMarket(m.last);
+      if (!isLocalEngineActive()) store.applyMarket(m.last);
       break;
     case "account_update":
-      store.applyAccount(m.account);
+      if (!isLocalEngineActive()) store.applyAccount(m.account);
       break;
     case "order_update":
-      store.applyOrder(m.order);
+      if (!isLocalEngineActive()) store.applyOrder(m.order);
       break;
     case "trade":
-      store.applyFill(m.fill);
+      if (!isLocalEngineActive()) store.applyFill(m.fill);
       break;
     case "replay_state":
-      store.applyReplay(m);
+      if (!isLocalEngineActive()) store.applyReplay(m);
       break;
     case "heartbeat":
       // Liveness only (already timestamped by the connection); nothing to render.
@@ -79,6 +101,9 @@ function route(m: ServerMessage): void {
       break;
     case "preload_done":
       store.finishPreload(m.done, m.total, m.failed);
+      break;
+    case "market_lookup":
+      store.applyMarketLookup(m.quotes, m.failures);
       break;
     case "error":
       store.setError(m.message);

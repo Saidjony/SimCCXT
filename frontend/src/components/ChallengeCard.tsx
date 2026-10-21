@@ -14,8 +14,8 @@ function fmtMoney(n: number): string {
 }
 
 /**
- * Challenge: passwordless nick + opt-in shared leaderboard.
- * The server assigns a random nick per session; typing your own overrides it.
+ * Challenge: passwordless nick + shared leaderboard.
+ * The server-assigned random nick is persisted per browser; typing your own overrides it.
  * Join sends the current fixed risk so the board can show R multiples.
  */
 export function ChallengeCard(): JSX.Element {

@@ -920,9 +920,12 @@ impl Broker {
             // trigger price. The trader sized the position from that price, so
             // filling at whatever the market happens to be would move the entry
             // away from the planned risk by up to the whole bar's range.
-            // Protective exits (reduce_only) stay on the market: a stop-loss
-            // filling at its trigger would hide real slippage.
-            let fill_reference = if triggered_market && !c.reduce_only {
+            // Protective stop-losses in this replay fill at their trigger so a
+            // candle gap cannot turn the configured risk into a larger loss.
+            // Other reduce-only exits still use the current market reference.
+            let capped_stop_loss =
+                c.order_type == OrderType::Stop && c.reduce_only && triggered_market;
+            let fill_reference = if triggered_market && (!c.reduce_only || capped_stop_loss) {
                 Some(c.trigger_price)
             } else {
                 None
@@ -955,6 +958,11 @@ impl Broker {
                 );
                 executed.push(order);
             }
+            if capped_stop_loss {
+                // The trigger price is only for this protective fill; do not
+                // leave the simulated book behind the actual replay price.
+                self.update_midpoint(&c.symbol.symbol, price, 1e12);
+            }
         }
 
         executed
@@ -980,6 +988,11 @@ impl Broker {
             .filter(|f| symbol.map(|s| f.symbol.symbol.as_str() == s).unwrap_or(true))
             .cloned()
             .collect()
+    }
+
+    /// Number of recorded fills without cloning the execution log.
+    pub fn fill_count(&self) -> usize {
+        self.fill_log.len()
     }
 }
 
@@ -1173,9 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn protective_stop_still_fills_at_the_market() {
-        // The mirror image: a stop-LOSS filling at its trigger would hide real
-        // slippage, so reduce-only exits keep filling at the market.
+    fn protective_stop_fills_at_its_trigger_to_cap_replay_loss() {
         let mut b = Broker::new();
         b.add_market(&btc(), MarketKind::Linear, ts());
         b.wallet_mut().deposit("USDT", 100_000.0);
@@ -1190,11 +1201,41 @@ mod tests {
         stop.reduce_only = true;
         b.submit_order(stop, ts()).unwrap();
 
-        b.on_price_update(&btc(), 80.0, ts());
+        let executed = b.on_price_update(&btc(), 80.0, ts());
         assert!(
             b.portfolio().position("BTC/USDT").is_none(),
             "the protective stop must have closed the position"
         );
+        assert_eq!(executed.len(), 1);
+        assert!(
+            (executed[0].average_price - 90.0).abs() < 1e-9,
+            "protective stop should fill at the stop, not the gapped price: {:?}",
+            executed[0]
+        );
+    }
+
+    #[test]
+    fn protective_short_stop_fills_at_its_trigger_after_a_gap() {
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_bid(100.0, 10.0);
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Sell, 1.0), ts()).unwrap();
+
+        let mut stop = BrokerOrderRequest::market(btc(), Side::Buy, 1.0);
+        stop.order_type = OrderType::Stop;
+        stop.stop_price = Some(110.0);
+        stop.reduce_only = true;
+        b.submit_order(stop, ts()).unwrap();
+
+        let executed = b.on_price_update(&btc(), 120.0, ts());
+        assert_eq!(executed.len(), 1);
+        assert!(
+            (executed[0].average_price - 110.0).abs() < 1e-9,
+            "short protective stop should fill at the stop after a gap: {:?}",
+            executed[0]
+        );
+        assert!(b.portfolio().position("BTC/USDT").is_none());
     }
 
     #[test]

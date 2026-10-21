@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::stamp;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -98,17 +99,61 @@ fn net_permit() -> NetPermit {
 }
 
 // ---------------------------------------------------------------------------
-// Market-data loading (memory → exchange-scoped disk cache → CCXT → synthetic)
+// Market-data loading (memory → exchange-scoped disk cache → CCXT)
 // ---------------------------------------------------------------------------
 
 /// How many klines to pull when a series is missing from cache and memory.
 const DOWNLOAD_BARS: usize = 5_000;
+const MAX_MEMORY_SERIES: usize = 64;
 const MAX_WINDOW_BARS: usize = 100_000;
 const OHLCV_PAGE: usize = 1_000;
 /// How many open-interest points to keep (coarser grid than klines).
 const OI_POINTS: usize = 1_500;
 const MAX_OI_HISTORY_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const OI_PAGE: usize = 500;
+
+#[derive(Default)]
+struct MemorySeriesCache {
+    access_seq: u64,
+    entries: HashMap<(String, String, String), (u64, Vec<OHLCV>)>,
+}
+
+static MEMORY_SERIES: OnceLock<Mutex<MemorySeriesCache>> = OnceLock::new();
+
+fn cache_memory_series(exchange: &str, symbol: &str, timeframe: &str, candles: &[OHLCV]) {
+    if candles.is_empty() {
+        return;
+    }
+    let cache = MEMORY_SERIES.get_or_init(|| Mutex::new(MemorySeriesCache::default()));
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    cache.access_seq = cache.access_seq.wrapping_add(1);
+    let access_seq = cache.access_seq;
+    let key = (exchange.to_string(), symbol.to_string(), timeframe.to_string());
+    let recent = candles[candles.len().saturating_sub(DOWNLOAD_BARS)..].to_vec();
+    cache.entries.insert(key, (access_seq, recent));
+    while cache.entries.len() > MAX_MEMORY_SERIES {
+        let Some(oldest) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, (used, _))| *used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.entries.remove(&oldest);
+    }
+}
+
+fn cached_memory_series(exchange: &str, symbol: &str, timeframe: &str) -> Option<Vec<OHLCV>> {
+    let cache = MEMORY_SERIES.get()?;
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let key = (exchange.to_string(), symbol.to_string(), timeframe.to_string());
+    cache.access_seq = cache.access_seq.wrapping_add(1);
+    let access_seq = cache.access_seq;
+    let entry = cache.entries.get_mut(&key)?;
+    entry.0 = access_seq;
+    Some(entry.1.clone())
+}
 
 pub(super) struct SeriesRequest<'a> {
     pub exchange: &'a str,
@@ -453,6 +498,85 @@ fn ccxt_timestamp_ms(value: &Value) -> Option<i64> {
     })
 }
 
+#[derive(Clone)]
+pub(super) struct MarketTicker {
+    pub exchange: String,
+    pub last: f64,
+}
+
+static MARKET_TICKER_CACHE: OnceLock<
+    Mutex<HashMap<(String, String), (Instant, Result<Option<MarketTicker>, String>)>>,
+> = OnceLock::new();
+
+/// Find a currently tradable spot symbol, checking the preferred venue first.
+/// The short cache prevents each connected browser from repeating the same
+/// public ticker requests when their watchlists overlap.
+pub(super) fn lookup_market_ticker(
+    symbol: &str,
+    preferred_exchange: &str,
+) -> Result<Option<MarketTicker>, String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    let key = (symbol.clone(), preferred_exchange.to_string());
+    let cache = MARKET_TICKER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((cached_at, result)) = cache.get(&key) {
+            if cached_at.elapsed() < Duration::from_secs(20) {
+                return result.clone();
+            }
+        }
+    }
+
+    let mut exchanges = vec!["binance", "bybit", "okx"];
+    if let Some(index) = exchanges.iter().position(|exchange| *exchange == preferred_exchange) {
+        exchanges.swap(0, index);
+    }
+    let mut failures = Vec::new();
+    let mut result = None;
+    for exchange_id in exchanges {
+        match with_ccxt(exchange_id, |session| {
+            let _permit = net_permit();
+            let CcxtSession { exchange, runtime, .. } = session;
+            runtime
+                .block_on(async {
+                    exchange
+                        .call_raw("fetch_ticker", vec![Value::str(symbol.clone())])
+                        .await
+                })
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(ticker) => {
+                let last = ticker
+                    .as_map()
+                    .and_then(|fields| fields.get("last").or_else(|| fields.get("close")))
+                    .and_then(ccxt_number)
+                    .filter(|price| *price > 0.0);
+                if let Some(last) = last {
+                    result = Some(MarketTicker {
+                        exchange: exchange_id.to_string(),
+                        last,
+                    });
+                    break;
+                }
+                failures.push(format!("{exchange_id}: ticker has no last price"));
+            }
+            Err(error) => failures.push(format!("{exchange_id}: {error}")),
+        }
+    }
+    let lookup = match result {
+        Some(ticker) => Ok(Some(ticker)),
+        None => Err(format!(
+            "no usable ticker for {symbol} on Binance, Bybit or OKX ({})",
+            failures.join("; ")
+        )),
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key, (Instant::now(), lookup.clone()));
+    lookup
+}
+
 fn oi_row(row: &Value) -> Option<(i64, f64)> {
     let interest = ccxt::types::OpenInterest::from_value(row.clone());
     let raw = row.as_map();
@@ -784,8 +908,8 @@ fn download_oi(exchange_id: &str, symbol: &str, tf: &str, points: usize) -> Resu
     })
 }
 
-/// Deterministic synthetic random walk (xorshift64, fixed seed) — explicit
-/// fallback when no cache file exists. Never silent: the source is logged.
+/// Deterministic test fixture (xorshift64, fixed seed).
+#[cfg(test)]
 fn synthetic(symbol: &str, tf: &str, n: usize) -> Vec<OHLCV> {
     let step = tf_step_ms(tf) as i64;
     let start = Utc::now().timestamp_millis() - (n as i64) * step;
@@ -908,12 +1032,13 @@ pub(super) fn ensure_oi(
     }
 }
 
-/// True when a real on-disk series cache exists for `symbol@tf`.
-/// The read-only diary candles API checks this first: offline with no cache
-/// must answer "no data" instead of `ensure_series`'s silent synthetic bars —
-/// fabricated history must never be served as a trader's chart.
+/// True when an on-disk series cache can provide `symbol@tf`.
+/// Derived timeframes use the canonical 5m cache as their source.
 pub(super) fn has_series_cache(exchange: &str, symbol: &str, tf: &str, data_dir: &Path) -> bool {
-    data_dir.join(series_file(exchange, symbol, tf)).exists()
+    let has_bars = |timeframe: &str| {
+        load_csv(&data_dir.join(series_file(exchange, symbol, timeframe))).is_some()
+    };
+    has_bars(tf) || (is_derived_tf(tf) && has_bars(BASE_TF))
 }
 
 /// Closest finer-grained cached OI series for `exchange/symbol` that can
@@ -1025,9 +1150,8 @@ fn insert_oi_grid(
 }
 
 /// Make sure `symbol@timeframe` is loaded. Order: already in memory →
-/// disk cache → CCXT download (saved to cache) → synthetic fallback.
-/// Network is only attempted when `allow_net` (off in unit tests, and with
-/// `--offline`); every source is logged — synthetic is never silent.
+/// disk cache → CCXT download (saved to cache). Production never invents
+/// market history; synthetic candles are only a deterministic unit-test fixture.
 pub(super) fn ensure_series(
     ex: &mut Exchange,
     exchange: &str,
@@ -1039,6 +1163,17 @@ pub(super) fn ensure_series(
 ) -> Result<(), String> {
     if !force_reload && !ex.fetch_ohlcv(symbol, tf, None, Some(1)).is_empty() {
         return Ok(());
+    }
+    if !force_reload {
+        if let Some(candles) = cached_memory_series(exchange, symbol, tf) {
+            if let Ok(sym) = Symbol::parse(symbol) {
+                ex.add_market(&sym, MarketKind::Linear);
+            }
+            let count = candles.len();
+            ex.load_candles(symbol, tf, candles);
+            log!("[engine] {exchange} {symbol} {tf}: {count} bars from memory cache");
+            return Ok(());
+        }
     }
     // 15m/1h/4h/1d are rolled up from the 5m base rather than downloaded: one
     // request per pair instead of four, and every timeframe then agrees on
@@ -1053,6 +1188,7 @@ pub(super) fn ensure_series(
                 if let Ok(sym) = Symbol::parse(symbol) {
                     ex.add_market(&sym, MarketKind::Linear);
                 }
+                cache_memory_series(exchange, symbol, tf, &derived);
                 ex.load_candles(symbol, tf, derived);
                 log!(
                     "[engine] {exchange} {symbol} {tf}: {n} bars aggregated from {BASE_TF} ({})",
@@ -1068,6 +1204,7 @@ pub(super) fn ensure_series(
         if let Ok(sym) = Symbol::parse(symbol) {
             ex.add_market(&sym, MarketKind::Linear);
         }
+        cache_memory_series(exchange, symbol, tf, &candles);
         ex.load_candles(symbol, tf, candles);
         log!(
             "[engine] {exchange} {symbol} {tf}: {n} bars from cache ({})",
@@ -1086,6 +1223,7 @@ pub(super) fn ensure_series(
                 if let Ok(sym) = Symbol::parse(symbol) {
                     ex.add_market(&sym, MarketKind::Linear);
                 }
+                cache_memory_series(exchange, symbol, tf, &candles);
                 ex.load_candles(symbol, tf, candles);
                 log!(
                     "[engine] {exchange} {symbol} {tf}: {n} bars via CCXT (cached {})",
@@ -1096,16 +1234,26 @@ pub(super) fn ensure_series(
             Err(e) => return Err(format!("{exchange} {symbol} {tf}: {e}")),
         }
     }
-    let candles = synthetic(symbol, tf, 2000);
-    if let Ok(sym) = Symbol::parse(symbol) {
-        ex.add_market(&sym, MarketKind::Linear);
+    #[cfg(test)]
+    {
+        let candles = synthetic(symbol, tf, 2000);
+        if let Ok(sym) = Symbol::parse(symbol) {
+            ex.add_market(&sym, MarketKind::Linear);
+        }
+        ex.load_candles(symbol, tf, candles);
+        log!(
+            "[engine] {exchange} {symbol} {tf}: 2000 test-fixture bars (offline; no cache at {})",
+            path.display()
+        );
+        Ok(())
     }
-    ex.load_candles(symbol, tf, candles);
-    log!(
-        "[engine] {exchange} {symbol} {tf}: 2000 synthetic bars (offline; no cache at {})",
-        path.display()
-    );
-    Ok(())
+    #[cfg(not(test))]
+    {
+        Err(format!(
+            "{exchange} {symbol} {tf}: no real candle history available (offline; cache missing at {})",
+            path.display()
+        ))
+    }
 }
 
 /// True when `candles` already spans `[start_ms, end_ms]` (one step of slack
@@ -1132,17 +1280,22 @@ pub(super) fn warm_series_cache(
 ) -> Result<String, String> {
     let step = tf_step_ms(timeframe) as i64;
     let base = data_dir.join(series_file(exchange, symbol, timeframe));
-    let mut note = match load_csv(&base) {
-        Some(candles) => format!("{} bars from cache", candles.len()),
+    let (candles, downloaded) = match load_csv(&base) {
+        Some(candles) => (candles, false),
         None => {
             if !allow_net {
                 return Err("no cache and downloads are disabled (--offline)".into());
             }
             let candles = download_series(exchange, symbol, timeframe, DOWNLOAD_BARS)?;
-            let bars = candles.len();
             save_csv(&base, &candles).map_err(|err| format!("cache write failed: {err}"))?;
-            format!("{bars} bars downloaded")
+            (candles, true)
         }
+    };
+    cache_memory_series(exchange, symbol, timeframe, &candles);
+    let mut note = if downloaded {
+        format!("{} bars downloaded and cached in memory", candles.len())
+    } else {
+        format!("{} bars from disk cached in memory", candles.len())
     };
     if let Some((start_ms, end_ms)) = window {
         let covered = load_csv(&base)
@@ -1545,17 +1698,19 @@ mod tests {
 
     #[test]
     fn has_series_cache_only_sees_real_files() {
-        // The read-only diary candles API answers "no data" offline instead of
-        // letting `ensure_series` fabricate bars — this is that gate.
+        // Derived timeframes may be served from the canonical 5m cache.
         let dir = std::env::temp_dir().join(format!("simccxt-cachechk-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::remove_file(dir.join(series_file("binance", "BTC/USDT", "5m")));
         assert!(!has_series_cache("binance", "BTC/USDT", "5m", &dir));
 
         let path = dir.join(series_file("binance", "BTC/USDT", "5m"));
-        std::fs::write(&path, "ts_ms,open,high,low,close,volume\n").expect("touch cache");
+        let timestamp = DateTime::from_timestamp_millis(1_790_000_000_000).unwrap();
+        save_csv(&path, &[OHLCV::new(timestamp, 100.0, 101.0, 99.0, 100.5, 1.0)])
+            .expect("write cache");
         assert!(has_series_cache("binance", "BTC/USDT", "5m", &dir));
-        // A different exchange or timeframe must not be mistaken for a hit.
+        assert!(has_series_cache("binance", "BTC/USDT", "1h", &dir));
+        // A different exchange or a non-derived timeframe must not be a hit.
         assert!(!has_series_cache("bybit", "BTC/USDT", "5m", &dir));
         assert!(!has_series_cache("binance", "BTC/USDT", "1m", &dir));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1641,7 +1796,12 @@ mod tests {
 
         // A cached pair is reported as a hit and never touches the network.
         let note = warm_series_cache("binance", "BTC/USDT", "1m", &dir, false, None).expect("hit");
-        assert!(note.contains("from cache"), "{note}");
+        assert!(note.contains("from disk cached in memory"), "{note}");
+        assert_eq!(
+            cached_memory_series("binance", "BTC/USDT", "1m").map(|rows| rows.len()),
+            Some(3),
+            "a background warm-up must retain candles in the server memory cache",
+        );
         assert!(!oi_cache_hit("binance", "BTC/USDT", "1m", &dir), "no OI file yet");
 
         // Offline + no cache: an error, not a synthetic series.
@@ -1662,6 +1822,35 @@ mod tests {
         assert!(error.contains("outside"), "{error}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_series_uses_the_background_memory_cache() {
+        let exchange = "memory-cache-test";
+        let symbol = "MEMORY/USDT";
+        let timeframe = "1m";
+        let path = std::env::temp_dir().join(format!("simccxt-memory-{}", std::process::id()));
+        let candles = (1..=3)
+            .map(|minute| {
+                let timestamp = DateTime::from_timestamp_millis(minute * 60_000).unwrap();
+                OHLCV::new(timestamp, 1.0, 2.0, 0.5, 1.5, 10.0)
+            })
+            .collect::<Vec<_>>();
+        cache_memory_series(exchange, symbol, timeframe, &candles);
+
+        let mut engine = Exchange::default();
+        ensure_series(
+            &mut engine,
+            exchange,
+            symbol,
+            timeframe,
+            &path,
+            false,
+            false,
+        )
+        .expect("preloaded series should be available offline from memory");
+        assert_eq!(engine.fetch_ohlcv(symbol, timeframe, None, None).len(), 3);
+
     }
 
     #[test]

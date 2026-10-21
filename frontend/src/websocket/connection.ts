@@ -1,6 +1,7 @@
 import type { ClientMessage, ExchangeId, ServerMessage } from "../types/protocol";
 import { apiBaseFrom, parseServerMessage } from "../types/protocol";
 import { getState, store } from "../state/store";
+import { handleLocalCommand } from "../replay/localEngine";
 
 export function wsUrl(): string {
   const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
@@ -33,6 +34,7 @@ export function subscribeSim(
   exchange: ExchangeId,
 ): void {
   const range = getState().replayWindow;
+  getConnection().expectSnapshot();
   sendSim({
     type: "subscribe",
     symbol,
@@ -43,11 +45,11 @@ export function subscribeSim(
 }
 
 /**
- * Ask Rust to warm the disk caches for the whole watchlist x every timeframe
+ * Ask Rust to warm the memory and disk caches for the whole watchlist x every timeframe
  * in the background. Unlike a burst of `subscribe`s this touches no session
- * state (no snapshot, no clock reset, no account change): Rust only fills
- * files on a background thread, so switching a coin or a timeframe later is
- * instant. The replay date window rides along, so its range cache is warm too.
+ * state (no snapshot, no clock reset, no account change): Rust fills caches
+ * on a background thread, so switching a coin or timeframe later is instant.
+ * The replay date window rides along, so its range cache is warm too.
  */
 export function preloadSim(
   symbols: string[],
@@ -67,8 +69,15 @@ export function preloadSim(
   store.startPreload(symbols.length * timeframes.length);
 }
 
+/** Request current prices and their source venue for the complete watchlist. */
+export function lookupMarketsSim(symbols: string[], exchange: ExchangeId): void {
+  if (symbols.length === 0) return;
+  sendSim({ type: "market_lookup", symbols, exchange });
+}
+
 /** Silence longer than this (with a live socket) means the link is dead. */
 const WATCHDOG_MS = 25000;
+const SNAPSHOT_TIMEOUT_MS = 180000;
 
 let seq = 0;
 export function nextRequestId(): string {
@@ -92,6 +101,11 @@ class Connection {
   private retryTimer = 0;
   private watchdogTimer = 0;
   private lastMsg = 0;
+  private snapshotDeadline = 0;
+
+  expectSnapshot(): void {
+    this.snapshotDeadline = Date.now() + SNAPSHOT_TIMEOUT_MS;
+  }
 
   attach(route: Route): void {
     this.route = route;
@@ -99,6 +113,7 @@ class Connection {
       this.connect();
     } else if (this.ws.readyState === WebSocket.OPEN) {
       // Reused live socket (StrictMode remount): ask Rust for a fresh snapshot.
+      this.expectSnapshot();
       this.send({
         type: "subscribe",
         symbol: getState().symbol,
@@ -116,6 +131,11 @@ class Connection {
   }
 
   send(msg: ClientMessage): void {
+    if (handleLocalCommand(msg)) return;
+    this.sendToServer(msg);
+  }
+
+  sendToServer(msg: ClientMessage): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
@@ -142,6 +162,7 @@ class Connection {
       const m = parseServerMessage(String(ev.data));
       if (!m) return;
       this.lastMsg = Date.now();
+      if (m.type === "snapshot" || m.type === "error") this.snapshotDeadline = 0;
       store.noteMessage(this.lastMsg);
       this.route?.(m);
     };
@@ -174,6 +195,7 @@ class Connection {
     window.clearInterval(this.watchdogTimer);
     this.watchdogTimer = window.setInterval(() => {
       if (!this.route || this.lastMsg === 0) return;
+      if (this.snapshotDeadline > Date.now()) return;
       if (this.ws && this.ws.readyState === WebSocket.OPEN && Date.now() - this.lastMsg > WATCHDOG_MS) {
         // Looks connected but silent well past the server heartbeat: recycle.
         try {
@@ -195,4 +217,8 @@ export function getConnection(): Connection {
 
 export function sendSim(msg: ClientMessage): void {
   getConnection().send(msg);
+}
+
+export function sendServer(msg: ClientMessage): void {
+  getConnection().sendToServer(msg);
 }

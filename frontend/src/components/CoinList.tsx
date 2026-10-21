@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { getState, normalizeSymbol, store, useSim } from "../state/store";
-import type { CoinEntry } from "../state/store";
+import type { CoinEntry, MarketQuote } from "../state/store";
 import { subscribeSim } from "../websocket/connection";
 
 /** Outline/filled flag: the "pinned" marker for a watchlist coin. */
@@ -22,12 +22,12 @@ function FlagIcon({ filled }: { filled: boolean }): JSX.Element {
 function CoinRow(props: {
   coin: CoinEntry;
   active: boolean;
-  lastPrice: number;
+  quote?: MarketQuote;
   onSwitch: (sym: string) => void;
   onFlag: (sym: string) => void;
   onRemove: (sym: string) => void;
 }): JSX.Element {
-  const { coin, active, lastPrice } = props;
+  const { coin, active, quote } = props;
   return (
     <div
       className={
@@ -48,13 +48,19 @@ function CoinRow(props: {
         <FlagIcon filled={coin.flagged} />
       </span>
       <span className="coin-name">{coin.symbol}</span>
-      {active && (
-        <span className="coin-px">
-          {lastPrice > 0
-            ? lastPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })
-            : "—"}
-        </span>
-      )}
+      <span
+        className="coin-px"
+        title={quote?.error ?? "ожидание котировки"}
+      >
+        {quote && !quote.error && quote.last > 0
+          ? <>
+              {quote.last.toLocaleString("en-US", { maximumSignificantDigits: 8 })}
+              <span className="coin-venue">{quote.exchange?.toUpperCase()}</span>
+            </>
+          : quote?.error
+            ? "нет котировки"
+            : "поиск…"}
+      </span>
       <span
         className="coin-x"
         role="button"
@@ -80,6 +86,7 @@ export function CoinList(): JSX.Element {
   const timeframe = useSim((s) => s.timeframe);
   const exchange = useSim((s) => s.exchange);
   const lastPrice = useSim((s) => s.lastPrice);
+  const marketQuotes = useSim((s) => s.marketQuotes);
   const status = useSim((s) => s.status);
   const collapsed = useSim((s) => s.collapsedMarket);
   const [input, setInput] = useState("");
@@ -123,7 +130,7 @@ export function CoinList(): JSX.Element {
       key={c.symbol}
       coin={c}
       active={c.symbol === symbol}
-      lastPrice={lastPrice}
+      quote={marketQuotes[c.symbol]}
       onSwitch={switchTo}
       onFlag={store.toggleFlag}
       onRemove={remove}

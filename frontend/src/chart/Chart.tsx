@@ -26,6 +26,7 @@ import { criterionLabel } from "../trade/criteria";
 import { SPEED_DOWN_CODES, SPEED_UP_CODES, nextSpeed } from "../replay/speed";
 import {
   cumulativeDelta,
+  formatPriceValue,
   formatCompactUsdt,
   invertTime,
   nearestCandleTime,
@@ -39,6 +40,7 @@ import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 import type { SharedCrosshair } from "./crosshairSync";
 import type { BarPrice } from "lightweight-charts";
 import { followLatest } from "./rangeSync";
+import { watchAdaptivePriceAxis } from "./adaptivePriceAxis";
 import { DrawingEngine } from "./primitives/engine";
 import type { GhostShape } from "./primitives/ghost";
 import { PaneLabelPrimitive } from "./primitives/paneLabel";
@@ -126,6 +128,7 @@ export function Chart(): JSX.Element {
   /** Timestamp of the last applied shared cursor (drop same-T replays). */
   const lastAppliedRef = useRef<number | null>(null);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
+  const refreshPriceAxisRef = useRef<(() => void) | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   /** OI / CVD ride in their own panes of THIS chart: one clock, one axis. */
   const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
@@ -161,7 +164,9 @@ export function Chart(): JSX.Element {
   /** Set when a drawing was actually dragged: suppress the click that follows. */
   const suppressClickRef = useRef(false);
   const versionRef = useRef(0);
+  const chartCandleCountRef = useRef(0);
   const cvdValuesRef = useRef<number[]>([]);
+  const cvdRowsRef = useRef<CandleRow[]>([]);
   const [follow, setFollow] = useState(true);
   const followRef = useRef(true);
   const [hover, setHover] = useState<HoverBar | null>(null);
@@ -177,6 +182,7 @@ export function Chart(): JSX.Element {
   const tool = useSim((s) => s.tool);
   const fills = useSim((s) => s.fills);
   const account = useSim((s) => s.account);
+  const fullReset = useSim((s) => s.fullReset);
   const symbol = useSim((s) => s.symbol);
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
@@ -186,6 +192,10 @@ export function Chart(): JSX.Element {
   const oiPeriod = useSim((s) => s.oiPeriod);
   const oiData = useSim((s) => s.oi);
   const replayNow = useSim((s) => s.replay.now_ms);
+  const executionKey = JSON.stringify({
+    positions: (account?.positions ?? []).map((p) => [p.symbol, p.side, p.entryPrice, p.entryTimeMs]),
+    orders: (account?.open ?? []).map((o) => [o.symbol, o.side, o.triggerPrice, o.remaining]),
+  });
   const toolRef = useRef(tool);
   toolRef.current = tool;
   const marketData = getState();
@@ -314,6 +324,13 @@ export function Chart(): JSX.Element {
     chartRef.current = chart;
     barsRef.current = bars;
     volumeRef.current = volume;
+    const adaptivePriceAxis = watchAdaptivePriceAxis(
+      chart,
+      bars,
+      el,
+      () => getState().candles.at(-1)?.[4] ?? 0,
+    );
+    refreshPriceAxisRef.current = adaptivePriceAxis.refresh;
     // Fill markers: the v5 markers plugin, created once for the series.
     const markers = createSeriesMarkers(bars, []);
     markersRef.current = markers;
@@ -419,8 +436,8 @@ export function Chart(): JSX.Element {
         const up = data.close >= data.open;
         setHover({
           text:
-            "O " + data.open.toFixed(1) + "  H " + (data.high ?? 0).toFixed(1) +
-            "  L " + (data.low ?? 0).toFixed(1) + "  C " + data.close.toFixed(1),
+            "O " + formatPriceValue(data.open) + "  H " + formatPriceValue(data.high ?? 0) +
+            "  L " + formatPriceValue(data.low ?? 0) + "  C " + formatPriceValue(data.close),
           up,
         });
       } else {
@@ -509,12 +526,15 @@ export function Chart(): JSX.Element {
     // Seed with whatever is already in the store.
     candleTimesRef.current = getState().candles.map(([timestamp]) => timestamp);
     pushBars(chart, bars, volume, getState().candles, true);
+    chartCandleCountRef.current = getState().candles.length;
     versionRef.current = getState().candlesVersion;
 
     return () => {
       window.clearTimeout(rulerTimer.current);
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("blur", onBlur);
+      adaptivePriceAxis.dispose();
+      refreshPriceAxisRef.current = null;
       crosshairListener();
       publishCrosshair(null, "main");
       ro.disconnect();
@@ -563,7 +583,7 @@ export function Chart(): JSX.Element {
       orders: account?.open ?? [],
       symbol,
     });
-  }, [fills, account, symbol]);
+  }, [fills, executionKey, symbol]);
 
   // Incremental data: full snapshot -> setData(), tick -> update().
   useEffect(() => {
@@ -574,18 +594,50 @@ export function Chart(): JSX.Element {
     if (version === versionRef.current) return;
     versionRef.current = version;
     const s = getState();
-    candleTimesRef.current = s.candles.map(([timestamp]) => timestamp);
-    pushBars(chart, bars, volume, s.candles, s.fullReset);
+    if (
+      s.fullReset
+      || s.candles.length < candleTimesRef.current.length
+      || s.candles.length > candleTimesRef.current.length + 1
+    ) {
+      candleTimesRef.current = s.candles.map(([timestamp]) => timestamp);
+    } else if (s.candles.length > 0) {
+      const index = s.candles.length - 1;
+      const timestamp = s.candles[index][0];
+      if (index === candleTimesRef.current.length) candleTimesRef.current.push(timestamp);
+      else candleTimesRef.current[index] = timestamp;
+    } else {
+      candleTimesRef.current = [];
+    }
+    const reset = s.fullReset
+      || s.candles.length < chartCandleCountRef.current
+      || (s.candles.length > 0
+        && candleTimesRef.current.length > 0
+        && s.candles[0][0] !== candleTimesRef.current[0]);
+    if (reset) {
+      pushBars(chart, bars, volume, s.candles, true);
+    } else if (s.candles.length > 0) {
+      const firstChanged = Math.max(0, chartCandleCountRef.current - 1);
+      for (let index = firstChanged; index < s.candles.length; index += 1) {
+        pushBars(chart, bars, volume, [s.candles[index]], false);
+      }
+    }
+    chartCandleCountRef.current = s.candles.length;
     store.consumedReset();
-    if (s.fullReset) chart.priceScale("right").applyOptions({ autoScale: true });
+    if (reset) chart.priceScale("right").applyOptions({ autoScale: true });
+    refreshPriceAxisRef.current?.();
     followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
     // OI is forward-filled onto the candle grid, so it shares the range.
-    if (s.fullReset && oiSeriesRef.current) {
+    if (reset && oiSeriesRef.current) {
       pushOi(oiSeriesRef.current, s.oi, candleTimesRef.current);
     }
     if (cvdSeriesRef.current) {
-      cvdValuesRef.current = cumulativeDelta(s.candles);
-      pushCvd(cvdSeriesRef.current, s.candles);
+      if (reset) {
+        cvdValuesRef.current = cumulativeDelta(s.candles);
+        pushCvd(cvdSeriesRef.current, s.candles, cvdValuesRef.current);
+      } else {
+        updateCvd(cvdSeriesRef.current, s.candles, cvdRowsRef.current, cvdValuesRef.current);
+      }
+      cvdRowsRef.current = s.candles;
     }
   }, [version]);
 
@@ -638,7 +690,7 @@ export function Chart(): JSX.Element {
     } catch {
       /* timestamps outside the visible series: ignore */
     }
-  }, [fills, symbol, version]);
+  }, [fills, fullReset, symbol]);
 
   // OI / CVD live in panes of the main chart: one clock, one crosshair, one
   // zoom, no second chart to keep in step. The panes are rebuilt together so
@@ -678,7 +730,8 @@ export function Chart(): JSX.Element {
       cvdLabelRef.current = label;
       created.push(line);
       cvdValuesRef.current = cumulativeDelta(state0.candles);
-      pushCvd(line, state0.candles);
+      cvdRowsRef.current = state0.candles;
+      pushCvd(line, state0.candles, cvdValuesRef.current);
     }
 
     applyIndicatorSpec();
@@ -1294,9 +1347,38 @@ function pushOi(
   line.setData(data);
 }
 
-function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[]): void {
-  const cvd = cumulativeDelta(rows);
+function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[], cvd: number[]): void {
   line.setData(rows.map((r, i) => ({ time: toTime(r[0]), value: cvd[i] })));
+}
+
+function updateCvd(
+  line: ISeriesApi<"Line">,
+  rows: CandleRow[],
+  previousRows: CandleRow[],
+  values: number[],
+): void {
+  if (
+    rows.length === 0
+    || previousRows.length === 0
+    || rows.length < previousRows.length
+    || rows[0] !== previousRows[0]
+  ) {
+    const full = cumulativeDelta(rows);
+    pushCvd(line, rows, full);
+    values.length = 0;
+    for (const value of full) values.push(value);
+    return;
+  }
+
+  const firstChanged = Math.max(0, previousRows.length - 1);
+  for (let index = firstChanged; index < rows.length; index += 1) {
+    const row = rows[index];
+    const base = index > 0 ? values[index - 1] : 0;
+    const next = base + (row[4] >= row[1] ? row[5] : -row[5]);
+    if (index === values.length) values.push(next);
+    else values[index] = next;
+    line.update({ time: toTime(row[0]), value: next });
+  }
 }
 
 function pushBars(
@@ -1310,7 +1392,9 @@ function pushBars(
   // Tick size follows the price magnitude: a 0.09 DOGE needs five decimals or
   // the axis rounds to whole cents and the trader cannot read the price.
   const last = rows[rows.length - 1];
-  bars.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(last[4]) } });
+  bars.applyOptions({
+    priceFormat: { type: "price", ...priceAxisFormat(last[4], bars.priceScale().getVisibleRange()) },
+  });
   if (full) {
     bars.setData(
       rows.map((r) => ({ time: toTime(r[0]), open: r[1], high: r[2], low: r[3], close: r[4] })),

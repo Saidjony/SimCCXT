@@ -132,13 +132,14 @@ export function Trades(): JSX.Element {
   return (
     <div>
       <h4>Trades</h4>
+      <div className="lbl">Последние 500 исполнений сохраняются в этом браузере; счёт и позиции не восстанавливаются после разрыва сессии.</div>
       {fills.length === 0 && <div className="lbl">no fills yet</div>}
       {fills.length > 0 && (
         <table className="grid-table">
           <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Type</th><th className="num">Price</th><th className="num">Qty</th><th className="num">Notional</th><th className="num">Fee</th><th>Liquidity</th><th>Order ID</th></tr></thead>
           <tbody>
             {fills.map((f) => (
-              <tr key={f.id}>
+              <tr key={`${f.id}-${f.timestamp}-${f.symbol}-${f.price}-${f.amount}`}>
                 <td>{formatTs(f.timestamp)}</td>
                 <td>{f.symbol}</td>
                 <td><span className={"pill " + (f.side === "buy" ? "pos" : "neg")}>{f.side.toUpperCase()}</span></td>

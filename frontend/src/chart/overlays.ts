@@ -148,17 +148,36 @@ export function formatRuler(s: RulerStats): string {
  */
 export function priceTick(price: number): number {
   if (!Number.isFinite(price) || price <= 0) return 0.01;
-  const decimals = Math.max(0, 2 - Math.floor(Math.log10(price)));
-  // `10 ** -0` is 1, so no clamp is needed on the exponent side.
+  const decimals = Math.max(0, Math.min(12, 2 - Math.floor(Math.log10(price))));
   return decimals === 0 ? 1 : Math.pow(10, -decimals);
 }
 
-/** Precision + minMove pair for a `priceFormat`, from the series' last price. */
-export function priceAxisFormat(price: number): { precision: number; minMove: number } {
-  const minMove = priceTick(price);
+/** Precision + minMove pair for a price format, adapting to the visible zoom. */
+export function priceAxisFormat(
+  price: number,
+  visibleRange?: { from: number; to: number } | null,
+): { precision: number; minMove: number } {
+  let minMove = priceTick(price);
+  if (visibleRange) {
+    const span = Math.abs(visibleRange.to - visibleRange.from);
+    if (Number.isFinite(span) && span > 0) {
+      const zoomStep = Math.pow(10, Math.floor(Math.log10(span / 100)));
+      if (Number.isFinite(zoomStep) && zoomStep > 0) minMove = Math.min(minMove, zoomStep);
+    }
+  }
   const precision =
     minMove >= 1 ? 0 : Math.max(0, Math.min(12, Math.round(-Math.log10(minMove))));
   return { precision, minMove };
+}
+
+/** Formats candle OHLC without discarding the precision present in the data. */
+export function formatPriceValue(value: number): string {
+  const [significand, exponentText] = value.toString().toLowerCase().split("e");
+  const decimals = Math.max(
+    0,
+    Math.min(12, (significand.split(".")[1]?.length ?? 0) - Number(exponentText ?? 0)),
+  );
+  return value.toFixed(decimals);
 }
 
 /** Russian plural for "bar" (chart hint uses timeframe bars). */
@@ -259,9 +278,9 @@ export function formatCompactUsdt(v: number): string {
  * on a "10 dollar" trade.
  *
  * With a taker fee of `feeRate` per side, one unit costs
- * `|entry - sl| + 2 * entry * feeRate`, so:
+ * `|entry - sl| + (|entry| + |sl|) * feeRate`, so:
  *
- *     qty = risk / (|entry - sl| + 2 * entry * feeRate)
+ *     qty = risk / (|entry - sl| + (|entry| + |sl|) * feeRate)
  *
  * `feeRate` is a fraction (0.0025 = 0.25%); null/0 means fees are ignored.
  * Null when inputs are unusable (missing/degenerate stop) — entry is blocked.
@@ -276,7 +295,7 @@ export function calcQty(
   const dist = Math.abs(entry - sl);
   if (!(dist > 0)) return null;
   const fee = Number.isFinite(feeRate) && feeRate > 0 ? feeRate : 0;
-  const perUnit = dist + 2 * Math.abs(entry) * fee;
+  const perUnit = dist + (Math.abs(entry) + Math.abs(sl)) * fee;
   const qty = riskUsdt / perUnit;
   return Number.isFinite(qty) && qty > 0 ? qty : null;
 }
@@ -298,7 +317,7 @@ export function riskAtStop(
   const dist = Math.abs(entry - sl);
   if (!(dist > 0)) return null;
   const fee = Number.isFinite(feeRate) && feeRate > 0 ? feeRate : 0;
-  return qty * (dist + 2 * Math.abs(entry) * fee);
+  return qty * (dist + (Math.abs(entry) + Math.abs(sl)) * fee);
 }
 
 export type OhlcRow = [number, number, number, number, number, number];
@@ -348,8 +367,8 @@ export function profileBarLayout(
 
 /**
  * Cumulative volume delta over the whole series: +volume on up bars
- * (close >= open), -volume on down bars. Recomputed per tick; 10k bars
- * is far below a millisecond, so no incremental bookkeeping.
+ * (close >= open), -volume on down bars. Used when a chart loads or resets;
+ * live updates adjust only the final cumulative point.
  */
 export function cumulativeDelta(rows: OhlcRow[]): number[] {
   const out: number[] = new Array(rows.length);

@@ -61,7 +61,8 @@ src/order-engine    matching engine (market/limit, partial fills, fees, post-onl
                     IOC / FOK time-in-force)
 src/portfolio       positions, cross/isolated margin, leverage, liquidation
 src/wallet          balances, realized/unrealized PnL, fees, funding
-src/server          WebSocket API for the TypeScript terminal (thin layer, no logic)
+src/wasm            Web Worker adapter exposing the same Exchange to the browser
+src/server          market-data HTTP API, WebSocket session and diary/challenge mirror
 ```
 
 Resting limit orders fill when the market trades through them: every replayed
@@ -70,19 +71,36 @@ from funds locked at placement). Without the sweep they would hang open
 forever — nothing else re-matches them.
 
 ```
-Rust simccxt (engine + WebSocket server)
-    │  WebSocket JSON (snapshot once, then deltas)
-    ▼
-TypeScript + React terminal (frontend/)
-    └── TradingView Lightweight Charts (candles, drawings stay in the browser)
+Rust server ──HTTP candles / WebSocket session + diary mirror──▶ React terminal
+                                                            ├── Web Worker + Rust/WASM Exchange
+                                                            └── Lightweight Charts + drawings
 ```
 
-**Sessions (isolation).** Every WebSocket connection gets its own session: a
-private `Exchange` (own 1M USDT paper account, orders, positions), own series,
-own replay clock/speed, own push cursors. Every session event carries `to`
-(the session's `client_id`) and each socket forwards only its own messages;
-disconnect destroys the session. Two browsers = two users = zero shared state —
-except the opt-in challenge board (nick + stats only, no `to`, for everyone).
+**Sessions (isolation).** Every WebSocket connection gets its own session:
+account identity, challenge participation, and diary mirror. Every session
+event carries `to` (the session's `client_id`) and each socket forwards only
+its own messages; disconnect destroys the session. Challenge statistics are
+broadcast to all users.
+
+**Replay execution.** The browser's Web Worker runs the same Rust `Exchange`
+compiled to WebAssembly. Each tab owns its replay clock, speed, orders,
+positions, fills, and PnL; changing one user's speed does not affect another
+user or add per-candle matching work to the server. The server supplies the
+selected history through `GET /api/candles` and receives throttled account/fill
+mirrors for the live challenge board and diary. After the initial history load,
+the worker sends only newly revealed candles and fills; the UI batches chart
+updates for large histories instead of rebuilding or retransmitting the full
+series on every replay tick. Keep the market-data cache on fast local storage
+and warm it before users start replaying. When history is unavailable, replay
+stays paused and reports the loading error rather than displaying fabricated
+prices. If the WASM engine fails after real history has loaded, the client
+reports the error and can fall back to server replay.
+
+The browser's account, positions, open orders, and replay clock are in-memory
+and are lost when the page is refreshed. The server's session mirror is
+destroyed when its WebSocket disconnects or the server restarts. The browser
+separately keeps the latest 500 fills in `localStorage`, so the trade log
+survives a reload; that cache does not restore the account or resume replay.
 
 The workspace deliberately contains **no research crates** — no indicators,
 feature-engineering, clustering (KMeans), support/resistance levels, zones,
@@ -103,10 +121,21 @@ frontend/src/chart        three-panel timeframe workspace, market charts,
 frontend/src/chart/primitives  primitives drawn by lightweight-charts itself
                           (drawings, pane legends; no HTML/SVG layer)
 frontend/src/websocket    singleton connection (reconnect, watchdog), router
+frontend/src/replay       local WASM Worker + engine lifecycle and server mirror
 frontend/src/state        tiny external store (React state/context level, no Redux)
 frontend/src/types        explicit WebSocket protocol types (no `any`)
 frontend/test             pure protocol/math tests (bun test / npm test)
+src/wasm                  WASM adapter for the existing Rust exchange engine
 ```
+
+**Browser replay migration.** The terminal loads the selected candle window
+and runs replay/trading commands in a per-tab Rust/WASM engine. The server
+remains responsible for market-data loading, connection/session identity,
+challenge aggregation, and the read-only diary API. A local account is mirrored
+while connected; as with the prior in-memory server session, it is not a
+persistent account and is lost when the page disconnects. `npm run build`
+compiles the WASM module and requires the Rust `wasm32-unknown-unknown` target
+to be installed.
 
 ## Terminal features
 
@@ -385,6 +414,23 @@ CCXT's unified exchange API, so the terminal loads no data itself:
   subscribe.
 
 `data/` is gitignored — cache is machine-local.
+
+### Remote access through a VPS
+
+The Rust listeners bind to `127.0.0.1` on ports `9001` (WebSocket) and `9002`
+(diary HTTP API), not to a public interface. For a private server behind a
+VPS, use reverse SSH forwarding to VPS loopback and terminate TLS on a VPS
+reverse proxy; forward both ports because the browser uses the HTTP API as
+well as WebSocket. Do not expose the raw ports directly: this protocol has no
+login/authentication, and the diary HTTP API permits cross-origin reads.
+Restrict access at the proxy/firewall until authentication and rate limiting
+are added.
+
+For 5–6 simultaneous sessions, replay computation is serialized but generally
+light compared with uncached downloads and browser chart work. Load testing
+must use the same history size, replay speed, cache state, VPS network path,
+and browser hardware as production; there is no fixed CPU/RAM guarantee from
+the number of connected users alone.
 
 ## Subtleties and gotchas (hard-won, read before debugging)
 
