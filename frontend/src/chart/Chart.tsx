@@ -25,7 +25,6 @@ import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import { SPEED_DOWN_CODES, SPEED_UP_CODES, nextSpeed } from "../replay/speed";
 import {
-  cumulativeDelta,
   formatCompactUsdt,
   invertTime,
   nearestCandleTime,
@@ -162,6 +161,12 @@ export function Chart(): JSX.Element {
   const suppressClickRef = useRef(false);
   const versionRef = useRef(0);
   const cvdValuesRef = useRef<number[]>([]);
+  /** Incremental CVD state: length + running sum of the rendered line. */
+  const cvdRef = useRef({ len: 0, sum: 0, lastTime: 0, lastDelta: 0, first: 0 });
+  /** OI forward-fill signature: skip full rebuilds when nothing moved. */
+  const oiSigRef = useRef("");
+  /** Bars already painted (rAF may batch several WS candles into one render). */
+  const renderedRef = useRef({ len: 0, first: 0 });
   const [follow, setFollow] = useState(true);
   const followRef = useRef(true);
   const [hover, setHover] = useState<HoverBar | null>(null);
@@ -186,6 +191,8 @@ export function Chart(): JSX.Element {
   const oiPeriod = useSim((s) => s.oiPeriod);
   const oiData = useSim((s) => s.oi);
   const replayNow = useSim((s) => s.replay.now_ms);
+  /** Changes only when a NEW bar appears (the forming bar keeps its time). */
+  const candleLen = useSim((s) => s.candles.length);
   const toolRef = useRef(tool);
   toolRef.current = tool;
   const marketData = getState();
@@ -508,7 +515,9 @@ export function Chart(): JSX.Element {
 
     // Seed with whatever is already in the store.
     candleTimesRef.current = getState().candles.map(([timestamp]) => timestamp);
-    pushBars(chart, bars, volume, getState().candles, true);
+    const seed = getState().candles;
+    pushBars(chart, bars, volume, seed, true, 0);
+    renderedRef.current = { len: seed.length, first: seed.length > 0 ? seed[0][0] : 0 };
     versionRef.current = getState().candlesVersion;
 
     return () => {
@@ -574,18 +583,39 @@ export function Chart(): JSX.Element {
     if (version === versionRef.current) return;
     versionRef.current = version;
     const s = getState();
-    candleTimesRef.current = s.candles.map(([timestamp]) => timestamp);
-    pushBars(chart, bars, volume, s.candles, s.fullReset);
-    store.consumedReset();
-    if (s.fullReset) chart.priceScale("right").applyOptions({ autoScale: true });
-    followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
-    // OI is forward-filled onto the candle grid, so it shares the range.
-    if (s.fullReset && oiSeriesRef.current) {
-      pushOi(oiSeriesRef.current, s.oi, candleTimesRef.current);
+    const full = s.fullReset;
+    // Time axis: extend the cached array instead of rebuilding 10k entries
+    // on every tick. Only a reset/symbol switch needs the full map.
+    const times = candleTimesRef.current;
+    if (
+      full ||
+      times.length === 0 ||
+      s.candles.length < times.length ||
+      s.candles[0][0] !== times[0]
+    ) {
+      candleTimesRef.current = s.candles.map(([timestamp]) => timestamp);
+    } else {
+      for (let i = times.length; i < s.candles.length; i += 1) times.push(s.candles[i][0]);
+      if (times.length > 0 && s.candles.length > 0) {
+        times[times.length - 1] = s.candles[s.candles.length - 1][0];
+      }
     }
+    const rendered = renderedRef.current;
+    const paintFull =
+      full ||
+      rendered.len === 0 ||
+      s.candles.length < rendered.len ||
+      (s.candles.length > 0 && s.candles[0][0] !== rendered.first);
+    pushBars(chart, bars, volume, s.candles, paintFull, rendered.len);
+    renderedRef.current = {
+      len: s.candles.length,
+      first: s.candles.length > 0 ? s.candles[0][0] : 0,
+    };
+    store.consumedReset();
+    if (full) chart.priceScale("right").applyOptions({ autoScale: true });
+    followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
     if (cvdSeriesRef.current) {
-      cvdValuesRef.current = cumulativeDelta(s.candles);
-      pushCvd(cvdSeriesRef.current, s.candles);
+      updateCvd(cvdSeriesRef.current, s.candles, cvdRef.current, cvdValuesRef.current, full);
     }
   }, [version]);
 
@@ -638,7 +668,7 @@ export function Chart(): JSX.Element {
     } catch {
       /* timestamps outside the visible series: ignore */
     }
-  }, [fills, symbol, version]);
+  }, [fills, symbol, candleLen]);
 
   // OI / CVD live in panes of the main chart: one clock, one crosshair, one
   // zoom, no second chart to keep in step. The panes are rebuilt together so
@@ -661,6 +691,7 @@ export function Chart(): JSX.Element {
       line.attachPrimitive(label);
       oiSeriesRef.current = line;
       oiLabelRef.current = label;
+      oiSigRef.current = "";
       created.push(line);
       pushOi(line, state0.oi, candleTimesRef.current);
     }
@@ -677,8 +708,9 @@ export function Chart(): JSX.Element {
       cvdSeriesRef.current = line;
       cvdLabelRef.current = label;
       created.push(line);
-      cvdValuesRef.current = cumulativeDelta(state0.candles);
-      pushCvd(line, state0.candles);
+      cvdRef.current = { len: 0, sum: 0, lastTime: 0, lastDelta: 0, first: 0 };
+      cvdValuesRef.current = [];
+      updateCvd(line, state0.candles, cvdRef.current, cvdValuesRef.current, true);
     }
 
     applyIndicatorSpec();
@@ -703,12 +735,19 @@ export function Chart(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oiVisible, cvdVisible]);
 
-  // OI is revealed with the replay clock; CVD follows every candle.
+  // OI is revealed with the replay clock. The line is forward-filled onto the
+  // candle grid, so it only needs rebuilding when a sample becomes visible or
+  // a new candle appears — not on every replay_state message.
   useEffect(() => {
     const line = oiSeriesRef.current;
     if (!line) return;
-    pushOi(line, oiData.filter(([timestamp]) => timestamp <= replayNow), candleTimesRef.current);
-  }, [oiData, replayNow]);
+    const visible = countAtOrBefore(oiData, replayNow);
+    const times = candleTimesRef.current;
+    const sig = `${oiData.length}|${visible}|${times.length}|${times[0] ?? 0}|${times[times.length - 1] ?? 0}`;
+    if (sig === oiSigRef.current) return;
+    oiSigRef.current = sig;
+    pushOi(line, oiData.slice(0, visible), times);
+  }, [oiData, replayNow, version]);
 
   // The OI legend shows which grid is loaded (and when there is none).
   useEffect(() => {
@@ -1294,9 +1333,99 @@ function pushOi(
   line.setData(data);
 }
 
-function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[]): void {
-  const cvd = cumulativeDelta(rows);
-  line.setData(rows.map((r, i) => ({ time: toTime(r[0]), value: cvd[i] })));
+/** Signed volume of one bar (the CVD increment). */
+function barDelta(r: CandleRow): number {
+  return r[4] >= r[1] ? r[5] : -r[5];
+}
+
+/** Number of OI samples at or before `target` (binary search). */
+function countAtOrBefore(samples: Array<[number, number]>, target: number): number {
+  let lo = 0;
+  let hi = samples.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (samples[mid][0] <= target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * Incremental CVD: a full rebuild on reset, otherwise only the forming bar's
+ * value changes or the new tail bars are appended. Recomputing all 10k points
+ * and calling setData on every tick made the chart the hottest render path.
+ */
+function updateCvd(
+  line: ISeriesApi<"Line">,
+  rows: CandleRow[],
+  cache: { len: number; sum: number; lastTime: number; lastDelta: number; first: number },
+  values: number[],
+  full: boolean,
+): void {
+  if (rows.length === 0) {
+    line.setData([]);
+    values.length = 0;
+    cache.len = 0;
+    cache.sum = 0;
+    cache.lastTime = 0;
+    cache.lastDelta = 0;
+    cache.first = 0;
+    return;
+  }
+  const n = rows.length;
+  const last = rows[n - 1];
+  const reset =
+    full || n < cache.len || cache.len === 0 || rows[0][0] !== cache.first;
+  if (reset) {
+    let sum = 0;
+    const data = new Array<{ time: UTCTimestamp; value: number }>(n);
+    values.length = n;
+    for (let i = 0; i < n; i += 1) {
+      sum += barDelta(rows[i]);
+      values[i] = sum;
+      data[i] = { time: toTime(rows[i][0]), value: sum };
+    }
+    line.setData(data);
+    cache.len = n;
+    cache.sum = sum;
+    cache.lastTime = last[0];
+    cache.lastDelta = barDelta(last);
+    cache.first = rows[0][0];
+    return;
+  }
+  if (n === cache.len) {
+    if (last[0] !== cache.lastTime) {
+      // Same length but a different last bar: a reset slipped past `full`.
+      updateCvd(line, rows, cache, values, true);
+      return;
+    }
+    const delta = barDelta(last);
+    if (delta !== cache.lastDelta) {
+      cache.sum += delta - cache.lastDelta;
+      cache.lastDelta = delta;
+      values[n - 1] = cache.sum;
+      line.update({ time: toTime(last[0]), value: cache.sum });
+    }
+    return;
+  }
+  // Append: the previously forming bar is final now, so absorb its change
+  // before adding the new tail (one rAF may batch two WS candles).
+  const prev = rows[cache.len - 1];
+  const prevDelta = barDelta(prev);
+  if (prevDelta !== cache.lastDelta) {
+    cache.sum += prevDelta - cache.lastDelta;
+    values[cache.len - 1] = cache.sum;
+    line.update({ time: toTime(prev[0]), value: cache.sum });
+    cache.lastDelta = prevDelta;
+  }
+  for (let i = cache.len; i < n; i += 1) {
+    cache.sum += barDelta(rows[i]);
+    values[i] = cache.sum;
+    line.update({ time: toTime(rows[i][0]), value: cache.sum });
+  }
+  cache.len = n;
+  cache.lastTime = last[0];
+  cache.lastDelta = barDelta(last);
 }
 
 function pushBars(
@@ -1305,8 +1434,13 @@ function pushBars(
   volume: ISeriesApi<"Histogram">,
   rows: CandleRow[],
   full: boolean,
+  from: number,
 ): void {
-  if (!rows.length) return;
+  if (!rows.length) {
+    bars.setData([]);
+    volume.setData([]);
+    return;
+  }
   // Tick size follows the price magnitude: a 0.09 DOGE needs five decimals or
   // the axis rounds to whole cents and the trader cannot read the price.
   const last = rows[rows.length - 1];
@@ -1324,11 +1458,17 @@ function pushBars(
     );
     chart.timeScale().fitContent();
   } else {
-    bars.update({ time: toTime(last[0]), open: last[1], high: last[2], low: last[3], close: last[4] });
-    volume.update({
-      time: toTime(last[0]),
-      value: last[5],
-      color: last[4] >= last[1] ? "rgba(61,154,80,0.4)" : "rgba(212,102,102,0.4)",
-    });
+    // One message can append several bars (a stalled link, a fast replay):
+    // repaint from the previously forming bar to the tail, not just the last.
+    const start = Math.max(0, Math.min(from - 1, rows.length - 1));
+    for (let i = start; i < rows.length; i += 1) {
+      const r = rows[i];
+      bars.update({ time: toTime(r[0]), open: r[1], high: r[2], low: r[3], close: r[4] });
+      volume.update({
+        time: toTime(r[0]),
+        value: r[5],
+        color: r[4] >= r[1] ? "rgba(61,154,80,0.4)" : "rgba(212,102,102,0.4)",
+      });
+    }
   }
 }

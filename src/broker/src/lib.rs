@@ -981,6 +981,17 @@ impl Broker {
             .cloned()
             .collect()
     }
+
+    /// Number of recorded fills. O(1): the hot path only needs the cursor.
+    pub fn fills_len(&self) -> usize {
+        self.fill_log.len()
+    }
+
+    /// One fill by chronological index. O(1), no clone — used to build only
+    /// the new tail of the fill log instead of cloning and serializing all of it.
+    pub fn fill_at(&self, index: usize) -> Option<&FillLog> {
+        self.fill_log.get(index)
+    }
 }
 
 /// Whether a conditional order is triggered at the given price.

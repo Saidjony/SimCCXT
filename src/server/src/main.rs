@@ -130,6 +130,21 @@ const SNAPSHOT_CAP: usize = 10_000;
 const DEFAULT_SPEED: f64 = 1.0;
 /// Idle poll interval when paused (so commands stay responsive).
 const IDLE_POLL_MS: u64 = 50;
+/// One `replay step` command may advance at most this many bars. A client
+/// asking for 1e9 must not stall the single engine thread for minutes.
+const MAX_STEPS_PER_COMMAND: u64 = 500;
+/// Hot-path push rates. The chart gets every new bar, but account/replay
+/// snapshots are coalesced: at 100 ticks/s the UI cannot use more, and each
+/// one costs a full account serialization.
+const ACCOUNT_PUSH_MS: u64 = 200;
+const REPLAY_PUSH_MS: u64 = 250;
+const MARKET_PUSH_MS: u64 = 100;
+/// Leaderboard refresh period while the replay runs (fills/joins are instant).
+const BOARD_PUSH_MS: u64 = 1_000;
+/// How long a disconnected session stays parked in memory for a reload.
+const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// Cap on parked sessions (each owns a series + account).
+const MAX_DETACHED: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Client -> server commands
@@ -170,6 +185,10 @@ enum ClientCmd {
     CancelOrder { order_id: String, symbol: String, request_id: Option<String> },
     ClosePosition { symbol: String, quantity: Option<f64>, request_id: Option<String> },
     Login { #[serde(default)] name: String, request_id: Option<String> },
+    /// Bind this connection to a client-generated token. If the token belongs
+    /// to a session that was parked by a disconnect (page reload), the session
+    /// — account, orders, clock, stats — is restored under the new client id.
+    Attach { token: String, request_id: Option<String> },
     Challenge {
         join: bool,
         #[serde(default)]
@@ -234,6 +253,9 @@ fn exchange_or_default(raw: Option<&str>) -> String {
 /// teardown of that client's session, or a diary request (read-only HTTP).
 enum EngineJob {
     Command { client_id: u64, cmd: ClientCmd },
+    /// Register the per-connection delivery channel. Directed messages go only
+    /// to that socket (no shared broadcast ring, no per-socket JSON parsing).
+    Connect { client_id: u64, tx: tokio::sync::mpsc::Sender<String> },
     Disconnect { client_id: u64 },
     Diary { nick: String, reply: oneshot::Sender<Value> },
     Traders { reply: oneshot::Sender<Value> },
@@ -246,6 +268,24 @@ enum EngineJob {
         end_ms: i64,
         reply: oneshot::Sender<Value>,
     },
+    /// A background warm-up finished for a `subscribe` that missed the cache.
+    /// The engine now applies it (a fast disk read) and answers the client.
+    SeriesReady {
+        client_id: u64,
+        exchange: String,
+        symbol: String,
+        timeframe: String,
+        window: RequestedWindow,
+        request_id: Option<String>,
+    },
+    /// Same, but the warm-up failed (offline / unknown pair / rate limit).
+    SeriesFailed {
+        client_id: u64,
+        symbol: String,
+        timeframe: String,
+        error: String,
+        request_id: Option<String>,
+    },
 }
 
 /// One background warm-up request: every `symbol x timeframe` pair the client
@@ -257,6 +297,30 @@ struct PreloadJob {
     pairs: Vec<(String, String)>,
     /// Replay date window, so the date-range caches are warm too.
     window: Option<(i64, i64)>,
+    /// When set, the loader answers the engine with `SeriesReady`/`SeriesFailed`
+    /// for this exact pair (a `subscribe` that would otherwise download on the
+    /// engine thread). The client's request id rides along for correlation.
+    notify: Option<SubscribeWait>,
+}
+
+/// A `subscribe` parked while the loader fetches its series.
+#[derive(Clone)]
+struct SubscribeWait {
+    symbol: String,
+    timeframe: String,
+    window: RequestedWindow,
+    request_id: Option<String>,
+}
+
+/// Worker-thread request for the read-only diary candles endpoint. Runs off
+/// the engine so a cold window download cannot freeze every session.
+struct CandleRequest {
+    exchange: String,
+    symbol: String,
+    timeframe: String,
+    start_ms: i64,
+    end_ms: i64,
+    reply: oneshot::Sender<Value>,
 }
 
 /// Cap on one request (a client cannot queue an unbounded download storm).
@@ -298,6 +362,21 @@ fn msg(v: Value) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| r#"{"type":"error","message":"encode"}"#.into())
 }
 
+/// Serialize a message addressed to one client with `to` as the FIRST key.
+/// The broadcast writer routes on a byte prefix (`routing_target`), and
+/// serde_json's map is alphabetical — `account`/`candles`/`type` would all
+/// sort before `to`, so a directed fallback would leak to every socket.
+fn msg_to(to: u64, mut v: Value) -> String {
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("to");
+    }
+    let body = msg(v);
+    if body.len() <= 2 {
+        return format!("{{\"to\":{to}}}");
+    }
+    format!("{{\"to\":{to},{}", &body[1..])
+}
+
 /// Timestamp prefix for server logs (so connect/disconnect storms are debuggable).
 pub(crate) fn stamp() -> String {
     chrono::Utc::now().format("%H:%M:%S").to_string()
@@ -313,6 +392,7 @@ mod market_data;
 
 /// Bars in `live` that the client has not seen yet (client has seen `fed`).
 /// Pure helper so it can be unit-tested: returns the slice of new rows.
+#[cfg(test)]
 fn new_bars(live: &[Vec<f64>], fed: usize) -> &[Vec<f64>] {
     if fed >= live.len() { &[] } else { &live[fed..] }
 }
@@ -330,8 +410,19 @@ struct Session {
     step_ms: u64, // mirrored from Exchange::set_step_ms (no getter there)
     fed: usize,   // candles already pushed to this client
     fills_seen: usize,
-    last_beat: std::time::Instant, // last heartbeat to this client
+    /// Distinct order ids seen so far — the leaderboard's trade count without
+    /// re-serializing the whole fill log on every board push.
+    seen_orders: HashSet<String>,
     last_step: std::time::Instant, // last auto-tick (per-session speed)
+    last_account_push: std::time::Instant,
+    last_replay_push: std::time::Instant,
+    last_market_push: std::time::Instant,
+    /// Opaque client token, so a page reload re-attaches to this session
+    /// instead of creating a fresh account (empty = old client, no restore).
+    token: String,
+    /// A `subscribe` parked on the loader thread: (symbol, timeframe). Stale
+    /// `SeriesReady` jobs are ignored unless they match this.
+    pending_subscribe: Option<(String, String)>,
     nick: String,      // challenge display name (random at creation)
     in_challenge: bool, // opt-in: publish nick+stats on the shared board
     risk_usdt: f64,    // fixed risk per trade, sent by the frontend on join
@@ -371,6 +462,7 @@ struct PendingProtection {
     remaining: f64,
 }
 
+#[derive(Clone)]
 struct RequestedWindow {
     start_ms: Option<i64>,
     reveal_start_ms: Option<i64>,
@@ -464,12 +556,10 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
         let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
         let equity = snap["equity"].as_f64().unwrap_or(0.0);
         let pnl = realized + unrealized;
-        let trades = {
-            let fills = s.ex.fetch_fills(None, None);
-            let mut ids = std::collections::HashSet::new();
-            for f in &fills { ids.insert(f["orderId"].as_str().unwrap_or("").to_string()); }
-            ids.len()
-        };
+        // Distinct entry/exit orders, maintained incrementally when fresh
+        // fills are seen. Re-serializing the whole fill log here was the
+        // hottest part of the board push (once per tick per participant).
+        let trades = s.seen_orders.len();
         let r = r_of(pnl, s.risk_usdt).unwrap_or(0.0);
         rows.push((r, json!({
             "nick": s.nick,
@@ -490,22 +580,40 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
 
 struct Engine {
     sessions: HashMap<u64, Session>,
+    /// Sessions parked on disconnect (by token) for a page reload / reconnect.
+    detached: HashMap<String, Detached>,
+    /// Per-socket delivery channels: directed events never enter the shared
+    /// broadcast ring (which would clone every snapshot for every client).
+    clients: HashMap<u64, tokio::sync::mpsc::Sender<String>>,
     out: broadcast::Sender<String>,
     /// Missing series may be downloaded via CCXT (false in unit tests,
     /// and when the server is started with `--offline`).
     allow_net: bool,
     /// Background cache warm-up sender (see PRELOAD above).
     preload: Option<mpsc::Sender<PreloadJob>>,
+    /// High-priority warm-up channel for a `subscribe` that would otherwise
+    /// download on the engine thread.
+    preload_urgent: Option<mpsc::Sender<PreloadJob>>,
+    /// Engine's own job queue, so a loader thread can hand work back.
+    jobs: Option<mpsc::Sender<EngineJob>>,
+    /// Diary-candle worker: never loads a series on the engine thread.
+    candles: Option<mpsc::Sender<CandleRequest>>,
+    last_board_push: std::time::Instant,
 }
 
-/// Heartbeat period: even a paused replay emits traffic so the frontend can
-/// tell "idle" apart from "disconnected".
-const HEARTBEAT_SECS: u64 = 10;
+/// A session kept alive after its socket closed, waiting for the tab to
+/// re-attach with the same token (page reload, engine stall reconnect).
+struct Detached {
+    session: Session,
+    since: std::time::Instant,
+}
 
 /// Wall-clock interval between auto-steps at `speed` ticks/second.
 fn speed_interval(speed: f64) -> Duration {
+    // 50 Hz ceiling: faster replay only burns CPU (the UI ladder tops out at
+    // 10x, and no display can use more than one update per frame).
     let ms = (1000.0 / speed.max(0.05)).round() as u64;
-    Duration::from_millis(ms.clamp(10, 5000))
+    Duration::from_millis(ms.clamp(20, 5000))
 }
 
 fn replay_json(s: &Session) -> Value {
@@ -516,8 +624,8 @@ fn replay_json(s: &Session) -> Value {
         "speed": s.speed,
         "step_ms": s.step_ms,
         "done": s.ex.replay_done(&s.symbol, &s.timeframe),
-        "fed": s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len(),
-        "total": s.ex.fetch_ohlcv(&s.symbol, &s.timeframe, None, None).len(),
+        "fed": s.ex.live_len(&s.symbol, &s.timeframe),
+        "total": s.ex.total_len(&s.symbol, &s.timeframe),
     })
 }
 
@@ -563,7 +671,7 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "replay": replay_json(s),
         "oi": s.oi.clone(),
         "oi_period": s.oi_period,
-        "fills": s.ex.fetch_fills(None, Some(500)),
+        "fills": s.ex.fetch_fills_last(500),
         "request_id": request_id,
     })
 }
@@ -571,18 +679,20 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
 /// Attach a protective stop to every newly executed entry fill.
 /// Pending limit/trigger entries are kept in the session until they fill.
 fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
-    let fills = s.ex.fetch_fills(None, None);
-    if fills.len() <= s.fills_seen {
+    let total = s.ex.fills_len();
+    if total <= s.fills_seen {
         return Vec::new();
     }
-    let fresh_count = fills.len() - s.fills_seen;
-    let mut fresh: Vec<Value> = fills.into_iter().take(fresh_count).collect();
-    fresh.reverse();
+    // Newest first, only the unseen tail. The old code cloned and serialized
+    // the entire fill log on every tick just to look at its length.
+    let mut fresh = s.ex.fetch_fills_from(s.fills_seen, None);
+    fresh.reverse(); // chronological (oldest unseen first)
     let mut events = Vec::new();
     for fill in fresh {
         let symbol = fill["symbol"].as_str().unwrap_or_default().to_string();
         let side = fill["side"].as_str().unwrap_or_default().to_string();
         let order_id = fill["orderId"].as_str().unwrap_or_default().to_string();
+        s.seen_orders.insert(order_id.clone());
         let source_order_id = s.ex.take_triggered_order_source(&order_id);
         // If this fill came from a protective order, remember WHICH level it
         // implemented: the diary needs the reason, and price proximity cannot
@@ -711,8 +821,7 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
         }
         events.push(json!({ "type": "trade", "fill": fill }));
     }
-    s.fills_seen = s.ex.fetch_fills(None, None).len();
-    events.push(account_json(s));
+    s.fills_seen = total;
     events
 }
 
@@ -725,10 +834,13 @@ fn error_json(message: String, request_id: Option<String>) -> Value {
 }
 
 /// Deltas after one step: new candles + market/trades/account/replay.
-fn delta_events(s: &mut Session) -> Vec<Value> {
+///
+/// `force` bypasses the coalescing timers (manual step, reset, order ack):
+/// those are user-initiated and the UI expects the result immediately.
+fn delta_events(s: &mut Session, force: bool) -> Vec<Value> {
     let mut ev = Vec::new();
-    let live = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe);
-    for bar in new_bars(&live, s.fed) {
+    // O(k): only the bars after the cursor, not the whole revealed history.
+    for bar in s.ex.live_from(&s.symbol, &s.timeframe, s.fed) {
         ev.push(json!({
             "type": "candle",
             "symbol": s.symbol,
@@ -738,7 +850,7 @@ fn delta_events(s: &mut Session) -> Vec<Value> {
             "is_new": true,
         }));
     }
-    s.fed = live.len();
+    s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
     let oi_end = s.oi.partition_point(|(ts, _)| *ts <= s.ex.now_ms());
     if oi_end > s.oi_fed {
         ev.push(json!({
@@ -747,17 +859,30 @@ fn delta_events(s: &mut Session) -> Vec<Value> {
         }));
         s.oi_fed = oi_end;
     }
-    let last = live.last().map(|r| r[4]).unwrap_or(0.0);
-    ev.push(json!({
-        "type": "market_update",
-        "symbol": s.symbol,
-        "last": last,
-        "timestamp": s.ex.now_ms(),
-    }));
+    let last = s.ex.live_last(&s.symbol, &s.timeframe)
+        .map(|row| row[4])
+        .unwrap_or(0.0);
+    if force || s.last_market_push.elapsed() >= Duration::from_millis(MARKET_PUSH_MS) {
+        s.last_market_push = std::time::Instant::now();
+        ev.push(json!({
+            "type": "market_update",
+            "symbol": s.symbol,
+            "last": last,
+            "timestamp": s.ex.now_ms(),
+        }));
+    }
     // New fills produced by the step (e.g. triggered stop/TP).
-    ev.extend(fresh_fill_events(s));
-    ev.push(account_json(s));
-    ev.push(replay_json(s));
+    let fresh = fresh_fill_events(s);
+    let has_fills = fresh.iter().any(|event| event["type"] == "trade");
+    ev.extend(fresh);
+    if force || has_fills || s.last_account_push.elapsed() >= Duration::from_millis(ACCOUNT_PUSH_MS) {
+        s.last_account_push = std::time::Instant::now();
+        ev.push(account_json(s));
+    }
+    if force || s.last_replay_push.elapsed() >= Duration::from_millis(REPLAY_PUSH_MS) {
+        s.last_replay_push = std::time::Instant::now();
+        ev.push(replay_json(s));
+    }
     ev
 }
 
@@ -775,8 +900,13 @@ fn new_session(nick: String) -> Session {
         step_ms: 60_000,
         fed: 0,
         fills_seen: 0,
-        last_beat: std::time::Instant::now(),
+        seen_orders: HashSet::new(),
         last_step: std::time::Instant::now(),
+        last_account_push: std::time::Instant::now() - Duration::from_secs(1),
+        last_replay_push: std::time::Instant::now() - Duration::from_secs(1),
+        last_market_push: std::time::Instant::now() - Duration::from_secs(1),
+        token: String::new(),
+        pending_subscribe: None,
         nick,
         in_challenge: false,
         risk_usdt: 0.0,
@@ -958,7 +1088,7 @@ fn use_series(
     }
     s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= reset_ms);
     s.fed = 0;
-    s.fills_seen = s.ex.fetch_fills(None, None).len();
+    s.fills_seen = s.ex.fills_len();
     s.last_step = std::time::Instant::now();
     s.symbol = symbol;
     s.timeframe = timeframe;
@@ -969,7 +1099,18 @@ fn use_series(
 impl Engine {
     /// Unit-test constructor: never touches the network.
     fn new(out: broadcast::Sender<String>) -> Self {
-        Engine { sessions: HashMap::new(), out, allow_net: false, preload: None }
+        Engine {
+            sessions: HashMap::new(),
+            detached: HashMap::new(),
+            clients: HashMap::new(),
+            out,
+            allow_net: false,
+            preload: None,
+            preload_urgent: None,
+            jobs: None,
+            candles: None,
+            last_board_push: std::time::Instant::now(),
+        }
     }
 
     fn with_net(mut self, allow_net: bool) -> Self {
@@ -983,11 +1124,40 @@ impl Engine {
         self
     }
 
-    /// Everything the engine says to a session carries `to`; the per-socket
-    /// writer drops messages addressed to other clients.
+    fn with_urgent_preload(mut self, urgent: mpsc::Sender<PreloadJob>) -> Self {
+        self.preload_urgent = Some(urgent);
+        self
+    }
+
+    fn with_jobs(mut self, jobs: mpsc::Sender<EngineJob>) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    fn with_candles(mut self, candles: mpsc::Sender<CandleRequest>) -> Self {
+        self.candles = Some(candles);
+        self
+    }
+
+    /// Everything the engine says to a session carries `to`. Delivery prefers
+    /// the client's private channel; the broadcast fallback exists for unit
+    /// tests (and preload progress), where no socket registered one.
     fn send_to(&self, to: u64, mut v: Value) {
         v["to"] = json!(to);
-        let _ = self.out.send(msg(v));
+        let mut text = msg_to(to, v);
+        if let Some(tx) = self.clients.get(&to) {
+            // `try_send`: the engine thread must never await a socket. A full
+            // queue falls back to the broadcast ring, whose lag path sends the
+            // client a `resync` — slow readers are recovered, not blocked.
+            match tx.try_send(text) {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    text = returned;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+        let _ = self.out.send(text);
     }
 
     fn send_all(&self, to: u64, evs: Vec<Value>) {
@@ -1009,7 +1179,8 @@ impl Engine {
 
     /// Broadcast the challenge board to EVERYONE (no `to` — the writer
     /// forwards such messages to all sockets). Cheap: only participants.
-    fn push_board(&self) {
+    fn push_board(&mut self) {
+        self.last_board_push = std::time::Instant::now();
         let _ = self.out.send(msg(challenge_board_json(&self.sessions)));
     }
 
@@ -1046,6 +1217,43 @@ impl Engine {
             }
             ClientCmd::Ping => {
                 evs.push(json!({ "type": "pong" }));
+            }
+            ClientCmd::Attach { token, request_id } => {
+                let restored = self.attach(to, token.clone());
+                let s = self.session(to);
+                s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
+                s.last_account_push = std::time::Instant::now();
+                s.last_replay_push = std::time::Instant::now();
+                s.last_market_push = std::time::Instant::now();
+                let state = json!({
+                    "type": "session_state",
+                    "restored": restored,
+                    "nick": s.nick,
+                    "risk_usdt": s.risk_usdt,
+                    "capital_usdt": s.capital_usdt,
+                    "in_challenge": s.in_challenge,
+                    "has_series": !s.symbol.is_empty(),
+                    "symbol": s.symbol,
+                    "timeframe": s.timeframe,
+                    "exchange": s.exchange,
+                    "start_ms": s.range_start_ms,
+                    "reveal_start_ms": s.reveal_start_ms,
+                    "end_ms": s.range_end_ms,
+                    "request_id": request_id,
+                });
+                let rejoined = restored && s.in_challenge;
+                evs.push(state);
+                if restored && !s.symbol.is_empty() {
+                    // The client adopts the restored series/clock/account
+                    // instead of re-subscribing (which would reset the replay).
+                    evs.push(snapshot_json(s, None));
+                }
+                board_push |= rejoined;
+                log!(
+                    "[engine] #{to} attach {} -> {}",
+                    if token.is_empty() { "(none)" } else { "token" },
+                    if restored { "restored" } else { "new session" }
+                );
             }
             ClientCmd::Login { name, request_id } => {
                 let s = self.session(to);
@@ -1127,36 +1335,89 @@ impl Engine {
                 symbol, timeframe, exchange, start_ms, reveal_start_ms, end_ms, request_id,
             } => {
                 let allow_net = self.allow_net;
+                let urgent = self.preload_urgent.clone();
                 let s = self.session(to);
+                // A new subscribe supersedes any parked load: its answer would
+                // be for a series the user already navigated away from.
+                s.pending_subscribe = None;
+                let window = RequestedWindow { start_ms, reveal_start_ms, end_ms };
                 let window_changed = start_ms.is_some_and(|value| value != s.range_start_ms)
                     || reveal_start_ms.is_some_and(|value| value != s.reveal_start_ms)
                     || end_ms.is_some_and(|value| value != s.range_end_ms);
-                let result = if s.symbol.is_empty() || symbol != s.symbol || timeframe != s.timeframe || exchange != s.exchange || window_changed {
-                    use_series(
-                        s,
-                        symbol,
-                        timeframe,
-                        exchange,
-                        RequestedWindow { start_ms, reveal_start_ms, end_ms },
-                        data_dir,
-                        allow_net,
-                    ).map(Some)
+                let switching = s.symbol.is_empty()
+                    || symbol != s.symbol
+                    || timeframe != s.timeframe
+                    || exchange != s.exchange
+                    || window_changed;
+                if !switching {
+                    s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
+                    evs.push(snapshot_json(s, request_id));
                 } else {
-                    Ok(None)
-                };
-                match result {
-                    Ok(Some(note)) => {
-                        log!("[engine] #{to} subscribe -> {note}");
-                        s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
-                        evs.push(snapshot_json(s, request_id));
-                    }
-                    Ok(None) => {
-                        s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
-                        evs.push(snapshot_json(s, request_id));
-                    }
-                    Err(err) => {
-                        log!("[engine] #{to} subscribe failed: {err}");
-                        evs.push(error_json(err, request_id));
+                    let in_memory = !s.ex.fetch_ohlcv(&symbol, &timeframe, None, Some(1)).is_empty();
+                    let window_pair = match (start_ms, end_ms) {
+                        (Some(start), Some(end)) if start < end => Some((start, end)),
+                        _ => None,
+                    };
+                    // A disk hit is a small CSV read; only a real download must
+                    // leave the engine thread. The preloader already warms the
+                    // watchlist, so this is the cold-pair path. An in-memory
+                    // series is NOT enough when the request moves the window:
+                    // the disk must cover the new range (or we park).
+                    let cached = (in_memory && !window_changed)
+                        || market_data::series_cache_hit(
+                            &exchange, &symbol, &timeframe, data_dir, window_pair,
+                        );
+                    let parked = if !cached && allow_net {
+                        urgent.and_then(|tx| {
+                            let wait = SubscribeWait {
+                                symbol: symbol.clone(),
+                                timeframe: timeframe.clone(),
+                                window: window.clone(),
+                                request_id: request_id.clone(),
+                            };
+                            let job = PreloadJob {
+                                client_id: to,
+                                exchange: exchange.clone(),
+                                pairs: vec![(symbol.clone(), timeframe.clone())],
+                                window: window_pair,
+                                notify: Some(wait),
+                            };
+                            tx.send(job).ok().map(|_| ())
+                        })
+                    } else {
+                        None
+                    };
+                    if parked.is_some() {
+                        s.pending_subscribe = Some((symbol.clone(), timeframe.clone()));
+                        log!(
+                            "[engine] #{to} subscribe {symbol} {timeframe}: cache miss, loading in background"
+                        );
+                        evs.push(json!({
+                            "type": "loading",
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "request_id": request_id,
+                        }));
+                    } else {
+                        match use_series(
+                            s,
+                            symbol,
+                            timeframe,
+                            exchange,
+                            window,
+                            data_dir,
+                            allow_net,
+                        ) {
+                            Ok(note) => {
+                                log!("[engine] #{to} subscribe -> {note}");
+                                s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
+                                evs.push(snapshot_json(s, request_id));
+                            }
+                            Err(err) => {
+                                log!("[engine] #{to} subscribe failed: {err}");
+                                evs.push(error_json(err, request_id));
+                            }
+                        }
                     }
                 }
             }
@@ -1175,7 +1436,13 @@ impl Engine {
                     ));
                 } else if let Some(tx) = self.preload.clone() {
                     let total = pairs.len();
-                    let job = PreloadJob { client_id: to, exchange, pairs, window };
+                    let job = PreloadJob {
+                        client_id: to,
+                        exchange,
+                        pairs,
+                        window,
+                        notify: None,
+                    };
                     if tx.send(job).is_ok() {
                         log!("[preload] #{to} queued {total} pairs");
                         evs.push(json!({
@@ -1345,6 +1612,7 @@ impl Engine {
                             board_push |= s.in_challenge
                                 && fill_events.iter().any(|event| event["type"] == "trade");
                             evs.extend(fill_events);
+                            evs.push(account_json(s));
                         }
                         Err(e) => evs.push(error_json(format!("close_position: {e}"), request_id)),
                     }
@@ -1383,14 +1651,15 @@ impl Engine {
                                 s.ex.set_step_ms(ms);
                                 s.step_ms = ms;
                             }
-                            let fills_before = s.ex.fetch_fills(None, None).len();
-                            s.ex.step_n(steps.unwrap_or(1).max(1));
+                            let fills_before = s.ex.fills_len();
+                            let steps = steps.unwrap_or(1).clamp(1, MAX_STEPS_PER_COMMAND);
+                            s.ex.step_n(steps);
                             if was_paused {
                                 s.ex.pause();
                             }
                             s.last_step = std::time::Instant::now();
-                            let d = delta_events(s);
-                            if s.ex.fetch_fills(None, None).len() > fills_before
+                            let d = delta_events(s, true);
+                            if s.ex.fills_len() > fills_before
                                 && s.in_challenge
                             {
                                 board_push = true;
@@ -1413,13 +1682,13 @@ impl Engine {
                             // snapshot that truncates the chart back to the new
                             // clock, then resume revealing bar by bar.
                             let snap = snapshot_json(s, request_id.clone());
-                            s.fed = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe).len();
+                            s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
                             s.last_step = std::time::Instant::now();
                             evs.push(snap);
                         }
                         "set_speed" => {
                             if let Some(v) = speed {
-                                if v > 0.0 && v <= 100.0 {
+                                if v > 0.0 && v <= 50.0 {
                                     s.speed = v;
                                 }
                             }
@@ -1434,7 +1703,7 @@ impl Engine {
                         _ => unreachable!("filtered by matches! above"),
                     }
                     if let Some(v) = speed {
-                        if action == "play" && v > 0.0 && v <= 100.0 {
+                        if action == "play" && v > 0.0 && v <= 50.0 {
                             s.speed = v;
                         }
                     }
@@ -1592,10 +1861,36 @@ impl Engine {
     fn handle_job(&mut self, job: EngineJob, data_dir: &Path) {
         match job {
             EngineJob::Command { client_id, cmd } => self.handle_command(client_id, cmd, data_dir),
+            EngineJob::Connect { client_id, tx } => {
+                self.clients.insert(client_id, tx);
+            }
             EngineJob::Disconnect { client_id } => {
+                self.clients.remove(&client_id);
                 if let Some(s) = self.sessions.remove(&client_id) {
-                    log!("[engine] session #{client_id} ({}) closed", s.nick);
-                    if s.in_challenge {
+                    // A page reload closes the socket and reconnects within
+                    // milliseconds. Park the session (account, orders, clock,
+                    // stats) so the new socket can re-attach by token instead
+                    // of starting from zero.
+                    let in_challenge = s.in_challenge;
+                    if !s.token.is_empty()
+                        && !self.sessions.values().any(|other| other.token == s.token)
+                    {
+                        // Parked sessions are not in `sessions`, so the board
+                        // (which iterates only live sessions) already drops
+                        // them; `in_challenge` is kept for the restore.
+                        log!(
+                            "[engine] session #{client_id} ({}) parked for reload",
+                            s.nick
+                        );
+                        self.detached.insert(
+                            s.token.clone(),
+                            Detached { session: s, since: std::time::Instant::now() },
+                        );
+                        self.evict_detached();
+                    } else {
+                        log!("[engine] session #{client_id} ({}) closed", s.nick);
+                    }
+                    if in_challenge {
                         self.push_board();
                     }
                 }
@@ -1603,9 +1898,134 @@ impl Engine {
             EngineJob::Diary { nick, reply } => self.handle_diary(&nick, reply),
             EngineJob::Traders { reply } => self.handle_traders(reply),
             EngineJob::Candles { exchange, symbol, timeframe, start_ms, end_ms, reply } => {
-                self.handle_candles(&exchange, &symbol, &timeframe, start_ms, end_ms, data_dir, reply)
+                let request = CandleRequest {
+                    exchange,
+                    symbol,
+                    timeframe,
+                    start_ms,
+                    end_ms,
+                    reply,
+                };
+                if let Some(tx) = &self.candles {
+                    if let Err(returned) = tx.send(request) {
+                        // Worker is gone: answer instead of leaving HTTP hanging.
+                        let request = returned.0;
+                        let _ = request.reply.send(json!({
+                            "type": "candles", "symbol": "", "candles": [],
+                            "error": "candle loader is unavailable",
+                        }));
+                    }
+                } else {
+                    // Unit-test path: no worker, load inline.
+                    let value = load_candles(
+                        &request.exchange,
+                        &request.symbol,
+                        &request.timeframe,
+                        request.start_ms,
+                        request.end_ms,
+                        data_dir,
+                        self.allow_net,
+                    );
+                    let _ = request.reply.send(value);
+                }
+            }
+            EngineJob::SeriesReady {
+                client_id,
+                exchange,
+                symbol,
+                timeframe,
+                window,
+                request_id,
+            } => {
+                let allow_net = self.allow_net;
+                let Some(s) = self.sessions.get_mut(&client_id) else { return };
+                // The user may have switched again while the loader worked.
+                if s.pending_subscribe.as_ref() != Some(&(symbol.clone(), timeframe.clone())) {
+                    log!(
+                        "[engine] #{client_id} stale series load for {symbol} {timeframe}, ignored"
+                    );
+                    return;
+                }
+                s.pending_subscribe = None;
+                match use_series(s, symbol, timeframe, exchange, window, data_dir, allow_net) {
+                    Ok(note) => {
+                        log!("[engine] #{client_id} subscribe (loaded) -> {note}");
+                        s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
+                        let snapshot = snapshot_json(s, request_id);
+                        self.send_to(client_id, snapshot);
+                    }
+                    Err(err) => {
+                        log!("[engine] #{client_id} loaded subscribe failed: {err}");
+                        self.send_to(client_id, error_json(err, request_id));
+                    }
+                }
+            }
+            EngineJob::SeriesFailed { client_id, symbol, timeframe, error, request_id } => {
+                let Some(s) = self.sessions.get_mut(&client_id) else { return };
+                if s.pending_subscribe.as_ref() != Some(&(symbol.clone(), timeframe.clone())) {
+                    log!(
+                        "[engine] #{client_id} stale series failure for {symbol} {timeframe}, ignored"
+                    );
+                    return;
+                }
+                s.pending_subscribe = None;
+                log!("[engine] #{client_id} background load failed: {error}");
+                self.send_to(client_id, error_json(error, request_id));
             }
         }
+    }
+
+    /// Drop parked sessions past the TTL, and the oldest when the cap is hit.
+    fn evict_detached(&mut self) {
+        let now = std::time::Instant::now();
+        self.detached
+            .retain(|_, parked| now.duration_since(parked.since) < SESSION_TTL);
+        while self.detached.len() > MAX_DETACHED {
+            let oldest = self
+                .detached
+                .iter()
+                .min_by_key(|(_, parked)| parked.since)
+                .map(|(token, _)| token.clone());
+            let Some(token) = oldest else { break };
+            self.detached.remove(&token);
+        }
+    }
+
+    /// Restore (or bind) a session token. Returns `true` when an existing
+    /// session was resumed, so the caller can tell the client to adopt it.
+    fn attach(&mut self, to: u64, token: String) -> bool {
+        let token = token.trim().to_string();
+        if token.is_empty() || token.len() > 128 {
+            return false;
+        }
+        // Re-attach on a live socket (StrictMode remount / duplicate frame):
+        // the session under this id is already ours.
+        if self.sessions.get(&to).is_some_and(|s| s.token == token) {
+            return true;
+        }
+        // Takeover race: the new socket may attach before the old socket's
+        // disconnect job is processed. Move the live session to the new id.
+        if let Some(old_id) = self
+            .sessions
+            .iter()
+            .find(|(id, s)| **id != to && s.token == token)
+            .map(|(id, _)| *id)
+        {
+            if let Some(mut s) = self.sessions.remove(&old_id) {
+                s.last_step = std::time::Instant::now();
+                self.sessions.insert(to, s);
+                return true;
+            }
+        }
+        if let Some(parked) = self.detached.remove(&token) {
+            let mut s = parked.session;
+            s.last_step = std::time::Instant::now();
+            self.sessions.insert(to, s);
+            return true;
+        }
+        let s = self.session(to);
+        s.token = token;
+        false
     }
 
     fn handle_traders(&self, reply: oneshot::Sender<Value>) {
@@ -1620,14 +2040,7 @@ impl Engine {
                 let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
                 let equity = snap["equity"].as_f64().unwrap_or(0.0);
                 let pnl = realized + unrealized;
-                let trades = {
-                    let fills = s.ex.fetch_fills(None, None);
-                    let mut ids = std::collections::HashSet::new();
-                    for f in &fills {
-                        ids.insert(f["orderId"].as_str().unwrap_or("").to_string());
-                    }
-                    ids.len()
-                };
+                let trades = s.seen_orders.len();
                 let r = r_of(pnl, s.risk_usdt);
                 let value = json!({
                     "nick": s.nick,
@@ -1651,97 +2064,83 @@ impl Engine {
         let traders: Vec<Value> = rows.into_iter().map(|(_, _, v)| v).collect();
         let _ = reply.send(json!({"type":"traders","traders":traders}));
     }
+}
 
-    /// Candles for the diary chart: read-only, loaded into a throwaway
-    /// `Exchange` so no session is touched. Falls back to the error JSON when
-    /// the series cannot be loaded (offline and not cached).
-    fn handle_candles(
-        &self,
-        exchange: &str,
-        symbol: &str,
-        timeframe: &str,
-        start_ms: i64,
-        end_ms: i64,
-        data_dir: &Path,
-        reply: oneshot::Sender<Value>,
-    ) {
-        let mut ex = Exchange::default();
-        // Offline with no cache would make `ensure_series` fabricate 2000
-        // synthetic bars — never serve those as a trader's chart.
-        let mut result = if !self.allow_net
-            && !market_data::has_series_cache(exchange, symbol, timeframe, data_dir)
-        {
-            json!({"type": "candles", "symbol": symbol, "error":
-                   format!("{exchange} {symbol} {timeframe}: no cached candles (offline)"),
-                   "candles": []})
-        } else if start_ms > 0 && end_ms > start_ms {
-            // The diary asks for an explicit window. The canonical per-series
-            // cache holds only a recent tail (e.g. 5000 bars), which would cut
-            // the trader's older trades off the chart — and the client cannot
-            // draw an entry/exit marker for a bar it never received. Load the
-            // window itself (window cache, topped up via CCXT when missing).
-            match ensure_series_window(
-                &mut ex,
-                market_data::SeriesRequest {
-                    exchange,
-                    symbol,
-                    timeframe,
-                    data_dir,
-                    allow_net: self.allow_net,
-                    force_reload: false,
-                    start_ms,
-                    end_ms,
-                },
-            ) {
-                Ok(()) => Value::Null,
-                Err(e) => json!({"type": "candles", "symbol": symbol, "error": e, "candles": []}),
-            }
-        } else {
-            match ensure_series(
-                &mut ex,
+/// Load candles for a read-only chart. Free function (no engine state) so it
+/// can run on a worker thread: a cold window download used to block every
+/// session's ticks for the duration of the HTTP round-trip.
+fn load_candles(
+    exchange: &str,
+    symbol: &str,
+    timeframe: &str,
+    start_ms: i64,
+    end_ms: i64,
+    data_dir: &Path,
+    allow_net: bool,
+) -> Value {
+    let mut ex = Exchange::default();
+    let mut result = if !allow_net
+        && !market_data::has_series_cache(exchange, symbol, timeframe, data_dir)
+    {
+        json!({"type": "candles", "symbol": symbol, "error":
+               format!("{exchange} {symbol} {timeframe}: no cached candles (offline)"),
+               "candles": []})
+    } else if start_ms > 0 && end_ms > start_ms {
+        match ensure_series_window(
+            &mut ex,
+            market_data::SeriesRequest {
                 exchange,
                 symbol,
                 timeframe,
                 data_dir,
-                self.allow_net,
-                false,
-            ) {
-                Ok(()) => Value::Null,
-                Err(e) => json!({"type": "candles", "symbol": symbol, "error": e, "candles": []}),
-            }
-        };
-        if result.is_null() {
-            let mut rows = ex.fetch_ohlcv(symbol, timeframe, None, None);
-            rows.retain(|r| {
-                let t = r[0] as i64;
-                (start_ms <= 0 || t >= start_ms) && (end_ms <= 0 || t <= end_ms)
-            });
-            // Tell the client what it actually got: a window that falls short of
-            // the requested range must be visible, not silently short. A whole
-            // bar of slack on each side, since the first/last candle of a
-            // requested range is rarely aligned to a bar boundary.
-            let step = tf_step_ms(timeframe) as i64;
-            let covered = rows.first().map(|r| r[0] as i64).unwrap_or(0);
-            let covered_end = rows.last().map(|r| r[0] as i64).unwrap_or(0);
-            let partial = covered > 0
-                && ((start_ms > 0 && covered > start_ms + step)
-                    || (end_ms > 0 && covered_end + step < end_ms));
-            result = json!({
-                "type": "candles", "symbol": symbol, "timeframe": timeframe,
-                "candles": rows,
-                "start_ms": covered, "end_ms": covered_end,
-                "partial": partial,
-            });
-            if partial {
-                log!(
-                    "[candles] {exchange} {symbol} {timeframe}: served {covered}..{covered_end}, \
-                     short of the requested {start_ms}..{end_ms}"
-                );
-            }
+                allow_net,
+                force_reload: false,
+                start_ms,
+                end_ms,
+            },
+        ) {
+            Ok(()) => Value::Null,
+            Err(e) => json!({"type": "candles", "symbol": symbol, "error": e, "candles": []}),
         }
-        let _ = reply.send(result);
+    } else {
+        match ensure_series(&mut ex, exchange, symbol, timeframe, data_dir, allow_net, false) {
+            Ok(()) => Value::Null,
+            Err(e) => json!({"type": "candles", "symbol": symbol, "error": e, "candles": []}),
+        }
+    };
+    if result.is_null() {
+        let mut rows = ex.fetch_ohlcv(symbol, timeframe, None, None);
+        rows.retain(|r| {
+            let t = r[0] as i64;
+            (start_ms <= 0 || t >= start_ms) && (end_ms <= 0 || t <= end_ms)
+        });
+        // Tell the client what it actually got: a window that falls short of
+        // the requested range must be visible, not silently short. A whole
+        // bar of slack on each side, since the first/last candle of a
+        // requested range is rarely aligned to a bar boundary.
+        let step = tf_step_ms(timeframe) as i64;
+        let covered = rows.first().map(|r| r[0] as i64).unwrap_or(0);
+        let covered_end = rows.last().map(|r| r[0] as i64).unwrap_or(0);
+        let partial = covered > 0
+            && ((start_ms > 0 && covered > start_ms + step)
+                || (end_ms > 0 && covered_end + step < end_ms));
+        result = json!({
+            "type": "candles", "symbol": symbol, "timeframe": timeframe,
+            "candles": rows,
+            "start_ms": covered, "end_ms": covered_end,
+            "partial": partial,
+        });
+        if partial {
+            log!(
+                "[candles] {exchange} {symbol} {timeframe}: served {covered}..{covered_end}, \
+                 short of the requested {start_ms}..{end_ms}"
+            );
+        }
     }
+    result
+}
 
+impl Engine {
     /// Sleep until the next session step is due (or the idle poll fires).
     fn next_timeout(&self) -> Duration {
         let mut d = Duration::from_millis(IDLE_POLL_MS);
@@ -1777,7 +2176,7 @@ impl Engine {
                 continue;
             }
             s.ex.step_n(1);
-            emissions.push((id, delta_events(s)));
+            emissions.push((id, delta_events(s, false)));
         }
         // Mark-to-market changes unrealized PnL on every replay tick.
         let board_dirty = emissions.iter().any(|(id, _)| {
@@ -1786,31 +2185,12 @@ impl Engine {
         for (id, evs) in emissions {
             self.send_all(id, evs);
         }
-        if board_dirty {
+        // Unrealized PnL moves every tick; a leaderboard at 1 Hz is plenty and
+        // avoids serializing every participant's account 100 times a second.
+        if board_dirty
+            && self.last_board_push.elapsed() >= Duration::from_millis(BOARD_PUSH_MS)
+        {
             self.push_board();
-        }
-    }
-
-    /// Per-session heartbeat: lets the frontend distinguish a paused replay
-    /// from a dead connection (every HEARTBEAT_SECS per session).
-    fn heartbeat_all(&mut self) {
-        let now = std::time::Instant::now();
-        let mut beats: Vec<(u64, Value)> = Vec::new();
-        for (&id, s) in &mut self.sessions {
-            if s.last_beat.elapsed() >= Duration::from_secs(HEARTBEAT_SECS) {
-                s.last_beat = now;
-                beats.push((
-                    id,
-                    json!({
-                        "type": "heartbeat",
-                        "now_ms": s.ex.now_ms(),
-                        "paused": s.ex.is_paused(),
-                    }),
-                ));
-            }
-        }
-        for (id, v) in beats {
-            self.send_to(id, v);
         }
     }
 }
@@ -1848,6 +2228,14 @@ async fn handle_conn(
     log!("[ws] #{client_id} connected from {addr}");
     let (mut sink, mut stream) = ws.split();
     let mut rx = out.subscribe();
+    // Private delivery channel: directed events (candles, snapshots, account)
+    // never enter the shared broadcast ring, so N sockets no longer clone and
+    // parse each other's multi-hundred-KB snapshots.
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::channel::<String>(256);
+    let err_tx = direct_tx.clone();
+    if jobs.send(EngineJob::Connect { client_id, tx: direct_tx }).is_err() {
+        return;
+    }
     // Tell the client its id so it can filter directed messages.
     let hello = msg(json!({ "type": "welcome", "client_id": client_id }));
     if sink.send(tokio_tungstenite::tungstenite::Message::Text(hello.into())).await.is_err() {
@@ -1873,42 +2261,53 @@ async fn handle_conn(
                     }
                 }
                 Err(e) => {
-                    let err = msg(json!({
-                        "type": "error", "to": client_id,
+                    let err = msg_to(client_id, json!({
+                        "type": "error",
                         "message": format!("bad command: {e}"),
                     }));
-                    let _ = out.send(err);
+                    // Private channel first; the broadcast fallback is still
+                    // routed by its `to` prefix, never delivered to others.
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(err)) =
+                        err_tx.try_send(err)
+                    {
+                        let _ = out.send(err);
+                    }
                 }
             }
         }
     }
     .boxed();
-    // Broadcast -> this socket (skip other clients' directed messages).
-    // A slow client must NEVER kill its connection: on lag we ask it to
-    // resync (fresh snapshot) and keep streaming.
+    // Two sources, one sink: the private channel (this session) and the
+    // broadcast (challenge board + preload progress). A slow client must never
+    // kill its connection: broadcast lag asks it to resync and keeps streaming.
     let mut write = async move {
+        // Local keepalive, independent of the engine: a long CCXT download on
+        // the engine thread must not look like a dead link to the browser.
+        let mut beat = tokio::time::interval(Duration::from_secs(5));
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let s = match rx.recv().await {
-                Ok(s) => s,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    log!("[ws] #{client_id} lagged, skipped {skipped} msgs -> resync");
-                    let resync = msg(json!({ "type": "resync", "to": client_id }));
-                    let m = tokio_tungstenite::tungstenite::Message::Text(resync.into());
-                    if sink.send(m).await.is_err() {
-                        break;
-                    }
-                    continue;
+            let text = tokio::select! {
+                _ = beat.tick() => {
+                    json!({ "type": "heartbeat", "keepalive": true }).to_string()
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Some(text) = direct_rx.recv() => text,
+                message = rx.recv() => match message {
+                    Ok(s) => {
+                        // Broadcast carries no `to` (board/preload). Directed
+                        // messages on it are the test/legacy fallback only.
+                        if let Some(to) = routing_target(&s) {
+                            if to != client_id { continue; }
+                        }
+                        s
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        log!("[ws] #{client_id} lagged, skipped {skipped} msgs -> resync");
+                        msg_to(client_id, json!({ "type": "resync" }))
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             };
-            if let Ok(v) = serde_json::from_str::<Value>(&s) {
-                if let Some(to) = v.get("to").and_then(|t| t.as_u64()) {
-                    if to != client_id {
-                        continue;
-                    }
-                }
-            }
-            let m = tokio_tungstenite::tungstenite::Message::Text(s.into());
+            let m = tokio_tungstenite::tungstenite::Message::Text(text.into());
             if sink.send(m).await.is_err() {
                 break;
             }
@@ -1922,8 +2321,16 @@ async fn handle_conn(
         _ = &mut write => "send-failed",
     };
     log!("[ws] #{client_id} disconnected ({reason})");
-    // Destroy the session: its account/clock die with the connection.
+    // Park (or destroy) the session: a reload re-attaches by token.
     let _ = jobs.send(EngineJob::Disconnect { client_id });
+}
+
+/// The `to` field of a broadcast message, read without parsing the whole JSON:
+/// directed messages always start with `{"to":<id>,` (see `msg_to`).
+fn routing_target(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix("{\"to\":")?;
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 #[derive(Debug)]
@@ -1982,6 +2389,8 @@ struct PreloadReport<'a> {
 /// only chart context. Failures are counted, never fatal.
 fn preload_main(
     rx: mpsc::Receiver<PreloadJob>,
+    urgent: mpsc::Receiver<PreloadJob>,
+    jobs: mpsc::Sender<EngineJob>,
     out: broadcast::Sender<String>,
     data_dir: PathBuf,
     allow_net: bool,
@@ -1989,16 +2398,25 @@ fn preload_main(
     // This thread yields the shared CCXT path to the engine between pairs.
     mark_background_net();
     log!("[preload] background loader started (net={})", if allow_net { "on" } else { "off" });
-    while let Ok(job) = rx.recv() {
+    loop {
+        // A `subscribe` that missed the cache is user-facing: it must jump the
+        // warm-up queue, otherwise the chart would wait behind the watchlist.
+        let job = match urgent.try_recv() {
+            Ok(job) => job,
+            Err(_) => match rx.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            },
+        };
+        let notify = job.notify.clone();
         let total = job.pairs.len();
         let client_id = job.client_id;
         let mut done = 0usize;
         let mut failed = 0usize;
         // Free function (not a closure) so the counters can advance between calls.
         fn report(out: &broadcast::Sender<String>, job: PreloadReport<'_>) {
-            let event = msg(json!({
+            let event = msg_to(job.client_id, json!({
                 "type": "preload_progress",
-                "to": job.client_id,
                 "done": job.done,
                 "total": job.total,
                 "failed": job.failed,
@@ -2012,15 +2430,20 @@ fn preload_main(
         log!("[preload] #{client_id}: warming {total} series for {}", job.exchange);
 
         // Phase 1 — candles: this is what the charts need to switch instantly.
+        let mut first_result: Option<Result<(), String>> = None;
         for (symbol, timeframe) in &job.pairs {
-            match warm_series_cache(
+            let outcome = warm_series_cache(
                 &job.exchange,
                 symbol,
                 timeframe,
                 &data_dir,
                 allow_net,
                 job.window,
-            ) {
+            );
+            if first_result.is_none() {
+                first_result = Some(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
+            }
+            match outcome {
                 Ok(note) => {
                     log!("[preload] {} {symbol} {timeframe}: {note}", job.exchange);
                     done += 1;
@@ -2040,7 +2463,6 @@ fn preload_main(
                 }
             }
         }
-
         // Phase 2 — open interest: chart context, slower, never blocking a
         // chart. Several timeframes share one OI grid, and a venue that has no
         // OI history for a symbol answers for all of them, so each grid is
@@ -2079,9 +2501,31 @@ fn preload_main(
             }
         }
 
-        let final_event = msg(json!({
+        // Wake the parked `subscribe`: the engine applies the now-cached
+        // series (a fast disk read) and answers the client.
+        if let Some(wait) = notify {
+            let event = match first_result.unwrap_or_else(|| Err("no series requested".into())) {
+                Ok(()) => EngineJob::SeriesReady {
+                    client_id,
+                    exchange: job.exchange.clone(),
+                    symbol: wait.symbol,
+                    timeframe: wait.timeframe,
+                    window: wait.window,
+                    request_id: wait.request_id,
+                },
+                Err(error) => EngineJob::SeriesFailed {
+                    client_id,
+                    symbol: wait.symbol,
+                    timeframe: wait.timeframe,
+                    error,
+                    request_id: wait.request_id,
+                },
+            };
+            let _ = jobs.send(event);
+        }
+
+        let final_event = msg_to(client_id, json!({
             "type": "preload_done",
-            "to": client_id,
             "done": done,
             "total": total,
             "failed": failed,
@@ -2091,11 +2535,38 @@ fn preload_main(
     log!("[preload] channel closed, loader stopped");
 }
 
+/// Dedicated worker for `GET /api/candles`: loads a throwaway series for the
+/// diary chart. Runs off the engine, so a cold window download cannot freeze
+/// every live session (the old code did exactly that).
+fn candle_worker(
+    rx: mpsc::Receiver<CandleRequest>,
+    data_dir: PathBuf,
+    allow_net: bool,
+) {
+    log!("[candles] worker started");
+    while let Ok(request) = rx.recv() {
+        let value = load_candles(
+            &request.exchange,
+            &request.symbol,
+            &request.timeframe,
+            request.start_ms,
+            request.end_ms,
+            &data_dir,
+            allow_net,
+        );
+        let _ = request.reply.send(value);
+    }
+    log!("[candles] worker stopped");
+}
+
 fn engine_main(
     rx: mpsc::Receiver<EngineJob>,
+    jobs_tx: mpsc::Sender<EngineJob>,
     out: broadcast::Sender<String>,
     args: Args,
     preload: Option<mpsc::Sender<PreloadJob>>,
+    urgent: Option<mpsc::Sender<PreloadJob>>,
+    candles: Option<mpsc::Sender<CandleRequest>>,
 ) {
     log!(
         "[engine] cli defaults: {} {} (every session subscribes its own series, net={})",
@@ -2103,21 +2574,36 @@ fn engine_main(
         args.timeframe,
         if args.offline { "off" } else { "CCXT" }
     );
-    let mut engine = Engine::new(out).with_net(!args.offline);
+    let mut engine = Engine::new(out)
+        .with_net(!args.offline)
+        .with_jobs(jobs_tx);
     if let Some(preload) = preload {
         engine = engine.with_preload(preload);
+    }
+    if let Some(urgent) = urgent {
+        engine = engine.with_urgent_preload(urgent);
+    }
+    if let Some(candles) = candles {
+        engine = engine.with_candles(candles);
     }
 
     loop {
         match rx.recv_timeout(engine.next_timeout()) {
             Ok(job) => {
+                // Diagnostics: a single job blocking the engine for long is
+                // what makes the whole terminal look frozen. Name it in the log.
+                let started = std::time::Instant::now();
                 engine.handle_job(job, &args.data_dir);
+                let elapsed = started.elapsed();
+                if elapsed > Duration::from_millis(150) {
+                    log!("[engine] slow job: {elapsed:?} (possible freeze source)");
+                }
+                engine.evict_detached();
                 engine.auto_tick_all();
-                engine.heartbeat_all();
             }
             Err(RecvTimeoutError::Timeout) => {
+                engine.evict_detached();
                 engine.auto_tick_all();
-                engine.heartbeat_all();
             }
             Err(RecvTimeoutError::Disconnected) => {
                 log!("[engine] job channel closed, exiting");
@@ -2133,19 +2619,47 @@ async fn main() {
     let port = args.port;
     let (jobs_tx, jobs_rx) = mpsc::channel::<EngineJob>();
     let (preload_tx, preload_rx) = mpsc::channel::<PreloadJob>();
+    let (urgent_tx, urgent_rx) = mpsc::channel::<PreloadJob>();
+    let (candles_tx, candles_rx) = mpsc::channel::<CandleRequest>();
     let (out_tx, _) = broadcast::channel::<String>(1024);
     let out_for_engine = out_tx.clone();
     let data_dir = args.data_dir.clone();
     let preload_net = !args.offline;
     let out_for_preload = out_tx.clone();
+    let jobs_for_preload = jobs_tx.clone();
+    let preload_dir = data_dir.clone();
     std::thread::Builder::new()
         .name("simccxt-preload".into())
-        .spawn(move || preload_main(preload_rx, out_for_preload, data_dir, preload_net))
+        .spawn(move || {
+            preload_main(
+                preload_rx,
+                urgent_rx,
+                jobs_for_preload,
+                out_for_preload,
+                preload_dir,
+                preload_net,
+            )
+        })
         .expect("spawn preload thread");
-    let preload = Some(preload_tx);
+    let candle_dir = data_dir.clone();
+    std::thread::Builder::new()
+        .name("simccxt-candles".into())
+        .spawn(move || candle_worker(candles_rx, candle_dir, preload_net))
+        .expect("spawn candle worker");
+    let jobs_for_engine = jobs_tx.clone();
     std::thread::Builder::new()
         .name("simccxt-engine".into())
-        .spawn(move || engine_main(jobs_rx, out_for_engine, args, preload))
+        .spawn(move || {
+            engine_main(
+                jobs_rx,
+                jobs_for_engine,
+                out_for_engine,
+                args,
+                Some(preload_tx),
+                Some(urgent_tx),
+                Some(candles_tx),
+            )
+        })
         .expect("spawn engine thread");
     let listener = TcpListener::bind(("127.0.0.1", port)).await.expect("bind ws port");
     log!("[ws] simccxt-server listening on ws://127.0.0.1:{port}/");
@@ -3210,6 +3724,73 @@ mod tests {
 
         eng.handle_job(EngineJob::Disconnect { client_id: 7 }, data);
         assert!(!eng.sessions.contains_key(&7), "disconnect must free the session");
+    }
+
+    #[test]
+    fn directed_messages_are_routing_compatible() {
+        // The broadcast writer routes on the raw byte prefix, so `to` must be
+        // the FIRST key even for maps whose alphabetical order puts it later.
+        let raw = msg_to(42, json!({ "type": "account_update", "account": { "equity": 1 } }));
+        assert!(raw.starts_with(r#"{"to":42,"#), "got {raw}");
+        assert_eq!(routing_target(&raw), Some(42));
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["type"], "account_update");
+        assert_eq!(v["to"], 42);
+        // An existing `to` inside the payload is replaced, never duplicated.
+        let raw = msg_to(7, json!({ "type": "error", "to": 999, "message": "x" }));
+        assert_eq!(routing_target(&raw), Some(7));
+        // Undirected broadcasts must NOT look directed.
+        assert_eq!(routing_target(&msg(json!({ "type": "challenge_board", "board": [] }))), None);
+    }
+
+    #[test]
+    fn attach_restores_a_token_session_after_reload() {
+        let (tx, mut rx) = broadcast::channel::<String>(512);
+        let mut eng = Engine::new(tx);
+        let data = test_data_dir();
+
+        // A reload: the socket dies but the token parks the session.
+        eng.handle_command(1, subscribe_cmd("BTC/USDT", "1m"), data);
+        eng.handle_command(1, login_cmd("Reloader"), data);
+        eng.handle_command(1, attach_cmd("tok-1"), data);
+        assert_eq!(eng.sessions[&1].token, "tok-1");
+        eng.handle_job(EngineJob::Disconnect { client_id: 1 }, data);
+        assert!(!eng.sessions.contains_key(&1), "socket close parks, not destroys");
+        assert!(eng.detached.contains_key("tok-1"), "session parked under its token");
+
+        // The new socket re-attaches: same series, same nick, no fresh session.
+        let state = take_session_state(&mut rx);
+        assert!(!state["restored"].as_bool().unwrap(), "first attach is a new session");
+        eng.handle_command(2, attach_cmd("tok-1"), data);
+        let state = take_session_state(&mut rx);
+        assert!(state["restored"].as_bool().unwrap(), "re-attach must report restored");
+        assert!(state["has_series"].as_bool().unwrap(), "the series came back too");
+        assert_eq!(eng.sessions[&2].nick, "Reloader");
+        assert_eq!(eng.sessions[&2].symbol, "BTC/USDT");
+        assert!(eng.detached.is_empty(), "parked copy moved to the live map");
+
+        // Duplicate attach on the same socket (StrictMode remount) is a no-op
+        // restore, not a second session.
+        eng.handle_command(2, attach_cmd("tok-1"), data);
+        let state = take_session_state(&mut rx);
+        assert!(state["restored"].as_bool().unwrap());
+        assert_eq!(eng.sessions.len(), 1);
+    }
+
+    fn attach_cmd(token: &str) -> ClientCmd {
+        ClientCmd::Attach { token: token.to_string(), request_id: None }
+    }
+
+    /// Drain the broadcast until the `session_state` reply shows up: this is
+    /// the exact flag the frontend uses to decide restore vs fresh init.
+    fn take_session_state(rx: &mut broadcast::Receiver<String>) -> Value {
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("valid json");
+            if v["type"] == "session_state" {
+                return v;
+            }
+        }
+        panic!("no session_state on the bus");
     }
 
     // ------------------------------------------------------------------

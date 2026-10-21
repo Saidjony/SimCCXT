@@ -560,23 +560,6 @@ fn download_series_window(
     })
 }
 
-fn window_file(exchange: &str, symbol: &str, tf: &str, start_ms: i64, end_ms: i64) -> String {
-    // Cache key aligned to day boundaries: a client asking for "now-60d"
-    // must hit the same file on every reconnect, otherwise each subscribe
-    // re-downloads the whole window (the raw ms differ per request).
-    const DAY_MS: i64 = 86_400_000;
-    let key_start = start_ms.div_euclid(DAY_MS) * DAY_MS;
-    let key_end = end_ms.div_euclid(DAY_MS) * DAY_MS + DAY_MS;
-    let base = binance_file(symbol, tf)
-        .trim_end_matches(".csv")
-        .to_string();
-    format!(
-        "{exchange}_{base}_{key_start}_{key_end}.csv",
-    )
-}
-
-/// Load enough history for the requested window, fetching and caching an
-/// exchange-specific range when the normal recent-history cache is too short.
 pub(super) fn ensure_series_window(
     ex: &mut Exchange,
     request: SeriesRequest<'_>,
@@ -908,12 +891,41 @@ pub(super) fn ensure_oi(
     }
 }
 
+/// True when `subscribe` would resolve the series AND the requested window
+/// from disk alone (no CCXT). Used by the engine to decide whether loading can
+/// stay on its thread (a small CSV read) or must be parked on the loader.
+pub(super) fn series_cache_hit(
+    exchange: &str,
+    symbol: &str,
+    tf: &str,
+    data_dir: &Path,
+    window: Option<(i64, i64)>,
+) -> bool {
+    let source_tf = if is_derived_tf(tf) { BASE_TF } else { tf };
+    let path = data_dir.join(series_file(exchange, symbol, source_tf));
+    let Some(candles) = load_csv(&path) else {
+        return false;
+    };
+    let Some((start_ms, end_ms)) = window else {
+        return true;
+    };
+    // The canonical cache is the only file the current loader reads (window
+    // files were folded into it). For a rolled-up timeframe the 5m base grid
+    // is checked directly: it is a strictly stronger guarantee (never a false
+    // hit) and skips aggregating the whole history just to answer coverage.
+    let step = if source_tf == tf { tf_step_ms(tf) as i64 } else { tf_step_ms(source_tf) as i64 };
+    covers_range(&candles, start_ms, end_ms, step)
+}
+
 /// True when a real on-disk series cache exists for `symbol@tf`.
 /// The read-only diary candles API checks this first: offline with no cache
 /// must answer "no data" instead of `ensure_series`'s silent synthetic bars —
 /// fabricated history must never be served as a trader's chart.
 pub(super) fn has_series_cache(exchange: &str, symbol: &str, tf: &str, data_dir: &Path) -> bool {
-    data_dir.join(series_file(exchange, symbol, tf)).exists()
+    // Derived timeframes are rolled up from the 5m base, so the base file is
+    // the real cache (no per-timeframe file is ever written for them).
+    let source_tf = if is_derived_tf(tf) { BASE_TF } else { tf };
+    data_dir.join(series_file(exchange, symbol, source_tf)).exists()
 }
 
 /// Closest finer-grained cached OI series for `exchange/symbol` that can
@@ -1130,40 +1142,64 @@ pub(super) fn warm_series_cache(
     allow_net: bool,
     window: Option<(i64, i64)>,
 ) -> Result<String, String> {
-    let step = tf_step_ms(timeframe) as i64;
-    let base = data_dir.join(series_file(exchange, symbol, timeframe));
-    let mut note = match load_csv(&base) {
-        Some(candles) => format!("{} bars from cache", candles.len()),
-        None => {
-            if !allow_net {
-                return Err("no cache and downloads are disabled (--offline)".into());
-            }
-            let candles = download_series(exchange, symbol, timeframe, DOWNLOAD_BARS)?;
-            let bars = candles.len();
-            save_csv(&base, &candles).map_err(|err| format!("cache write failed: {err}"))?;
-            format!("{bars} bars downloaded")
+    // Load through the SAME path a `subscribe` uses, on a throwaway Exchange.
+    // The old implementation wrote a separate day-keyed window file that
+    // `ensure_series_window` never read: the preloader reported "warmed" while
+    // the next subscribe re-downloaded the window on the ENGINE thread — the
+    // exact freeze this function exists to prevent.
+    let had_cache = has_series_cache(exchange, symbol, timeframe, data_dir);
+    if !allow_net && !had_cache {
+        return Err("no cache and downloads are disabled (--offline)".into());
+    }
+    // Offline the engine clamps a subscribe to whatever history is on disk,
+    // so warm the series itself; asking for a date window the cache cannot
+    // cover would only turn a usable chart into a preload "failure".
+    let window = if allow_net { window } else { None };
+    let mut ex = Exchange::default();
+    let result = match window {
+        Some((start_ms, end_ms)) => ensure_series_window(
+            &mut ex,
+            SeriesRequest {
+                exchange,
+                symbol,
+                timeframe,
+                data_dir,
+                allow_net,
+                force_reload: false,
+                start_ms,
+                end_ms,
+            },
+        ),
+        None => ensure_series(
+            &mut ex,
+            exchange,
+            symbol,
+            timeframe,
+            data_dir,
+            allow_net,
+            false,
+        ),
+    };
+    result?;
+    // `ensure_series` above may have used a throwaway Exchange for the count;
+    // the actual cache is on disk now, which is all a later subscribe needs.
+    // Derived timeframes are rolled up from the 5m base, so count what the
+    // chart will actually plot, not a per-timeframe file that never exists.
+    let bars = {
+        let source_tf = if is_derived_tf(timeframe) { BASE_TF } else { timeframe };
+        let rows = load_csv(&data_dir.join(series_file(exchange, symbol, source_tf)))
+            .unwrap_or_default();
+        if source_tf == timeframe {
+            rows.len()
+        } else {
+            aggregate_ohlcv(&rows, tf_step_ms(source_tf), tf_step_ms(timeframe)).len()
         }
     };
-    if let Some((start_ms, end_ms)) = window {
-        let covered = load_csv(&base)
-            .map(|candles| covers_range(&candles, start_ms, end_ms, step))
-            .unwrap_or(false);
-        if !covered {
-            let path = data_dir.join(window_file(exchange, symbol, timeframe, start_ms, end_ms));
-            if load_csv(&path).is_none() {
-                if !allow_net {
-                    return Err("replay window is outside the cached history".into());
-                }
-                let candles =
-                    download_series_window(exchange, symbol, timeframe, start_ms, end_ms)?;
-                let bars = candles.len();
-                save_csv(&path, &candles)
-                    .map_err(|err| format!("window cache write failed: {err}"))?;
-                note = format!("{note} + {bars} bars for the date window");
-            }
-        }
-    }
-    Ok(note)
+    Ok(match window {
+        Some(_) => format!("{bars} bars cached (date window included)"),
+        None if had_cache => format!("{bars} bars from cache"),
+        None => format!("{bars} bars downloaded"),
+    })
 }
 
 /// True when the OI grid for `timeframe` is already on disk (nothing to warm).
@@ -1631,9 +1667,12 @@ mod tests {
     fn warm_series_cache_reports_cache_hits_and_offline_misses() {
         let dir = std::env::temp_dir().join(format!("simccxt-warm-{}", std::process::id()));
         let path = dir.join(series_file("binance", "BTC/USDT", "1m"));
-        let candles = (1..=3)
+        // Realistic ms timestamps: the CSV reader treats sub-1e12 numbers as
+        // SECONDS (venue exports), so toy epoch values would be scaled x1000.
+        let start = 1_700_000_000_000 - (1_700_000_000_000 % 900_000);
+        let candles = (0..3)
             .map(|minute| {
-                let timestamp = DateTime::from_timestamp_millis(minute * 60_000).unwrap();
+                let timestamp = DateTime::from_timestamp_millis(start + minute * 60_000).unwrap();
                 OHLCV::new(timestamp, 1.0, 2.0, 0.5, 1.5, 10.0)
             })
             .collect::<Vec<_>>();
@@ -1649,8 +1688,10 @@ mod tests {
             .expect_err("must fail offline");
         assert!(error.contains("offline"), "{error}");
 
-        // A window outside the cached history is also an offline error.
-        let error = warm_series_cache(
+        // A window outside the cached history is not a preload failure: the
+        // engine clamps an offline subscribe to what is on disk, so the
+        // preloader warms the series itself and says what is available.
+        let note = warm_series_cache(
             "binance",
             "BTC/USDT",
             "1m",
@@ -1658,8 +1699,16 @@ mod tests {
             false,
             Some((10_000_000_000, 20_000_000_000)),
         )
-        .expect_err("window miss must fail offline");
-        assert!(error.contains("outside"), "{error}");
+        .expect("offline window warms the cached series");
+        assert!(note.contains("from cache"), "{note}");
+
+        // Derived timeframes have no file of their own: the 5m base is the
+        // cache, and the note counts the bars the chart will plot.
+        let base = dir.join(series_file("binance", "BTC/USDT", "5m"));
+        save_csv(&base, &candles).expect("save base");
+        let note = warm_series_cache("binance", "BTC/USDT", "15m", &dir, false, None)
+            .expect("derived hit");
+        assert!(note.starts_with("1 bars"), "{note}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
