@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
-use simccxt_broker::{Broker, BrokerError, BrokerOrderRequest, MarketKind};
+use simccxt_broker::{Broker, BrokerError, BrokerOrderRequest, FillLog, MarketKind};
 use simccxt_clock::Clock;
 use simccxt_core::{
     Balance, Config, OHLCV, OrderStatus, OrderType, Side, Symbol, TimeInForce, Trade,
@@ -514,20 +514,9 @@ impl Exchange {
             .into_iter()
             .zip(ids)
             .map(|(f, id)| {
-                json!({
-                    "id": id,
-                    "symbol": f.symbol.symbol,
-                    "side": if f.side == Side::Buy { "buy" } else { "sell" },
-                    "type": order_type_str(f.order_type),
-                    "price": f.price,
-                    "amount": f.amount,
-                    "cost": f.price * f.amount,
-                    "fee": f.fee,
-                    "maker": f.maker,
-                    "orderId": f.order_id,
-                    "timestamp": f.timestamp.timestamp_millis(),
-                    "datetime": f.timestamp.to_rfc3339(),
-                })
+                let mut value = fill_json(&f);
+                value["id"] = json!(id);
+                value
             })
             .collect()
     }
@@ -665,18 +654,96 @@ impl Exchange {
             .unwrap_or_default()
     }
 
-    /// Number of loaded and currently visible candles without allocating rows.
-    pub fn ohlcv_counts(&self, symbol: &str, timeframe: &str) -> (usize, usize) {
+    // ------------------------------------------------------------------
+    // O(1)/O(k) replay accessors (hot path: one bar per tick)
+    //
+    // `fetch_ohlcv_live` copies and re-formats the WHOLE revealed history on
+    // every call. The server's tick only needs the count, the last bar, or the
+    // few bars after a cursor — these do exactly that. Candle vectors are
+    // sorted by timestamp (all loaders sort/merge), so the cut is a binary
+    // search rather than a scan.
+    // ------------------------------------------------------------------
+
+    /// Number of candles with `timestamp <= now` (the revealed prefix).
+    pub fn live_len(&self, symbol: &str, timeframe: &str) -> usize {
         let now = self.clock.now();
         self.candles
             .get(&(symbol.to_string(), timeframe.to_string()))
-            .map(|candles| {
-                (
-                    candles.partition_point(|c| c.timestamp <= now),
-                    candles.len(),
-                )
+            .map(|candles| candles.partition_point(|c| c.timestamp <= now))
+            .unwrap_or(0)
+    }
+
+    /// Total number of loaded candles (revealed + future).
+    pub fn total_len(&self, symbol: &str, timeframe: &str) -> usize {
+        self.candles
+            .get(&(symbol.to_string(), timeframe.to_string()))
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    /// The last revealed candle, if any.
+    pub fn live_last(&self, symbol: &str, timeframe: &str) -> Option<Vec<f64>> {
+        let now = self.clock.now();
+        let candles = self.candles.get(&(symbol.to_string(), timeframe.to_string()))?;
+        let end = candles.partition_point(|c| c.timestamp <= now);
+        candles.get(end.checked_sub(1)?).map(candle_row)
+    }
+
+    /// Revealed candles from `from` (inclusive) to the clock. Only the new
+    /// tail is formatted; `from` is clamped so a stale cursor cannot panic.
+    pub fn live_from(&self, symbol: &str, timeframe: &str, from: usize) -> Vec<Vec<f64>> {
+        let now = self.clock.now();
+        let Some(candles) = self.candles.get(&(symbol.to_string(), timeframe.to_string())) else {
+            return Vec::new();
+        };
+        let end = candles.partition_point(|c| c.timestamp <= now);
+        if from >= end {
+            return Vec::new();
+        }
+        candles[from..end].iter().map(candle_row).collect()
+    }
+
+    /// Number of recorded fills. O(1).
+    pub fn fills_len(&self) -> usize {
+        self.broker.fills_len()
+    }
+
+    /// Fills at chronological index `from..` as CCXT-style trade dicts, newest
+    /// first (same shape and stable ids as [`fetch_fills`]). Only the suffix is
+    /// serialized; the id counters are cheap integer work over the prefix.
+    pub fn fetch_fills_from(&self, from: usize, limit: Option<usize>) -> Vec<Value> {
+        let total = self.broker.fills_len();
+        let start = from.min(total);
+        let mut fill_indices = HashMap::<String, usize>::new();
+        for index in 0..start {
+            if let Some(fill) = self.broker.fill_at(index) {
+                *fill_indices.entry(fill.order_id.clone()).or_default() += 1;
+            }
+        }
+        let mut rows: Vec<(Value, String)> = Vec::with_capacity(total - start);
+        for index in start..total {
+            let Some(fill) = self.broker.fill_at(index) else { break };
+            let counter = fill_indices.entry(fill.order_id.clone()).or_default();
+            let id = format!("{}_{}", fill.order_id, *counter);
+            *counter += 1;
+            rows.push((fill_json(fill), id));
+        }
+        rows.reverse(); // newest first, like a live exchange feed
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+        rows.into_iter()
+            .map(|(mut fill, id)| {
+                fill["id"] = json!(id);
+                fill
             })
-            .unwrap_or_default()
+            .collect()
+    }
+
+    /// The last `limit` fills, newest first — without touching older history.
+    pub fn fetch_fills_last(&self, limit: usize) -> Vec<Value> {
+        let total = self.broker.fills_len();
+        self.fetch_fills_from(total.saturating_sub(limit), None)
     }
 
     /// Whether there are no more candles at or after the current simulator
@@ -1110,6 +1177,37 @@ fn order_status_str(s: OrderStatus) -> &'static str {
         OrderStatus::Expired => "expired",
         OrderStatus::Rejected => "rejected",
     }
+}
+
+/// One OHLCV candle as the protocol row `[ts_ms, o, h, l, c, v]`.
+fn candle_row(c: &OHLCV) -> Vec<f64> {
+    vec![
+        c.timestamp.timestamp_millis() as f64,
+        c.open,
+        c.high,
+        c.low,
+        c.close,
+        c.volume,
+    ]
+}
+
+/// One fill as a CCXT-style trade dict. `id` is filled in by the caller (it
+/// needs the per-order occurrence counter); everything else is field mapping.
+fn fill_json(f: &FillLog) -> Value {
+    json!({
+        "id": Value::Null,
+        "symbol": f.symbol.symbol.as_str(),
+        "side": if f.side == Side::Buy { "buy" } else { "sell" },
+        "type": order_type_str(f.order_type),
+        "price": f.price,
+        "amount": f.amount,
+        "cost": f.price * f.amount,
+        "fee": f.fee,
+        "maker": f.maker,
+        "orderId": f.order_id.as_str(),
+        "timestamp": f.timestamp.timestamp_millis(),
+        "datetime": f.timestamp.to_rfc3339(),
+    })
 }
 
 fn parse_side(s: &str) -> Result<Side, BrokerError> {

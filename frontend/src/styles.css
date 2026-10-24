@@ -497,3 +497,15 @@ td, th { padding: 3px 4px; }
   .chart-workspace-bottom { grid-template-columns: minmax(0, 1fr) 8px minmax(0, 1fr); }
   .chart-workspace-maximized { height: calc(100vh - 36px); min-height: 400px; }
 }
+
+/* Cold series being downloaded on the background loader (engine stays live). */
+.loading-note {
+  color: var(--acc, #d9a441);
+  font-size: 11px;
+  white-space: nowrap;
+  animation: loading-pulse 1.4s ease-in-out infinite;
+}
+@keyframes loading-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}

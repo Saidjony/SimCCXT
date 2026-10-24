@@ -1,4 +1,4 @@
-import { useCallback, useRef, useSyncExternalStore } from "react";
+import { useEffect, useReducer, useRef } from "react";
 import type {
   AccountSnapshot,
   CandleRow,
@@ -77,6 +77,7 @@ const WATCHLIST_KEY = "simccxt.watchlist.v1";
 const EXCHANGE_KEY = "simccxt.exchange.v1";
 const EXCHANGE_IDS: ExchangeId[] = ["binance", "bybit", "okx"];
 const REPLAY_WINDOW_KEY = "simccxt.replay-window.v1";
+const DRAWINGS_KEY = "simccxt.drawings.v1";
 const DEFAULT_WATCHLIST: CoinEntry[] = [
   { symbol: "BTC/USDT", flagged: false },
   { symbol: "ETH/USDT", flagged: false },
@@ -91,6 +92,31 @@ function defaultReplayWindow(): ReplayWindow {
   // Two months of context; the first month is pre-revealed and the last
   // month is what the replay acts on tick by tick.
   return { start_ms: end - 60 * day, reveal_start_ms: end - 30 * day, end_ms: end };
+}
+
+/** Drawings are visual-only, but losing them on reload is still data loss. */
+function loadDrawings(): Record<string, Drawing[]> {
+  try {
+    const raw = window.localStorage.getItem(DRAWINGS_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, Drawing[]> = {};
+    for (const [symbol, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (Array.isArray(value)) out[symbol] = value as Drawing[];
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistDrawings(all: Record<string, Drawing[]>): void {
+  try {
+    window.localStorage.setItem(DRAWINGS_KEY, JSON.stringify(all));
+  } catch {
+    // storage full/unavailable: drawings still work for this page load
+  }
 }
 
 function loadReplayWindow(): ReplayWindow {
@@ -338,10 +364,20 @@ interface UiPrefs {
   cvdVisible: boolean;
   collapsedMarket: boolean;
   collapsedCriteria: boolean;
+  /** Risk terminal inputs: reloading the page must not reset sizing. */
+  initialCapitalUsdt: number;
+  fixedRiskUsdt: number;
 }
 
 function loadUi(): UiPrefs {
-  const dflt: UiPrefs = { oiVisible: true, cvdVisible: true, collapsedMarket: false, collapsedCriteria: false };
+  const dflt: UiPrefs = {
+    oiVisible: true,
+    cvdVisible: true,
+    collapsedMarket: false,
+    collapsedCriteria: false,
+    initialCapitalUsdt: 1000,
+    fixedRiskUsdt: 10,
+  };
   try {
     const raw = window.localStorage.getItem(UI_KEY);
     if (raw) {
@@ -351,6 +387,14 @@ function loadUi(): UiPrefs {
         cvdVisible: parsed.cvdVisible !== false,
         collapsedMarket: parsed.collapsedMarket === true,
         collapsedCriteria: parsed.collapsedCriteria === true,
+        initialCapitalUsdt:
+          Number.isFinite(parsed.initialCapitalUsdt) && parsed.initialCapitalUsdt! > 0
+            ? parsed.initialCapitalUsdt!
+            : dflt.initialCapitalUsdt,
+        fixedRiskUsdt:
+          Number.isFinite(parsed.fixedRiskUsdt) && parsed.fixedRiskUsdt! > 0
+            ? parsed.fixedRiskUsdt!
+            : dflt.fixedRiskUsdt,
       };
     }
   } catch {
@@ -371,6 +415,8 @@ function currentUi(): UiPrefs {
   return {
     oiVisible: state.oiVisible,
     cvdVisible: state.cvdVisible,
+    initialCapitalUsdt: state.initialCapitalUsdt,
+    fixedRiskUsdt: state.fixedRiskUsdt,
     collapsedMarket: state.collapsedMarket,
     collapsedCriteria: state.collapsedCriteria,
   };
@@ -394,6 +440,8 @@ export interface SimState {
   replay: ReplayState;
   replayWindow: ReplayWindow;
   error: string | null;
+  /** Non-null while a cold series is being downloaded off the engine thread. */
+  seriesLoading: string | null;
   /** Background market-data warm-up progress for watchlist x timeframes. */
   preload: PreloadProgress;
   bgLoaded: boolean;
@@ -489,6 +537,8 @@ const initialPreload: PreloadProgress = {
   current: "",
 };
 
+const initialUi = loadUi();
+
 let state: SimState = {
   status: "connecting",
   clientId: null,
@@ -505,16 +555,17 @@ let state: SimState = {
   replay: initialReplay,
   replayWindow: loadReplayWindow(),
   error: null,
+  seriesLoading: null,
   preload: initialPreload,
   // Pre-load all watchlist symbols for all timeframes (background).
   bgLoaded: false,
   drawings: [],
-  drawingsBySymbol: {},
+  drawingsBySymbol: loadDrawings(),
   tool: "none",
   selectedId: null,
   positionSizeUsdt: 100,
-  initialCapitalUsdt: 1000,
-  fixedRiskUsdt: 10,
+  initialCapitalUsdt: initialUi.initialCapitalUsdt,
+  fixedRiskUsdt: initialUi.fixedRiskUsdt,
   feeRates: null,
   watchlist: loadWatchlist(),
   marketQuotes: {},
@@ -526,74 +577,95 @@ let state: SimState = {
   board: [],
   oi: [],
   oiPeriod: "",
-  oiVisible: loadUi().oiVisible,
-  cvdVisible: loadUi().cvdVisible,
-  collapsedMarket: loadUi().collapsedMarket,
-  collapsedCriteria: loadUi().collapsedCriteria,
+  oiVisible: initialUi.oiVisible,
+  cvdVisible: initialUi.cvdVisible,
+  collapsedMarket: initialUi.collapsedMarket,
+  collapsedCriteria: initialUi.collapsedCriteria,
   lastMsgAt: 0,
   reconnects: 0,
 };
 
 const listeners = new Set<() => void>();
 
-function set(patch: Partial<SimState>): void {
-  state = { ...state, ...patch };
-  for (const l of listeners) l();
+/** Notifications are coalesced to one animation frame: a burst of WS messages
+ *  (snapshot + candles + account + fills) renders once, not five times. The
+ *  state itself is updated synchronously, so `getState()` is always current. */
+let notifyScheduled = false;
+function scheduleNotify(): void {
+  if (notifyScheduled) return;
+  notifyScheduled = true;
+  const flush = (): void => {
+    notifyScheduled = false;
+    for (const l of listeners) l();
+  };
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(flush);
+  } else {
+    setTimeout(flush, 16);
+  }
 }
 
-function subscribe(l: () => void): () => void {
-  listeners.add(l);
-  return () => {
-    listeners.delete(l);
-  };
+function set(patch: Partial<SimState>): void {
+  state = { ...state, ...patch };
+  scheduleNotify();
 }
 
 function get(): SimState {
   return state;
 }
 
-function sameSelection(a: unknown, b: unknown): boolean {
+/** Shallow equality with array awareness: selectors may build fresh arrays
+ *  (`positions ?? []`), which must not force a re-render. */
+function sameValue<T>(a: T, b: T): boolean {
   if (Object.is(a, b)) return true;
   if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.length > 128) return false;
-    return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (!Object.is(a[i], b[i])) return false;
+    }
+    return true;
   }
-  if (
-    a === null
-    || b === null
-    || typeof a !== "object"
-    || typeof b !== "object"
-    || Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)
-  ) return false;
-  const aRecord = a as Record<string, unknown>;
-  const bRecord = b as Record<string, unknown>;
-  const keys = Object.keys(aRecord);
-  return keys.length === Object.keys(bRecord).length
-    && keys.every((key) => Object.hasOwn(bRecord, key) && Object.is(aRecord[key], bRecord[key]));
+  return false;
 }
 
-/** Selector-aware subscription: unrelated store patches do not rerender every panel. */
+/** Per-field subscription: a component re-renders only when ITS selected
+ *  value changes.
+ *
+ * `useSyncExternalStore` re-renders every subscriber on every `set` (the
+ * snapshot object is new), so a 100 tick/s replay re-rendered the whole
+ * terminal 100 times a second. Here the selector runs on each store update
+ * and the component is woken only on an actual change. */
 export function useSim<T>(sel: (s: SimState) => T): T {
-  const selectorRef = useRef(sel);
-  selectorRef.current = sel;
-  const selectionRef = useRef<{ value: T } | null>(null);
-  const getSelection = useCallback((): T => {
-    const next = selectorRef.current(state);
-    const previous = selectionRef.current;
-    if (previous && sameSelection(previous.value, next)) return previous.value;
-    selectionRef.current = { value: next };
-    return next;
+  const selRef = useRef(sel);
+  selRef.current = sel;
+  const valueRef = useRef<{ value: T } | null>(null);
+  if (valueRef.current === null) valueRef.current = { value: sel(state) };
+  const [, force] = useReducer((n: number) => n + 1, 0);
+
+  // Selector identity may change between renders (closure over props): keep
+  // the cached value in step without waiting for the next store update.
+  const next = sel(state);
+  if (!sameValue(next, valueRef.current.value)) {
+    valueRef.current = { value: next };
+  }
+
+  useEffect(() => {
+    const check = (): void => {
+      const current = selRef.current(state);
+      if (!sameValue(current, valueRef.current!.value)) {
+        valueRef.current = { value: current };
+        force();
+      }
+    };
+    // Catch a store update that landed between render and effect.
+    check();
+    listeners.add(check);
+    return () => {
+      listeners.delete(check);
+    };
   }, []);
-  const subscribeSelection = useCallback((notify: () => void): (() => void) => {
-    let current = getSelection();
-    return subscribe(() => {
-      const next = getSelection();
-      if (Object.is(current, next)) return;
-      current = next;
-      notify();
-    });
-  }, [getSelection]);
-  return useSyncExternalStore(subscribeSelection, getSelection, getSelection);
+
+  return valueRef.current.value;
 }
 
 let drawingSeq = 1;
@@ -637,6 +709,7 @@ export const store = {
       ? { ...state.drawingsBySymbol, [state.symbol]: state.drawings }
       : state.drawingsBySymbol;
     const drawings = switching ? (drawingsBySymbol[symbol] ?? []) : state.drawings;
+    if (switching) persistDrawings(drawingsBySymbol);
     set({
       symbol,
       exchange: selectedExchange,
@@ -775,6 +848,9 @@ export const store = {
     set({ fills });
     persistFillHistory(fills);
   },
+  setSeriesLoading(message: string | null): void {
+    if (state.seriesLoading !== message) set({ seriesLoading: message });
+  },
   setError(message: string): void {
     set({ error: message });
   },
@@ -808,10 +884,23 @@ export const store = {
     if (Number.isFinite(v) && v > 0) set({ positionSizeUsdt: v });
   },
   setInitialCapitalUsdt(v: number): void {
-    if (Number.isFinite(v) && v > 0) set({ initialCapitalUsdt: v });
+    if (!Number.isFinite(v) || v <= 0) return;
+    set({ initialCapitalUsdt: v });
+    persistUi(currentUi());
   },
   setFixedRiskUsdt(v: number): void {
-    if (Number.isFinite(v) && v > 0) set({ fixedRiskUsdt: v });
+    if (!Number.isFinite(v) || v <= 0) return;
+    set({ fixedRiskUsdt: v });
+    persistUi(currentUi());
+  },
+  /** Adopt the server's risk/capital after a restored session: the UI must
+   *  show what the round is actually scored with. */
+  restoreChallenge(riskUsdt: number, capitalUsdt: number, joined: boolean): void {
+    const patch: Partial<SimState> = { inChallenge: joined };
+    if (Number.isFinite(riskUsdt) && riskUsdt > 0) patch.fixedRiskUsdt = riskUsdt;
+    if (Number.isFinite(capitalUsdt) && capitalUsdt > 0) patch.initialCapitalUsdt = capitalUsdt;
+    set(patch);
+    persistUi(currentUi());
   },
   /** Toggle a setup criterion (unknown ids ignored). */
   toggleCriterion(id: string): void {
@@ -912,8 +1001,11 @@ export const store = {
     set({ watchlist });
     persistWatchlist(watchlist);
   },
-  /** Any inbound traffic resets the liveness clock (see the watchdog). */
+  /** Any inbound traffic resets the liveness clock (see the watchdog).
+   *  Throttled to 1 Hz: at 100 ticks/s this used to `set` the whole store a
+   *  hundred times a second just to update a badge. */
   noteMessage(at: number): void {
+    if (at - state.lastMsgAt < 1000) return;
     set({ lastMsgAt: at });
   },
   noteReconnect(): void {
@@ -921,19 +1013,24 @@ export const store = {
   },
   addDrawing(d: NewDrawing): void {
     set({ drawings: [...state.drawings, { ...d, id: nextDrawingId() } as Drawing] });
+    persistDrawings({ ...state.drawingsBySymbol, [state.symbol]: state.drawings });
   },
   removeDrawing(id: string): void {
     set({
       drawings: state.drawings.filter((d) => d.id !== id),
       selectedId: state.selectedId === id ? null : state.selectedId,
     });
+    persistDrawings({ ...state.drawingsBySymbol, [state.symbol]: state.drawings });
   },
   /** Patch one drawing (drag-move). Pure fn keeps the kind intact. */
   updateDrawing(id: string, fn: (d: Drawing) => Drawing): void {
     set({ drawings: state.drawings.map((d) => (d.id === id ? fn(d) : d)) });
+    persistDrawings({ ...state.drawingsBySymbol, [state.symbol]: state.drawings });
   },
   clearDrawings(): void {
-    if (state.drawings.length) set({ drawings: [] });
+    if (!state.drawings.length) return;
+    set({ drawings: [] });
+    persistDrawings({ ...state.drawingsBySymbol, [state.symbol]: [] });
   },
 };
 

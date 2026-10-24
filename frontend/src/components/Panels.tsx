@@ -126,9 +126,14 @@ export function Orders(): JSX.Element {
   );
 }
 
+/** Rows rendered in the bottom terminal. The store keeps 500; painting all
+ *  of them on every fill made the table the slowest DOM in the app. */
+const TRADES_RENDER_CAP = 150;
+
 /** Account's own fills (newest first), emitted by Rust execution. */
 export function Trades(): JSX.Element {
   const fills = useSim((s) => s.fills);
+  const shown = fills.slice(0, TRADES_RENDER_CAP);
   return (
     <div>
       <h4>Trades</h4>
@@ -138,8 +143,8 @@ export function Trades(): JSX.Element {
         <table className="grid-table">
           <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Type</th><th className="num">Price</th><th className="num">Qty</th><th className="num">Notional</th><th className="num">Fee</th><th>Liquidity</th><th>Order ID</th></tr></thead>
           <tbody>
-            {fills.map((f) => (
-              <tr key={`${f.id}-${f.timestamp}-${f.symbol}-${f.price}-${f.amount}`}>
+            {shown.map((f) => (
+              <tr key={f.id}>
                 <td>{formatTs(f.timestamp)}</td>
                 <td>{f.symbol}</td>
                 <td><span className={"pill " + (f.side === "buy" ? "pos" : "neg")}>{f.side.toUpperCase()}</span></td>
@@ -154,6 +159,11 @@ export function Trades(): JSX.Element {
             ))}
           </tbody>
         </table>
+      )}
+      {fills.length > shown.length && (
+        <div className="lbl">
+          показаны последние {shown.length} из {fills.length} (полная история — в дневнике)
+        </div>
       )}
     </div>
   );

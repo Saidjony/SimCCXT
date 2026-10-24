@@ -49,48 +49,118 @@ export function MiniChart({
   // pane's timeframe. This is what keeps every pane on the same clock and
   // price (main + minis read from one store instead of three sessions).
   const candlesBase = useSim((s) => s.candles);
-  const candlesVersion = useSim((s) => s.candlesVersion);
-  const fullReset = useSim((s) => s.fullReset);
-  const aggregationRef = useRef<AggregationCache | null>(null);
-  const candles = useMemo(
-    () => aggregateCandlesIncremental(
-      candlesBase,
-      timeframeMs(timeframe),
-      aggregationRef,
-      fullReset,
-    ),
-    [candlesBase, timeframe, fullReset, symbol, mainTimeframe],
-  );
-  const chartDataRef = useRef<{
-    series: ISeriesApi<"Bar">;
-    symbol: string;
-    mainTimeframe: string;
-    timeframe: string;
-    firstSourceCandle: CandleRow | undefined;
-    firstTimestamp: number | undefined;
-    candleCount: number;
-  } | null>(null);
-  const candleTimesRef = useRef<number[]>([]);
-  const candleTimesStateRef = useRef({ version: -1, timeframe: "" });
-  if (
-    candleTimesStateRef.current.version !== candlesVersion
-    || candleTimesStateRef.current.timeframe !== timeframe
-  ) {
-    const times = candleTimesRef.current;
-    if (fullReset || candleTimesStateRef.current.timeframe !== timeframe || candles.length < times.length) {
-      candleTimesRef.current = candles.map((candle) => candle[0]);
-    } else if (candles.length > 0) {
-      const index = candles.length - 1;
-      const timestamp = candles[index][0];
-      if (index === times.length) times.push(timestamp);
-      else times[index] = timestamp;
+  const aggRef = useRef<{
+    rows: CandleRow[];
+    baseLen: number;
+    first: number;
+    step: number;
+  }>({ rows: [], baseLen: 0, first: 0, step: 0 });
+  // Incremental aggregation: on a tick only the forming bucket changes, so
+  // re-bucketing all 10k source bars per tick was pure waste.
+  const candles = useMemo(() => {
+    const step = timeframeMs(timeframe);
+    const cache = aggRef.current;
+    const base = candlesBase;
+    const baseFirst = base.length > 0 ? base[0][0] : 0;
+    if (
+      step !== cache.step ||
+      cache.baseLen === 0 ||
+      base.length < cache.baseLen ||
+      base.length === 0 ||
+      baseFirst !== cache.first
+    ) {
+      const rows = aggregateCandles(base, step);
+      aggRef.current = { rows, baseLen: base.length, first: baseFirst, step };
+      return rows;
     }
-    candleTimesStateRef.current = { version: candlesVersion, timeframe };
-  }
-  const candleTimes = candleTimesRef.current;
+    const bucketOf = (ts: number): number => Math.floor(ts / step) * step;
+    if (base.length === cache.baseLen) {
+      // Same source length: only the last source bar was updated. Rebuild the
+      // bucket that contains it (at most `step / baseStep` bars).
+      const bucket = bucketOf(base[base.length - 1][0]);
+      const rows = cache.rows.slice();
+      const last = rows[rows.length - 1];
+      if (!last || last[0] !== bucket) {
+        const full = aggregateCandles(base, step);
+        aggRef.current = { rows: full, baseLen: base.length, first: baseFirst, step };
+        return full;
+      }
+      let i = base.length - 1;
+      while (i > 0 && bucketOf(base[i - 1][0]) === bucket) i -= 1;
+      let high = base[i][2];
+      let low = base[i][3];
+      let amount = 0;
+      for (let k = i; k < base.length; k += 1) {
+        high = Math.max(high, base[k][2]);
+        low = Math.min(low, base[k][3]);
+        amount += base[k][5];
+      }
+      rows[rows.length - 1] = [
+        bucket,
+        base[i][1],
+        high,
+        low,
+        base[base.length - 1][4],
+        amount,
+      ];
+      cache.rows = rows;
+      return rows;
+    }
+    // New source bars: extend the last bucket or open the next one. The
+    // previously forming source bar may have been updated in the same rAF
+    // batch, so recompute the cached last bucket before appending.
+    const rows = cache.rows.slice();
+    const prevRow = base[cache.baseLen - 1];
+    const prevBucket = bucketOf(prevRow[0]);
+    let back = cache.baseLen - 1;
+    while (back > 0 && bucketOf(base[back - 1][0]) === prevBucket) back -= 1;
+    let prevHigh = base[back][2];
+    let prevLow = base[back][3];
+    let prevAmount = 0;
+    for (let k = back; k < cache.baseLen; k += 1) {
+      prevHigh = Math.max(prevHigh, base[k][2]);
+      prevLow = Math.min(prevLow, base[k][3]);
+      prevAmount += base[k][5];
+    }
+    const prevLast = rows[rows.length - 1];
+    if (prevLast && prevLast[0] === prevBucket) {
+      rows[rows.length - 1] = [
+        prevBucket,
+        base[back][1],
+        prevHigh,
+        prevLow,
+        prevRow[4],
+        prevAmount,
+      ];
+    }
+    for (let i = cache.baseLen; i < base.length; i += 1) {
+      const row = base[i];
+      const bucket = bucketOf(row[0]);
+      const last = rows[rows.length - 1];
+      if (last && last[0] === bucket) {
+        rows[rows.length - 1] = [
+          bucket,
+          last[1],
+          Math.max(last[2], row[2]),
+          Math.min(last[3], row[3]),
+          row[4],
+          last[5] + row[5],
+        ];
+      } else {
+        rows.push([bucket, row[1], row[2], row[3], row[4], row[5]]);
+      }
+    }
+    cache.rows = rows;
+    cache.baseLen = base.length;
+    cache.first = baseFirst;
+    return rows;
+  }, [candlesBase, timeframe]);
   const drawings = useSim((s) => s.drawings);
   const drawingsRef = useRef(drawings);
   drawingsRef.current = drawings;
+  const candleTimes = useMemo(() => candles.map((candle) => candle[0]), [candles]);
+  const candleTimesRef = useRef(candleTimes);
+  candleTimesRef.current = candleTimes;
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
   /** Drawing primitives live on this chart's series, outside React's render. */
   const engineRef = useRef<DrawingEngine | null>(null);
@@ -212,37 +282,30 @@ export function MiniChart({
           : base();
       },
     });
-  }, [drawings, candles]);
+  }, [drawings]);
 
+  const renderedRef = useRef<{ len: number; first: number; timeframe: string }>({
+    len: 0,
+    first: 0,
+    timeframe: "",
+  });
   useEffect(() => {
     const bars = barsRef.current;
     const volume = volumeRef.current;
     if (!bars || !volume) return;
-    const previous = chartDataRef.current;
-    const reset = fullReset
-      || !previous
-      // React StrictMode mounts, destroys and re-creates the chart. The data
-      // ref survives that remount, so comparing only the rows would take the
-      // incremental branch and `update()` the last bar on an EMPTY series —
-      // the pane then shows a single candle until the next full reset.
-      || previous.series !== bars
-      || previous.symbol !== symbol
-      || previous.mainTimeframe !== mainTimeframe
-      || previous.timeframe !== timeframe
-      || previous.firstSourceCandle !== candlesBase[0]
-      || candles.length < previous.candleCount
-      || (candles.length > 0 && previous.firstTimestamp !== candles[0][0]);
-    // Keep axis precision consistent with the current vertical zoom.
     const lastCandle = candles[candles.length - 1];
-    if (lastCandle) {
-      bars.applyOptions({
-        priceFormat: {
-          type: "price",
-          ...priceAxisFormat(lastCandle[4], bars.priceScale().getVisibleRange()),
-        },
-      });
-    }
-    if (reset) {
+    if (!lastCandle) return;
+    // Tick size follows the price magnitude (see priceAxisFormat): a cheap pair
+    // must not be rounded to whole cents.
+    bars.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(lastCandle[4]) } });
+    const first = candles[0][0];
+    const prev = renderedRef.current;
+    const full =
+      prev.timeframe !== timeframe ||
+      candles.length < prev.len ||
+      prev.len === 0 ||
+      first !== prev.first;
+    if (full) {
       bars.setData(candles.map(([ts, open, high, low, close]) => ({
         time: Math.floor(ts / 1000) as UTCTimestamp,
         open,
@@ -256,28 +319,27 @@ export function MiniChart({
         color: close >= open ? "rgba(61, 154, 80, 0.45)" : "rgba(212, 102, 102, 0.45)",
       })));
       chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
-    } else if (lastCandle && previous) {
-      const firstChanged = Math.max(0, previous.candleCount - 1);
-      for (let index = firstChanged; index < candles.length; index += 1) {
-        const [ts, open, high, low, close, amount] = candles[index];
-        const time = Math.floor(ts / 1000) as UTCTimestamp;
-        bars.update({ time, open, high, low, close });
+    } else {
+      // One bucket usually changes; two when a new bucket just opened. Update
+      // from the previously last bucket so its finalized close is corrected.
+      const from = Math.max(prev.len - 1, 0);
+      for (let i = from; i < candles.length; i += 1) {
+        const [ts, open, high, low, close, amount] = candles[i];
+        bars.update({
+          time: Math.floor(ts / 1000) as UTCTimestamp,
+          open,
+          high,
+          low,
+          close,
+        });
         volume.update({
-          time,
+          time: Math.floor(ts / 1000) as UTCTimestamp,
           value: amount,
           color: close >= open ? "rgba(61, 154, 80, 0.45)" : "rgba(212, 102, 102, 0.45)",
         });
       }
     }
-    chartDataRef.current = {
-      series: bars,
-      symbol,
-      mainTimeframe,
-      timeframe,
-      firstSourceCandle: candlesBase[0],
-      firstTimestamp: candles[0]?.[0],
-      candleCount: candles.length,
-    };
+    renderedRef.current = { len: candles.length, first, timeframe };
     // Few aggregated bars (early replay on a higher pane timeframe): spread
     // them across the pane instead of pinning one bar at the right edge.
     if (candles.length > 0 && candles.length < 25) {
@@ -285,8 +347,7 @@ export function MiniChart({
     } else {
       chartRef.current?.timeScale().scrollToRealTime();
     }
-    refreshPriceAxisRef.current?.();
-  }, [candles, candlesVersion, fullReset, mainTimeframe, symbol, timeframe]);
+  }, [candles, timeframe]);
 
   // Store drawings -> this pane's primitives (same engine as the main chart).
   useEffect(() => {

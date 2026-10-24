@@ -291,6 +291,7 @@ export type ClientMessage =
       request_id?: string;
     }
   | { type: "login"; name: string; request_id?: string }
+  | { type: "attach"; token: string; request_id?: string }
   | { type: "challenge"; join: boolean; risk_usdt?: number; capital_usdt?: number; request_id?: string }
   /**
    * Background warm-up of the Rust memory/disk caches for watchlist x timeframes, so
@@ -323,6 +324,25 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: "welcome"; client_id: number }
   | {
+      /** Reply to `attach`: whether an existing session was resumed. */
+      type: "session_state";
+      to?: number;
+      restored: boolean;
+      nick: string;
+      risk_usdt: number;
+      capital_usdt: number;
+      in_challenge: boolean;
+      has_series: boolean;
+      symbol: string;
+      timeframe: string;
+      exchange: ExchangeId;
+      start_ms: number;
+      reveal_start_ms: number;
+      end_ms: number;
+      request_id?: string;
+    }
+  | { type: "loading"; to?: number; symbol: string; timeframe: string; request_id?: string }
+  | {
       type: "snapshot";
       to?: number;
       symbol: string;
@@ -344,7 +364,7 @@ export type ServerMessage =
   | { type: "order_update"; to?: number; order: OrderLine; request_id?: string }
   | { type: "trade"; to?: number; fill: FillLine }
   | (ReplayState & { to?: number; request_id?: string })
-  | { type: "heartbeat"; to?: number; now_ms: number; paused: boolean }
+  | { type: "heartbeat"; to?: number; now_ms?: number; paused?: boolean; keepalive?: boolean }
   | { type: "resync"; to?: number }
   | { type: "login_ok"; to?: number; nick: string; request_id?: string }
   | { type: "challenge_ok"; to?: number; joined: boolean; nick?: string; request_id?: string }
@@ -388,6 +408,8 @@ export function parseServerMessage(raw: string): ServerMessage | null {
   if (!isRecord(v) || typeof v["type"] !== "string") return null;
   switch (v["type"]) {
     case "welcome":
+    case "session_state":
+    case "loading":
     case "snapshot":
     case "candle":
     case "oi_update":
