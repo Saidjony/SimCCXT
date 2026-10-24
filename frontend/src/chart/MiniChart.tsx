@@ -9,9 +9,10 @@ import {
 import type { AutoscaleInfo, IChartApi, ISeriesApi, UTCTimestamp } from "lightweight-charts";
 import type { CandleRow } from "../types/protocol";
 import type { Drawing } from "../state/store";
-import { chartCriteriaKey, useSim } from "../state/store";
+import { chartCriteriaKey, getState, useSim } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import { nearestCandleTime, priceAxisFormat } from "./overlays";
+import { watchAdaptivePriceAxis } from "./adaptivePriceAxis";
 import { ChartCriteriaPicker } from "./ChartCriteriaPicker";
 import { DrawingEngine } from "./primitives/engine";
 import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
@@ -42,6 +43,7 @@ export function MiniChart({
   const chartRef = useRef<IChartApi | null>(null);
   const applyingCrosshairRef = useRef(false);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
+  const refreshPriceAxisRef = useRef<(() => void) | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   // Data source: the SHARED session's candle buffer, aggregated into this
   // pane's timeframe. This is what keeps every pane on the same clock and
@@ -196,6 +198,13 @@ export function MiniChart({
     chartRef.current = chart;
     barsRef.current = bars;
     volumeRef.current = volume;
+    const adaptivePriceAxis = watchAdaptivePriceAxis(
+      chart,
+      bars,
+      el,
+      () => getState().candles.at(-1)?.[4] ?? 0,
+    );
+    refreshPriceAxisRef.current = adaptivePriceAxis.refresh;
     // Mirror of the main chart's drawings: same primitives, read-only layer.
     const engine = new DrawingEngine({
       chart,
@@ -248,10 +257,15 @@ export function MiniChart({
     return () => {
       observer.disconnect();
       crosshairListener();
+      adaptivePriceAxis.dispose();
+      refreshPriceAxisRef.current = null;
       chart.unsubscribeCrosshairMove(onCrosshairMove);
       publishCrosshair(null, panel);
       engine.destroy();
       engineRef.current = null;
+      // The series dies with the chart; force a full setData on the next mount
+      // instead of updating a bar that no longer exists.
+      chartDataRef.current = null;
       chart.remove();
       chartRef.current = null;
       barsRef.current = null;
@@ -464,6 +478,78 @@ function timeframeMs(timeframe: string): number {
  * always the "now" one, so its close equals the main chart's last close —
  * keeping all panes' last price identical.
  */
+interface AggregationCache {
+  source: CandleRow[];
+  stepMs: number;
+  aggregated: CandleRow[];
+}
+
+function aggregateCandlesIncremental(
+  rows: CandleRow[],
+  stepMs: number,
+  cacheRef: React.MutableRefObject<AggregationCache | null>,
+  forceReset: boolean,
+): CandleRow[] {
+  const cached = cacheRef.current;
+  if (cached?.source === rows && cached.stepMs === stepMs) return cached.aggregated;
+  const stablePrefix = cached
+    && cached.stepMs === stepMs
+    && rows.length >= cached.source.length
+    && rows[0] === cached.source[0]
+    && (cached.source.length < 2
+      || rows[cached.source.length - 2] === cached.source[cached.source.length - 2])
+    && (rows.length === cached.source.length
+      || rows[cached.source.length - 1] === cached.source[cached.source.length - 1]);
+  if (!forceReset && cached && stablePrefix) {
+    const aggregated = cached.aggregated;
+    if (rows.length > 0) {
+      const firstChangedIndex = Math.max(0, cached.source.length - 1);
+      const firstBucket = Math.floor(rows[firstChangedIndex][0] / stepMs) * stepMs;
+      const outputIndex = lowerBoundTime(aggregated, firstBucket);
+      aggregated.length = outputIndex;
+      let sourceIndex = lowerBoundTime(rows, firstBucket);
+      while (sourceIndex < rows.length) {
+        const bucket = Math.floor(rows[sourceIndex][0] / stepMs) * stepMs;
+        aggregated.push(aggregateBucket(rows, sourceIndex, bucket, stepMs));
+        sourceIndex = lowerBoundTime(rows, bucket + stepMs);
+      }
+    }
+    cacheRef.current = { source: rows, stepMs, aggregated };
+    return aggregated;
+  }
+
+  const aggregated = aggregateCandles(rows, stepMs);
+  cacheRef.current = { source: rows, stepMs, aggregated };
+  return aggregated;
+}
+
+function lowerBoundTime(rows: CandleRow[], timestamp: number): number {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (rows[middle][0] < timestamp) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function aggregateBucket(rows: CandleRow[], start: number, bucket: number, stepMs: number): CandleRow {
+  const first = rows[start];
+  let high = first[2];
+  let low = first[3];
+  let close = first[4];
+  let volume = first[5];
+  for (let i = start + 1; i < rows.length && Math.floor(rows[i][0] / stepMs) * stepMs === bucket; i += 1) {
+    const row = rows[i];
+    high = Math.max(high, row[2]);
+    low = Math.min(low, row[3]);
+    close = row[4];
+    volume += row[5];
+  }
+  return [bucket, first[1], high, low, close, volume];
+}
+
 function aggregateCandles(rows: CandleRow[], stepMs: number): CandleRow[] {
   if (stepMs <= 0 || rows.length === 0) return rows;
   const out: CandleRow[] = [];

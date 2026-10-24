@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc, Duration};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use simccxt_core::Config;
 
@@ -41,7 +41,11 @@ impl Clock {
     /// Create a new real-time clock
     pub fn real_time() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             current_time: Utc::now(),
+            #[cfg(target_arch = "wasm32")]
+            current_time: DateTime::<Utc>::from_timestamp_millis(0)
+                .expect("the Unix epoch is a valid timestamp"),
             mode: TimeMode::RealTime,
             paused: false,
             step_ms: 0,
@@ -74,6 +78,9 @@ impl Clock {
     /// Get the current time
     pub fn now(&self) -> DateTime<Utc> {
         match self.mode {
+            #[cfg(target_arch = "wasm32")]
+            TimeMode::RealTime => self.current_time,
+            #[cfg(not(target_arch = "wasm32"))]
             TimeMode::RealTime => {
                 if self.paused {
                     self.current_time
@@ -205,7 +212,11 @@ impl Clock {
 impl Default for Clock {
     fn default() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             current_time: Utc::now(),
+            #[cfg(target_arch = "wasm32")]
+            current_time: DateTime::<Utc>::from_timestamp_millis(0)
+                .expect("the Unix epoch is a valid timestamp"),
             mode: TimeMode::Simulated,
             paused: true,
             step_ms: 1000,

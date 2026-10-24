@@ -11,6 +11,7 @@ import {
   countBars,
   cumulativeDelta,
   formatCompactUsdt,
+  formatPriceValue,
   formatRuler,
   invertTime,
   nearestCandleTime,
@@ -190,6 +191,25 @@ describe("priceTick", () => {
     assert.deepEqual(priceAxisFormat(79_967.9), { precision: 0, minMove: 1 });
     assert.equal(priceAxisFormat(0).precision, 2);
   });
+
+  it("adds axis precision when the visible price range is zoomed in", () => {
+    assert.deepEqual(priceAxisFormat(1.33, { from: 1.329, to: 1.331 }), {
+      precision: 5,
+      minMove: 0.00001,
+    });
+    assert.deepEqual(priceAxisFormat(80_000, { from: 79_999.999, to: 80_000.001 }), {
+      precision: 5,
+      minMove: 0.00001,
+    });
+  });
+});
+
+describe("formatPriceValue", () => {
+  it("preserves the precision present in OHLC values", () => {
+    assert.equal(formatPriceValue(1.3115), "1.3115");
+    assert.equal(formatPriceValue(79_967.9), "79967.9");
+    assert.equal(formatPriceValue(0.000001), "0.000001");
+  });
 });
 
 describe("calcQty", () => {
@@ -225,6 +245,13 @@ describe("calcQty", () => {
     assert.ok(withFee < noFee, `fee must reduce size: ${withFee} vs ${noFee}`);
   });
 
+  it("budgets the exit fee at the stop price", () => {
+    const qty = calcQty(10, 100, 90, 0.01);
+    assert.ok(qty !== null);
+    assert.ok(Math.abs(qty - 10 / 11.9) < 1e-12);
+    assert.ok(Math.abs(riskAtStop(qty, 100, 90, 0.01)! - 10) < 1e-12);
+  });
+
   it("treats a missing fee rate as no fee", () => {
     assert.equal(calcQty(10, 100, 90, 0), 1, "feeRate 0 = price distance only");
   });
@@ -240,8 +267,8 @@ describe("calcQty", () => {
 
 describe("riskAtStop", () => {
   it("is price distance plus the round-trip commission", () => {
-    // 1 unit at 100 with the stop at 99 loses 1, plus 0.1 entry + 0.1 exit fee.
-    assert.equal(riskAtStop(2, 100, 99, 0.0005), 2 * (1 + 2 * 100 * 0.0005));
+    // 1 unit at 100 with the stop at 99 loses 1, plus 0.1 entry + 0.099 exit fee.
+    assert.equal(riskAtStop(2, 100, 99, 0.0005), 2 * (1 + (100 + 99) * 0.0005));
     assert.equal(riskAtStop(2, 100, 99), 2, "without a fee rate it is pure distance");
   });
 

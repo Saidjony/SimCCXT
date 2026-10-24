@@ -38,6 +38,7 @@ import { publishCrosshair, subscribeCrosshair } from "./crosshairSync";
 import type { SharedCrosshair } from "./crosshairSync";
 import type { BarPrice } from "lightweight-charts";
 import { followLatest } from "./rangeSync";
+import { watchAdaptivePriceAxis } from "./adaptivePriceAxis";
 import { DrawingEngine } from "./primitives/engine";
 import type { GhostShape } from "./primitives/ghost";
 import { PaneLabelPrimitive } from "./primitives/paneLabel";
@@ -125,6 +126,7 @@ export function Chart(): JSX.Element {
   /** Timestamp of the last applied shared cursor (drop same-T replays). */
   const lastAppliedRef = useRef<number | null>(null);
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
+  const refreshPriceAxisRef = useRef<(() => void) | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   /** OI / CVD ride in their own panes of THIS chart: one clock, one axis. */
   const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
@@ -160,6 +162,7 @@ export function Chart(): JSX.Element {
   /** Set when a drawing was actually dragged: suppress the click that follows. */
   const suppressClickRef = useRef(false);
   const versionRef = useRef(0);
+  const chartCandleCountRef = useRef(0);
   const cvdValuesRef = useRef<number[]>([]);
   /** Incremental CVD state: length + running sum of the rendered line. */
   const cvdRef = useRef({ len: 0, sum: 0, lastTime: 0, lastDelta: 0, first: 0 });
@@ -182,6 +185,7 @@ export function Chart(): JSX.Element {
   const tool = useSim((s) => s.tool);
   const fills = useSim((s) => s.fills);
   const account = useSim((s) => s.account);
+  const fullReset = useSim((s) => s.fullReset);
   const symbol = useSim((s) => s.symbol);
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
@@ -321,6 +325,13 @@ export function Chart(): JSX.Element {
     chartRef.current = chart;
     barsRef.current = bars;
     volumeRef.current = volume;
+    const adaptivePriceAxis = watchAdaptivePriceAxis(
+      chart,
+      bars,
+      el,
+      () => getState().candles.at(-1)?.[4] ?? 0,
+    );
+    refreshPriceAxisRef.current = adaptivePriceAxis.refresh;
     // Fill markers: the v5 markers plugin, created once for the series.
     const markers = createSeriesMarkers(bars, []);
     markersRef.current = markers;
@@ -426,8 +437,8 @@ export function Chart(): JSX.Element {
         const up = data.close >= data.open;
         setHover({
           text:
-            "O " + data.open.toFixed(1) + "  H " + (data.high ?? 0).toFixed(1) +
-            "  L " + (data.low ?? 0).toFixed(1) + "  C " + data.close.toFixed(1),
+            "O " + formatPriceValue(data.open) + "  H " + formatPriceValue(data.high ?? 0) +
+            "  L " + formatPriceValue(data.low ?? 0) + "  C " + formatPriceValue(data.close),
           up,
         });
       } else {
@@ -524,6 +535,8 @@ export function Chart(): JSX.Element {
       window.clearTimeout(rulerTimer.current);
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("blur", onBlur);
+      adaptivePriceAxis.dispose();
+      refreshPriceAxisRef.current = null;
       crosshairListener();
       publishCrosshair(null, "main");
       ro.disconnect();
@@ -572,7 +585,7 @@ export function Chart(): JSX.Element {
       orders: account?.open ?? [],
       symbol,
     });
-  }, [fills, account, symbol]);
+  }, [fills, executionKey, symbol]);
 
   // Incremental data: full snapshot -> setData(), tick -> update().
   useEffect(() => {
@@ -1428,6 +1441,36 @@ function updateCvd(
   cache.lastDelta = barDelta(last);
 }
 
+function updateCvd(
+  line: ISeriesApi<"Line">,
+  rows: CandleRow[],
+  previousRows: CandleRow[],
+  values: number[],
+): void {
+  if (
+    rows.length === 0
+    || previousRows.length === 0
+    || rows.length < previousRows.length
+    || rows[0] !== previousRows[0]
+  ) {
+    const full = cumulativeDelta(rows);
+    pushCvd(line, rows, full);
+    values.length = 0;
+    for (const value of full) values.push(value);
+    return;
+  }
+
+  const firstChanged = Math.max(0, previousRows.length - 1);
+  for (let index = firstChanged; index < rows.length; index += 1) {
+    const row = rows[index];
+    const base = index > 0 ? values[index - 1] : 0;
+    const next = base + (row[4] >= row[1] ? row[5] : -row[5]);
+    if (index === values.length) values.push(next);
+    else values[index] = next;
+    line.update({ time: toTime(row[0]), value: next });
+  }
+}
+
 function pushBars(
   chart: IChartApi,
   bars: ISeriesApi<"Bar">,
@@ -1444,7 +1487,9 @@ function pushBars(
   // Tick size follows the price magnitude: a 0.09 DOGE needs five decimals or
   // the axis rounds to whole cents and the trader cannot read the price.
   const last = rows[rows.length - 1];
-  bars.applyOptions({ priceFormat: { type: "price", ...priceAxisFormat(last[4]) } });
+  bars.applyOptions({
+    priceFormat: { type: "price", ...priceAxisFormat(last[4], bars.priceScale().getVisibleRange()) },
+  });
   if (full) {
     bars.setData(
       rows.map((r) => ({ time: toTime(r[0]), open: r[1], high: r[2], low: r[3], close: r[4] })),

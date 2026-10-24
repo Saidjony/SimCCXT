@@ -35,17 +35,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
+use crate::market_data::{
+    apply_series_window, ensure_oi, ensure_series, ensure_series_window, lookup_market_ticker,
+    mark_background_net, merge_cached_oi, oi_cache_hit, oi_period, tf_step_ms, warm_oi_cache,
+    warm_series_cache, SeriesRequest,
+};
 use chrono::{DateTime, Utc};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use simccxt_core::Symbol;
 use simccxt_exchange::{CreateOrderParams, Exchange};
-use crate::market_data::{
-    apply_series_window, ensure_oi, ensure_series, ensure_series_window, mark_background_net,
-    merge_cached_oi, oi_cache_hit, oi_period, tf_step_ms, warm_oi_cache, warm_series_cache,
-    SeriesRequest,
-};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, oneshot};
 
@@ -74,6 +74,7 @@ mod diary_scenarios;
 //    (risk_usdt must be >0 and is fixed for the current session)
 //   {"type":"preload","symbols":["BTC/USDT","ETH/USDT"],"timeframes":["1m","5m"],
 //    "exchange":"binance","start_ms":..,"end_ms":..,"request_id":".."}
+//   {"type":"market_lookup","symbols":["BTC/USDT","BR/USDT"],"exchange":"binance"}
 //   {"type":"ping"}
 //
 // Rust -> frontend:
@@ -96,14 +97,17 @@ mod diary_scenarios;
 //   {"type":"preload_progress","to":7,"done":3,"total":24,"failed":0,
 //    "symbol":"ETH/USDT","timeframe":"1h","status":"downloaded","note":".."}
 //   {"type":"preload_done","to":7,"done":24,"total":24,"failed":1}
+//   {"type":"market_lookup","to":7,"quotes":[{"symbol":"BTC/USDT",
+//    "exchange":"binance","last":65000}],"failures":[]}
 //   {"type":"error","to":7,"message":"..","request_id":".."}
 //   {"type":"pong","to":7}
 //
 // PRELOAD (background market data): the watchlist x all timeframes is warmed
 // on a separate thread, so switching a coin/timeframe never waits for a
-// download. It only fills the disk caches (and the OI grid) — it never
-// touches a session, its series, its clock or its account, and it sends no
-// candles. Progress is addressed to the requesting client.
+// download. Each symbol is resolved across supported venues first; candles
+// and OI are cached against the venue where that symbol is available. It never
+// touches a session, its series, its clock or its account, and sends no candles.
+// MARKET_LOOKUP returns current prices and venue labels for the watchlist.
 //
 // SESSIONS (isolation): every connection owns a private session — its own
 // `Exchange` (1M USDT paper account, orders, positions), its own series and
@@ -172,6 +176,10 @@ enum ClientCmd {
         price: Option<f64>,
         stop_price: Option<f64>,
         stop_loss_price: Option<f64>,
+        /// Fixed risk budget. When present with a stop, size at the actual
+        /// entry reference so a stop-out costs this amount, not more.
+        #[serde(default)]
+        risk_usdt: Option<f64>,
         #[serde(default)]
         time_in_force: String,
         #[serde(default)]
@@ -212,6 +220,15 @@ enum ClientCmd {
         end_ms: Option<i64>,
         request_id: Option<String>,
     },
+    /// Resolve current public prices for the watchlist, independently of the
+    /// active replay series. Work is run off the engine thread.
+    MarketLookup {
+        #[serde(default)]
+        symbols: Vec<String>,
+        #[serde(default = "default_exchange")]
+        exchange: String,
+        request_id: Option<String>,
+    },
     Replay {
         action: String,
         #[serde(default)]
@@ -232,6 +249,22 @@ enum ClientCmd {
         #[serde(default)]
         criteria: Option<serde_json::Map<String, serde_json::Value>>,
         request_id: Option<String>,
+    },
+    LocalSync {
+        account: Value,
+        #[serde(default)]
+        fills: Vec<Value>,
+        #[serde(default)]
+        replace_fills: bool,
+        #[serde(default)]
+        entry_protections: HashMap<String, Value>,
+        #[serde(default)]
+        exit_reasons: HashMap<String, String>,
+        symbol: String,
+        timeframe: String,
+        #[serde(default = "default_exchange")]
+        exchange: String,
+        range: Value,
     },
     Ping,
 }
@@ -330,10 +363,12 @@ const PRELOAD_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 
 /// Deduplicated, validated `symbol x timeframe` list for a warm-up request.
 /// Pure helper so it can be unit-tested: malformed symbols/timeframes are
-/// dropped and the order stays stable (watchlist order first, timeframes after).
+/// dropped; newest watchlist entries and then timeframe order are prioritized.
 fn preload_plan(symbols: &[String], timeframes: &[String]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for symbol in symbols {
+    // Newly added watchlist entries are appended, so prioritize them if the
+    // bounded request has more pairs than the server can warm in one batch.
+    for symbol in symbols.iter().rev() {
         let symbol = symbol.trim().to_uppercase();
         if !symbol.contains('/') {
             continue;
@@ -394,7 +429,11 @@ mod market_data;
 /// Pure helper so it can be unit-tested: returns the slice of new rows.
 #[cfg(test)]
 fn new_bars(live: &[Vec<f64>], fed: usize) -> &[Vec<f64>] {
-    if fed >= live.len() { &[] } else { &live[fed..] }
+    if fed >= live.len() {
+        &[]
+    } else {
+        &live[fed..]
+    }
 }
 
 /// One WebSocket connection = one isolated session: its own `Exchange` (own
@@ -433,20 +472,22 @@ struct Session {
     protection_kinds: HashMap<String, &'static str>,
     /// Fill order id → the level that closed it.
     ///
-    /// This cannot be recovered from prices: a protective stop is a MARKET
-    /// order, so on a 5m bar it can fill well past its trigger (measured in
-    /// replay: stop 79519 filled at 79233 — 0.36% away). Classifying by price
-    /// proximity would report that stop-out as a manual exit and claim the
-    /// trader broke their own rule when the market simply gapped through.
+    /// This cannot be recovered from prices alone: classify stop/take exits
+    /// from the conditional order that triggered, independently of fill level.
     exit_reasons: HashMap<String, &'static str>,
     active_protections: Vec<(String, String, String)>,
     diary_meta: serde_json::Value, // client-pushed drawings/criteria to show in the diary
-    oi: Vec<(i64, f64)>, // open-interest history (ts_ms, USDT value), context only
-    oi_period: String, // OI grid actually loaded ("5m", "" when none)
+    oi: Vec<(i64, f64)>,           // open-interest history (ts_ms, USDT value), context only
+    oi_period: String,             // OI grid actually loaded ("5m", "" when none)
     oi_fed: usize,
     range_start_ms: i64,
     reveal_start_ms: i64,
     range_end_ms: i64,
+    /// Browser-owned Rust/WASM engine state mirrored for the online board and diary.
+    local_account: Option<Value>,
+    local_fills: Vec<Value>,
+    local_entry_protections: HashMap<String, Value>,
+    local_exit_reasons: HashMap<String, String>,
 }
 
 /// Protective levels the trader set, keyed by entry order id. Session-scoped:
@@ -477,14 +518,48 @@ struct RequestedWindow {
 const MAX_NICK_LEN: usize = 24;
 
 const NICK_A: [&str; 20] = [
-    "Быстрый", "Тихий", "Стальной", "Хитрый", "Смелый", "Резкий", "Меткий",
-    "Дерзкий", "Умный", "Спокойный", "Ловкий", "Жадный", "Терпеливый", "Зоркий",
-    "Крепкий", "Шустрый", "Мудрый", "Дикий", "Холодный", "Цепкий",
+    "Быстрый",
+    "Тихий",
+    "Стальной",
+    "Хитрый",
+    "Смелый",
+    "Резкий",
+    "Меткий",
+    "Дерзкий",
+    "Умный",
+    "Спокойный",
+    "Ловкий",
+    "Жадный",
+    "Терпеливый",
+    "Зоркий",
+    "Крепкий",
+    "Шустрый",
+    "Мудрый",
+    "Дикий",
+    "Холодный",
+    "Цепкий",
 ];
 const NICK_B: [&str; 20] = [
-    "Бык", "Медведь", "Волк", "Сокол", "Акула", "Тигр", "Ястреб", "Кит",
-    "Скорпион", "Ворон", "Барс", "Койот", "Филин", "Соболь", "Кречет",
-    "Тайфун", "Штиль", "Откат", "Пробой", "Флет",
+    "Бык",
+    "Медведь",
+    "Волк",
+    "Сокол",
+    "Акула",
+    "Тигр",
+    "Ястреб",
+    "Кит",
+    "Скорпион",
+    "Ворон",
+    "Барс",
+    "Койот",
+    "Филин",
+    "Соболь",
+    "Кречет",
+    "Тайфун",
+    "Штиль",
+    "Откат",
+    "Пробой",
+    "Флет",
 ];
 
 /// Random `A-B-NN` nick, unique among active sessions. xorshift64 seeded from
@@ -498,7 +573,10 @@ fn unique_nick(sessions: &HashMap<u64, Session>) -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x1234_5678);
     let mut state = nanos
-        .wrapping_add(SALT.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(
+            SALT.fetch_add(1, Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        )
         .max(1);
     let mut next = move || {
         state ^= state << 13;
@@ -551,7 +629,10 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
         if !s.in_challenge {
             continue;
         }
-        let snap = s.ex.account_snapshot();
+        let snap = s
+            .local_account
+            .clone()
+            .unwrap_or_else(|| s.ex.account_snapshot());
         let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
         let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
         let equity = snap["equity"].as_f64().unwrap_or(0.0);
@@ -561,18 +642,21 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
         // hottest part of the board push (once per tick per participant).
         let trades = s.seen_orders.len();
         let r = r_of(pnl, s.risk_usdt).unwrap_or(0.0);
-        rows.push((r, json!({
-            "nick": s.nick,
-            "risk": s.risk_usdt,
-            "capital": s.capital_usdt,
-            "realized": realized,
-            "unrealized": unrealized,
-            "pnl": pnl,
-            "r": (r * 100.0).round() / 100.0,
-            "equity": (equity * 100.0).round() / 100.0,
-            "trades": trades,
-            "symbol": s.symbol,
-        })));
+        rows.push((
+            r,
+            json!({
+                "nick": s.nick,
+                "risk": s.risk_usdt,
+                "capital": s.capital_usdt,
+                "realized": realized,
+                "unrealized": unrealized,
+                "pnl": pnl,
+                "r": (r * 100.0).round() / 100.0,
+                "equity": (equity * 100.0).round() / 100.0,
+                "trades": trades,
+                "symbol": s.symbol,
+            }),
+        ));
     }
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     json!({ "type": "challenge_board", "board": rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>() })
@@ -617,6 +701,7 @@ fn speed_interval(speed: f64) -> Duration {
 }
 
 fn replay_json(s: &Session) -> Value {
+    let (fed, total) = s.ex.ohlcv_counts(&s.symbol, &s.timeframe);
     json!({
         "type": "replay_state",
         "paused": s.ex.is_paused(),
@@ -697,12 +782,11 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
         // If this fill came from a protective order, remember WHICH level it
         // implemented: the diary needs the reason, and price proximity cannot
         // supply it (a stop is a market order and may fill far past its trigger).
-        if let Some(kind) = s
-            .protection_kinds
-            .get(&order_id)
-            .copied()
-            .or_else(|| source_order_id.as_ref().and_then(|id| s.protection_kinds.get(id).copied()))
-        {
+        if let Some(kind) = s.protection_kinds.get(&order_id).copied().or_else(|| {
+            source_order_id
+                .as_ref()
+                .and_then(|id| s.protection_kinds.get(id).copied())
+        }) {
             s.exit_reasons.insert(order_id.clone(), kind);
         }
         let amount = fill["amount"].as_f64().unwrap_or(0.0);
@@ -723,9 +807,7 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
             let planned = s
                 .entry_protections
                 .entry(entry_order_id.clone())
-                .or_insert_with(|| {
-                    json!({ "stop_price": Value::Null, "take_price": Value::Null })
-                });
+                .or_insert_with(|| json!({ "stop_price": Value::Null, "take_price": Value::Null }));
             if stop_price > 0.0 {
                 planned["stop_price"] = json!(stop_price);
             }
@@ -742,11 +824,17 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
                     protect_side,
                     protect_amount,
                     None,
-                    CreateOrderParams::new().stop_price(stop_price).reduce_only(true),
+                    CreateOrderParams::new()
+                        .stop_price(stop_price)
+                        .reduce_only(true),
                 ) {
                     Ok(order) => {
                         if let Some(id) = order["id"].as_str() {
-                            s.active_protections.push((symbol.clone(), entry_side.clone(), id.to_string()));
+                            s.active_protections.push((
+                                symbol.clone(),
+                                entry_side.clone(),
+                                id.to_string(),
+                            ));
                             s.protection_kinds.insert(id.to_string(), "stop");
                         }
                         events.push(json!({ "type": "order_update", "order": order }));
@@ -768,7 +856,8 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
                 ) {
                     Ok(order) => {
                         if let Some(id) = order["id"].as_str() {
-                            s.active_protections.push((symbol.clone(), entry_side, id.to_string()));
+                            s.active_protections
+                                .push((symbol.clone(), entry_side, id.to_string()));
                             s.protection_kinds.insert(id.to_string(), "take");
                         }
                         events.push(json!({ "type": "order_update", "order": order }));
@@ -783,18 +872,25 @@ fn fresh_fill_events(s: &mut Session) -> Vec<Value> {
             if s.pending_protections[index].remaining <= f64::EPSILON {
                 s.pending_protections.remove(index);
             }
-        } else if let Some(index) = s.active_protections.iter().position(|(protected_symbol, entry_side, stop_id)| {
-            protected_symbol == &symbol
-                && source_order_id.as_deref() == Some(stop_id.as_str())
-                && *entry_side != side
-        }) {
+        } else if let Some(index) =
+            s.active_protections
+                .iter()
+                .position(|(protected_symbol, entry_side, stop_id)| {
+                    protected_symbol == &symbol
+                        && source_order_id.as_deref() == Some(stop_id.as_str())
+                        && *entry_side != side
+                })
+        {
             let (_, protected_side, _) = s.active_protections.remove(index);
-            let position_is_open = s.ex.account_snapshot()["positions"]
-                .as_array()
-                .is_some_and(|positions| positions.iter().any(|position| {
-                    position["symbol"] == symbol
-                        && position["qty"].as_f64().unwrap_or(0.0).abs() > f64::EPSILON
-                }));
+            let position_is_open =
+                s.ex.account_snapshot()["positions"]
+                    .as_array()
+                    .is_some_and(|positions| {
+                        positions.iter().any(|position| {
+                            position["symbol"] == symbol
+                                && position["qty"].as_f64().unwrap_or(0.0).abs() > f64::EPSILON
+                        })
+                    });
             if !position_is_open {
                 let mut rest = Vec::new();
                 for (active_symbol, active_side, active_id) in s.active_protections.drain(..) {
@@ -923,6 +1019,10 @@ fn new_session(nick: String) -> Session {
         range_start_ms: 0,
         reveal_start_ms: 0,
         range_end_ms: 0,
+        local_account: None,
+        local_fills: Vec::new(),
+        local_entry_protections: HashMap::new(),
+        local_exit_reasons: HashMap::new(),
     }
 }
 
@@ -936,7 +1036,11 @@ fn use_series(
     data_dir: &Path,
     allow_net: bool,
 ) -> Result<String, String> {
-    let RequestedWindow { start_ms, reveal_start_ms, end_ms } = window;
+    let RequestedWindow {
+        start_ms,
+        reveal_start_ms,
+        end_ms,
+    } = window;
     // "Bare" switch = the client sent no dates at all, or exactly the window
     // the session already runs. Judged on the REQUEST (before it is resolved
     // against the new series, whose bar grid differs per timeframe).
@@ -955,24 +1059,24 @@ fn use_series(
         || reveal_start_ms.is_some_and(|value| value != s.reveal_start_ms)
         || end_ms.is_some_and(|value| value != s.range_end_ms);
     ensure_series(
-        &mut s.ex,
+        &mut s.ex, &exchange, &symbol, &timeframe, data_dir, allow_net, reload,
+    )?;
+    let step_ms = tf_step_ms(&timeframe);
+    ensure_oi(
+        &mut s.oi,
+        &mut s.oi_period,
         &exchange,
         &symbol,
         &timeframe,
         data_dir,
         allow_net,
-        reload,
-    )?;
-    let step_ms = tf_step_ms(&timeframe);
-    ensure_oi(&mut s.oi, &mut s.oi_period, &exchange, &symbol, &timeframe, data_dir, allow_net);
+    );
     let rows = s.ex.fetch_ohlcv(&symbol, &timeframe, None, None);
     let last_ms = rows.last().map(|row| row[0] as i64).unwrap_or(0);
-    let start_ms = start_ms.unwrap_or_else(|| {
-        rows.first().map(|row| row[0] as i64).unwrap_or(last_ms)
-    });
-    let reveal_start_ms = reveal_start_ms.unwrap_or_else(|| {
-        start_ms.saturating_add((step_ms as i64).saturating_mul(20))
-    });
+    let start_ms =
+        start_ms.unwrap_or_else(|| rows.first().map(|row| row[0] as i64).unwrap_or(last_ms));
+    let reveal_start_ms = reveal_start_ms
+        .unwrap_or_else(|| start_ms.saturating_add((step_ms as i64).saturating_mul(20)));
     let end_ms = end_ms.unwrap_or(last_ms);
     let (start_ms, reveal_start_ms, end_ms) = if !allow_net && !rows.is_empty() {
         let loaded_start = rows.first().map(|row| row[0] as i64).unwrap_or(last_ms);
@@ -1093,7 +1197,13 @@ fn use_series(
     s.symbol = symbol;
     s.timeframe = timeframe;
     s.exchange = exchange;
-    Ok(format!("{} {} {} ({} bars)", s.exchange, s.symbol, s.timeframe, rows.len()))
+    Ok(format!(
+        "{} {} {} ({} bars)",
+        s.exchange,
+        s.symbol,
+        s.timeframe,
+        rows.len()
+    ))
 }
 
 impl Engine {
@@ -1192,7 +1302,49 @@ impl Engine {
         // re-broadcast to everyone after the directed events go out.
         let mut board_push = false;
         match cmd {
-            ClientCmd::DiaryMeta { drawings, criteria, request_id } => {
+            ClientCmd::LocalSync {
+                account,
+                fills,
+                replace_fills,
+                entry_protections,
+                exit_reasons,
+                symbol,
+                timeframe,
+                exchange,
+                range,
+            } => {
+                let s = self.session(to);
+                s.local_account = Some(account);
+                if replace_fills {
+                    s.local_fills = fills;
+                } else {
+                    let mut known: std::collections::HashSet<String> = s
+                        .local_fills
+                        .iter()
+                        .map(|fill| fill["id"].as_str().unwrap_or_default().to_string())
+                        .collect();
+                    s.local_fills.extend(fills.into_iter().filter(|fill| {
+                        let id = fill["id"].as_str().unwrap_or_default();
+                        !id.is_empty() && known.insert(id.to_string())
+                    }));
+                }
+                s.local_entry_protections = entry_protections;
+                s.local_exit_reasons = exit_reasons;
+                s.symbol = symbol;
+                s.timeframe = timeframe;
+                s.exchange = exchange;
+                s.range_start_ms = range["start_ms"].as_i64().unwrap_or(s.range_start_ms);
+                s.reveal_start_ms = range["reveal_start_ms"]
+                    .as_i64()
+                    .unwrap_or(s.reveal_start_ms);
+                s.range_end_ms = range["end_ms"].as_i64().unwrap_or(s.range_end_ms);
+                board_push = true;
+            }
+            ClientCmd::DiaryMeta {
+                drawings,
+                criteria,
+                request_id,
+            } => {
                 let s = self.session(to);
                 // Bound size so a misbehaving client can't bloat the session.
                 let mut meta = s.diary_meta.clone();
@@ -1204,7 +1356,9 @@ impl Engine {
                     let mut map = serde_json::Map::new();
                     for (k, v) in c.into_iter().take(MAX_KEYS) {
                         if k.len() <= 32 {
-                            let list = v.as_array().map(|a| a.iter().take(16).cloned().collect::<Vec<_>>());
+                            let list = v
+                                .as_array()
+                                .map(|a| a.iter().take(16).cloned().collect::<Vec<_>>());
                             if let Some(list) = list {
                                 map.insert(k, serde_json::Value::Array(list));
                             }
@@ -1277,19 +1431,26 @@ impl Engine {
                 }
                 board_push = true; // a newcomer should see the current board
             }
-            ClientCmd::Challenge { join, risk_usdt, capital_usdt, request_id } => {
+            ClientCmd::Challenge {
+                join,
+                risk_usdt,
+                capital_usdt,
+                request_id,
+            } => {
                 let s = self.session(to);
                 if join {
                     match risk_usdt {
                         Some(r) if r > 0.0 && r.is_finite() => {
                             let capital_changed = capital_usdt.is_some_and(|capital| {
-                                s.capital_usdt > 0.0 && (s.capital_usdt - capital).abs() > f64::EPSILON
+                                s.capital_usdt > 0.0
+                                    && (s.capital_usdt - capital).abs() > f64::EPSILON
                             });
                             if (s.risk_usdt > 0.0 && (s.risk_usdt - r).abs() > f64::EPSILON)
                                 || capital_changed
                             {
                                 evs.push(error_json(
-                                    "risk and capital are fixed for the current challenge round".into(),
+                                    "risk and capital are fixed for the current challenge round"
+                                        .into(),
                                     request_id.clone(),
                                 ));
                                 evs.push(json!({
@@ -1298,7 +1459,9 @@ impl Engine {
                                 }));
                             } else {
                                 s.risk_usdt = r;
-                                if let Some(capital) = capital_usdt.filter(|value| value.is_finite() && *value > 0.0) {
+                                if let Some(capital) =
+                                    capital_usdt.filter(|value| value.is_finite() && *value > 0.0)
+                                {
                                     s.capital_usdt = capital;
                                 }
                                 s.in_challenge = true;
@@ -1332,7 +1495,13 @@ impl Engine {
                 }
             }
             ClientCmd::Subscribe {
-                symbol, timeframe, exchange, start_ms, reveal_start_ms, end_ms, request_id,
+                symbol,
+                timeframe,
+                exchange,
+                start_ms,
+                reveal_start_ms,
+                end_ms,
+                request_id,
             } => {
                 let allow_net = self.allow_net;
                 let urgent = self.preload_urgent.clone();
@@ -1422,7 +1591,13 @@ impl Engine {
                 }
             }
             ClientCmd::Preload {
-                symbols, timeframes, exchange, start_ms, end_ms, request_id, ..
+                symbols,
+                timeframes,
+                exchange,
+                start_ms,
+                end_ms,
+                request_id,
+                ..
             } => {
                 let pairs = preload_plan(&symbols, &timeframes);
                 let window = match (start_ms, end_ms) {
@@ -1451,7 +1626,10 @@ impl Engine {
                             "status": "queued", "note": "",
                         }));
                     } else {
-                        evs.push(error_json("preload: background loader is gone".into(), request_id));
+                        evs.push(error_json(
+                            "preload: background loader is gone".into(),
+                            request_id,
+                        ));
                     }
                 } else {
                     evs.push(error_json(
@@ -1460,83 +1638,196 @@ impl Engine {
                     ));
                 }
             }
+            ClientCmd::MarketLookup {
+                symbols,
+                exchange,
+                request_id,
+            } => {
+                let mut unique = HashSet::new();
+                let mut requested = Vec::new();
+                let mut failures = Vec::new();
+                for symbol in symbols {
+                    let symbol = symbol.trim().to_ascii_uppercase();
+                    let Some((base, quote)) = symbol.split_once('/') else {
+                        failures.push(json!({
+                            "symbol": symbol,
+                            "error": "формат символа должен быть BASE/QUOTE",
+                        }));
+                        continue;
+                    };
+                    if base.is_empty() || quote.is_empty() || !unique.insert(symbol.clone()) {
+                        continue;
+                    }
+                    if requested.len() == 64 {
+                        failures.push(json!({
+                            "symbol": symbol,
+                            "error": "лимит поиска — 64 монеты",
+                        }));
+                    } else {
+                        requested.push(symbol);
+                    }
+                }
+                let out = self.out.clone();
+                let exchange = exchange_or_default(Some(&exchange));
+                std::thread::spawn(move || {
+                    mark_background_net();
+                    let mut quotes = Vec::new();
+                    for symbol in requested {
+                        match lookup_market_ticker(&symbol, &exchange) {
+                            Ok(Some(ticker)) => quotes.push(json!({
+                                "symbol": symbol,
+                                "exchange": ticker.exchange,
+                                "last": ticker.last,
+                            })),
+                            Ok(None) => failures.push(json!({
+                                "symbol": symbol,
+                                "error": "не найдено на доступных биржах",
+                            })),
+                            Err(error) => failures.push(json!({
+                                "symbol": symbol,
+                                "error": error,
+                            })),
+                        }
+                    }
+                    let _ = out.send(msg(json!({
+                        "type": "market_lookup",
+                        "to": to,
+                        "quotes": quotes,
+                        "failures": failures,
+                        "request_id": request_id,
+                    })));
+                });
+            }
             ClientCmd::PlaceOrder {
-                symbol, side, order_type, quantity, price, stop_price, stop_loss_price,
-                time_in_force, post_only, reduce_only, tp_price, request_id,
+                symbol,
+                side,
+                order_type,
+                quantity,
+                price,
+                stop_price,
+                stop_loss_price,
+                risk_usdt,
+                time_in_force,
+                post_only,
+                reduce_only,
+                tp_price,
+                request_id,
             } => {
                 let s = self.session(to);
+                let mut quantity = quantity;
                 let valid_stop = if let Some(stop) = stop_loss_price {
-                    let reference = price.or(stop_price).or_else(|| s.ex.last_price_for(&symbol));
+                    let reference = price
+                        .or(stop_price)
+                        .or_else(|| s.ex.last_price_for(&symbol));
                     reference.is_some_and(|entry| {
                         stop.is_finite()
                             && stop > 0.0
-                            && if side == "buy" { stop < entry } else { stop > entry }
+                            && if side == "buy" {
+                                stop < entry
+                            } else {
+                                stop > entry
+                            }
                     })
                 } else {
                     true
                 };
                 let valid_tp = if let Some(tp) = tp_price {
-                    let reference = price.or(stop_price).or_else(|| s.ex.last_price_for(&symbol));
+                    let reference = price
+                        .or(stop_price)
+                        .or_else(|| s.ex.last_price_for(&symbol));
                     reference.is_some_and(|entry| {
                         tp.is_finite()
                             && tp > 0.0
-                            && if side == "buy" { tp > entry } else { tp < entry }
+                            && if side == "buy" {
+                                tp > entry
+                            } else {
+                                tp < entry
+                            }
                     })
                 } else {
                     true
                 };
                 if !valid_stop {
                     evs.push(error_json(
-                        "stop loss must be below the entry price for BUY and above it for SELL".into(),
+                        "stop loss must be below the entry price for BUY and above it for SELL"
+                            .into(),
                         request_id,
                     ));
                 } else if !valid_tp {
                     evs.push(error_json(
-                        "take profit must be above the entry price for BUY and below it for SELL".into(),
+                        "take profit must be above the entry price for BUY and below it for SELL"
+                            .into(),
                         request_id,
                     ));
                 } else {
-                    let mut p = CreateOrderParams::new();
-                        p.stop_price = stop_price;
-                        p.tp_price = tp_price;
-                        p.reduce_only = reduce_only;
-                        p.post_only = post_only;
-                        if !time_in_force.is_empty() {
-                            if let Some(tif) = parse_tif(&time_in_force) {
-                                p.time_in_force = tif;
-                            }
-                        }
-                        match s.ex.create_order(&symbol, &order_type, &side, quantity, price, p) {
-                            Ok(order) => {
-                                evs.push(json!({
-                                    "type": "order_update", "order": order, "request_id": request_id }));
-                                if stop_loss_price.is_some() || tp_price.is_some() {
-                                    let order_id = order["id"].as_str().unwrap_or_default().to_string();
-                                    s.pending_protections.push(PendingProtection {
-                                        symbol: symbol.clone(),
-                                        entry_side: side.clone(),
-                                        entry_order_id: order_id,
-                                        stop_price: stop_loss_price.unwrap_or(0.0),
-                                        take_price: tp_price,
-                                        remaining: quantity,
-                                    });
+                    // Re-size from the actual entry reference, not the client's
+                    // rendered preview: a replay tick between render and this
+                    // command would otherwise make the stop-out cost >1R.
+                    if let (Some(risk), Some(stop)) = (risk_usdt, stop_loss_price) {
+                        if risk > 0.0 && !reduce_only {
+                            let reference = price
+                                .or(stop_price)
+                                .or_else(|| s.ex.last_price_for(&symbol));
+                            if let Some(entry) = reference.filter(|value| *value > 0.0) {
+                                let taker = s.ex.broker().fee_schedule().taker;
+                                let per_unit = (entry - stop).abs()
+                                    + (entry.abs() + stop.abs()) * taker;
+                                if per_unit > 0.0 {
+                                    quantity = risk / per_unit;
                                 }
-                                let fill_events = fresh_fill_events(s);
-                                board_push |= s.in_challenge
-                                    && fill_events.iter().any(|event| event["type"] == "trade");
-                                evs.extend(fill_events);
-                                evs.push(account_json(s));
                             }
-                            Err(e) => evs.push(error_json(format!("place_order: {e}"), request_id)),
                         }
+                    }
+                    let mut p = CreateOrderParams::new();
+                    p.stop_price = stop_price;
+                    p.tp_price = tp_price;
+                    p.reduce_only = reduce_only;
+                    p.post_only = post_only;
+                    if !time_in_force.is_empty() {
+                        if let Some(tif) = parse_tif(&time_in_force) {
+                            p.time_in_force = tif;
+                        }
+                    }
+                    match s
+                        .ex
+                        .create_order(&symbol, &order_type, &side, quantity, price, p)
+                    {
+                        Ok(order) => {
+                            evs.push(json!({
+                                    "type": "order_update", "order": order, "request_id": request_id }));
+                            if stop_loss_price.is_some() || tp_price.is_some() {
+                                let order_id = order["id"].as_str().unwrap_or_default().to_string();
+                                s.pending_protections.push(PendingProtection {
+                                    symbol: symbol.clone(),
+                                    entry_side: side.clone(),
+                                    entry_order_id: order_id,
+                                    stop_price: stop_loss_price.unwrap_or(0.0),
+                                    take_price: tp_price,
+                                    remaining: quantity,
+                                });
+                            }
+                            let fill_events = fresh_fill_events(s);
+                            board_push |= s.in_challenge
+                                && fill_events.iter().any(|event| event["type"] == "trade");
+                            evs.extend(fill_events);
+                            evs.push(account_json(s));
+                        }
+                        Err(e) => evs.push(error_json(format!("place_order: {e}"), request_id)),
+                    }
                 }
             }
-            ClientCmd::CancelOrder { order_id, symbol, request_id } => {
+            ClientCmd::CancelOrder {
+                order_id,
+                symbol,
+                request_id,
+            } => {
                 let s = self.session(to);
                 match s.ex.cancel_order(&order_id, &symbol) {
                     Ok(order) => {
-                        s.pending_protections.retain(|pending| pending.entry_order_id != order_id);
-                        s.active_protections.retain(|(_, _, active_id)| active_id != &order_id);
+                        s.pending_protections
+                            .retain(|pending| pending.entry_order_id != order_id);
+                        s.active_protections
+                            .retain(|(_, _, active_id)| active_id != &order_id);
                         evs.push(json!({
                             "type": "order_update", "order": order, "request_id": request_id }));
                         evs.push(account_json(s));
@@ -1544,16 +1835,29 @@ impl Engine {
                     Err(e) => evs.push(error_json(format!("cancel_order: {e}"), request_id)),
                 }
             }
-            ClientCmd::ClosePosition { symbol, quantity, request_id } => {
+            ClientCmd::ClosePosition {
+                symbol,
+                quantity,
+                request_id,
+            } => {
                 let s = self.session(to);
                 let snapshot = s.ex.account_snapshot();
-                let position = snapshot["positions"].as_array().and_then(|positions| {
-                    positions.iter().find(|position| position["symbol"] == symbol)
-                }).cloned();
+                let position = snapshot["positions"]
+                    .as_array()
+                    .and_then(|positions| {
+                        positions
+                            .iter()
+                            .find(|position| position["symbol"] == symbol)
+                    })
+                    .cloned();
                 let (held, side) = if let Some(position) = position {
                     (
                         position["qty"].as_f64().unwrap_or(0.0),
-                        if position["side"] == "short" { "buy" } else { "sell" },
+                        if position["side"] == "short" {
+                            "buy"
+                        } else {
+                            "sell"
+                        },
                     )
                 } else {
                     let (qty, _) = s.ex.spot_basis(&symbol);
@@ -1566,9 +1870,14 @@ impl Engine {
                     let mut pending = Vec::new();
                     for protection in s.pending_protections.drain(..) {
                         if protection.symbol == symbol {
-                            if let Err(error) = s.ex.cancel_order(&protection.entry_order_id, &symbol) {
+                            if let Err(error) =
+                                s.ex.cancel_order(&protection.entry_order_id, &symbol)
+                            {
                                 evs.push(error_json(
-                                    format!("could not cancel pending entry {}: {error}", protection.entry_order_id),
+                                    format!(
+                                        "could not cancel pending entry {}: {error}",
+                                        protection.entry_order_id
+                                    ),
                                     request_id.clone(),
                                 ));
                             }
@@ -1582,7 +1891,9 @@ impl Engine {
                         if active_symbol == symbol {
                             if let Err(error) = s.ex.cancel_order(&active_id, &symbol) {
                                 evs.push(error_json(
-                                    format!("could not cancel protective stop {active_id}: {error}"),
+                                    format!(
+                                        "could not cancel protective stop {active_id}: {error}"
+                                    ),
                                     request_id.clone(),
                                 ));
                             }
@@ -1592,16 +1903,21 @@ impl Engine {
                     }
                     s.active_protections = active;
                     // Cancel any broker-level conditional orders (e.g. TP/SL) for this symbol.
-                    let broker_conditional_ids: Vec<String> = s.ex.broker_mut()
-                        .conditional_orders(Some(&symbol))
-                        .iter()
-                        .map(|c| format!("conditional_{}", c.id))
-                        .collect();
+                    let broker_conditional_ids: Vec<String> =
+                        s.ex.broker_mut()
+                            .conditional_orders(Some(&symbol))
+                            .iter()
+                            .map(|c| format!("conditional_{}", c.id))
+                            .collect();
                     for cond_id in broker_conditional_ids {
                         let _ = s.ex.cancel_order(&cond_id, &symbol);
                     }
                     match s.ex.create_order(
-                        &symbol, "market", side, q, None,
+                        &symbol,
+                        "market",
+                        side,
+                        q,
+                        None,
                         CreateOrderParams::new().reduce_only(true),
                     ) {
                         Ok(order) => {
@@ -1618,13 +1934,23 @@ impl Engine {
                     }
                 }
             }
-            ClientCmd::Replay { action, steps, speed, step_ms, timestamp_ms, request_id } => {
+            ClientCmd::Replay {
+                action,
+                steps,
+                speed,
+                step_ms,
+                timestamp_ms,
+                request_id,
+            } => {
                 let known = matches!(
                     action.as_str(),
                     "play" | "pause" | "step" | "reset" | "set_speed" | "set_step"
                 );
                 if !known {
-                    evs.push(error_json(format!("unknown replay action: {action}"), request_id));
+                    evs.push(error_json(
+                        format!("unknown replay action: {action}"),
+                        request_id,
+                    ));
                 } else {
                     let s = self.session(to);
                     match action.as_str() {
@@ -1723,9 +2049,17 @@ impl Engine {
             if s.nick != nick {
                 continue;
             }
-            let fills = s.ex.fetch_fills(None, None);
+            let local = s.local_account.is_some();
+            let fills = if local {
+                s.local_fills.clone()
+            } else {
+                s.ex.fetch_fills(None, None)
+            };
             let risk = s.risk_usdt;
-            let snap = s.ex.account_snapshot();
+            let snap = s
+                .local_account
+                .clone()
+                .unwrap_or_else(|| s.ex.account_snapshot());
             let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
             let equity = snap["equity"].as_f64().unwrap_or(0.0);
 
@@ -1736,27 +2070,39 @@ impl Engine {
                 mark_prices.insert(sym.to_string(), p["markPrice"].as_f64().unwrap_or(0.0));
             }
 
-            // fetch_fills is newest-first; mirror `timestamp` into `time_ms`
-            // and stamp a chronological `fill_index` (older ⇒ smaller) so the
-            // FIFO replay is deterministic inside one millisecond.
+            // The server exchange returns newest-first, while local sync stores
+            // browser fills oldest-first. Normalize both to chronological order.
             let n = fills.len() as u64;
             let mut fills_with_meta: Vec<Value> = fills
                 .into_iter()
                 .enumerate()
                 .map(|(idx, mut f)| {
                     f["time_ms"] = json!(f["timestamp"].as_i64().unwrap_or(0));
-                    f["fill_index"] = json!(n - idx as u64);
+                    f["fill_index"] = json!(if local {
+                        idx as u64 + 1
+                    } else {
+                        n - idx as u64
+                    });
                     f
                 })
                 .collect();
-            fills_with_meta.reverse(); // chronological (oldest first)
+            if !local {
+                fills_with_meta.reverse();
+            }
 
-            let (trades, positions) =
-                diary::reconstruct_trades(fills_with_meta, risk, mark_prices);
+            let (trades, positions) = diary::reconstruct_trades(fills_with_meta, risk, mark_prices);
 
             // Win/loss aggregates for the stats block.
-            let wins: Vec<f64> = trades.iter().filter(|t| t.pnl > 0.0).map(|t| t.pnl).collect();
-            let losses: Vec<f64> = trades.iter().filter(|t| t.pnl < 0.0).map(|t| t.pnl).collect();
+            let wins: Vec<f64> = trades
+                .iter()
+                .filter(|t| t.pnl > 0.0)
+                .map(|t| t.pnl)
+                .collect();
+            let losses: Vec<f64> = trades
+                .iter()
+                .filter(|t| t.pnl < 0.0)
+                .map(|t| t.pnl)
+                .collect();
             let total_pnl: f64 = trades.iter().map(|t| t.pnl).sum();
 
             result = json!({
@@ -1765,9 +2111,17 @@ impl Engine {
                 "trades": trades.iter().map(|t| {
                     // The protective levels the trader planned for this entry,
                     // so the review can measure the outcome against the plan.
-                    let plan = s.entry_protections.get(&t.entry_order_id);
+                    let plan = if local {
+                        s.local_entry_protections.get(&t.entry_order_id)
+                    } else {
+                        s.entry_protections.get(&t.entry_order_id)
+                    };
                     // Why it ended: the protective level that fired, if one did.
-                    let reason = s.exit_reasons.get(&t.exit_order_id).map(|k| json!(*k));
+                    let reason = if local {
+                        s.local_exit_reasons.get(&t.exit_order_id).map(|kind| json!(kind))
+                    } else {
+                        s.exit_reasons.get(&t.exit_order_id).map(|kind| json!(*kind))
+                    };
                     json!({
                         "symbol": t.symbol,
                         "side": t.side,
@@ -2035,7 +2389,10 @@ impl Engine {
             .sessions
             .values()
             .map(|s| {
-                let snap = s.ex.account_snapshot();
+                let snap = s
+                    .local_account
+                    .clone()
+                    .unwrap_or_else(|| s.ex.account_snapshot());
                 let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
                 let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
                 let equity = snap["equity"].as_f64().unwrap_or(0.0);
@@ -2060,7 +2417,11 @@ impl Engine {
             })
             .collect();
         // Deterministic order: most R first, ties broken by nick.
-        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        rows.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
         let traders: Vec<Value> = rows.into_iter().map(|(_, _, v)| v).collect();
         let _ = reply.send(json!({"type":"traders","traders":traders}));
     }
@@ -2180,7 +2541,9 @@ impl Engine {
         }
         // Mark-to-market changes unrealized PnL on every replay tick.
         let board_dirty = emissions.iter().any(|(id, _)| {
-            self.sessions.get(id).is_some_and(|session| session.in_challenge)
+            self.sessions
+                .get(id)
+                .is_some_and(|session| session.in_challenge)
         });
         for (id, evs) in emissions {
             self.send_all(id, evs);
@@ -2238,7 +2601,11 @@ async fn handle_conn(
     }
     // Tell the client its id so it can filter directed messages.
     let hello = msg(json!({ "type": "welcome", "client_id": client_id }));
-    if sink.send(tokio_tungstenite::tungstenite::Message::Text(hello.into())).await.is_err() {
+    if sink
+        .send(tokio_tungstenite::tungstenite::Message::Text(hello.into()))
+        .await
+        .is_err()
+    {
         return;
     }
     let jobs_tx = jobs.clone();
@@ -2364,7 +2731,13 @@ fn parse_args() -> Args {
             _ => log!("[args] ignoring unknown flag {a}"),
         }
     }
-    Args { port, symbol, timeframe, data_dir, offline }
+    Args {
+        port,
+        symbol,
+        timeframe,
+        data_dir,
+        offline,
+    }
 }
 
 /// One progress line of a warm-up batch (pure data, so the sender stays simple).
@@ -2427,7 +2800,10 @@ fn preload_main(
             }));
             let _ = out.send(event);
         }
-        log!("[preload] #{client_id}: warming {total} series for {}", job.exchange);
+        log!(
+            "[preload] #{client_id}: warming {total} series for {}",
+            job.exchange
+        );
 
         // Phase 1 — candles: this is what the charts need to switch instantly.
         let mut first_result: Option<Result<(), String>> = None;
@@ -2445,21 +2821,39 @@ fn preload_main(
             }
             match outcome {
                 Ok(note) => {
-                    log!("[preload] {} {symbol} {timeframe}: {note}", job.exchange);
+                    log!("[preload] {exchange} {symbol} {timeframe}: {note}");
                     done += 1;
-                    report(&out, PreloadReport {
-                        client_id, done, total, failed,
-                        symbol, timeframe, status: "cached", note,
-                    });
+                    report(
+                        &out,
+                        PreloadReport {
+                            client_id,
+                            done,
+                            total,
+                            failed,
+                            symbol,
+                            timeframe,
+                            status: "cached",
+                            note,
+                        },
+                    );
                 }
                 Err(error) => {
-                    log!("[preload] {} {symbol} {timeframe}: {error}", job.exchange);
+                    log!("[preload] {exchange} {symbol} {timeframe}: {error}");
                     failed += 1;
                     done += 1;
-                    report(&out, PreloadReport {
-                        client_id, done, total, failed,
-                        symbol, timeframe, status: "error", note: error,
-                    });
+                    report(
+                        &out,
+                        PreloadReport {
+                            client_id,
+                            done,
+                            total,
+                            failed,
+                            symbol,
+                            timeframe,
+                            status: "error",
+                            note: error,
+                        },
+                    );
                 }
             }
         }
@@ -2474,28 +2868,54 @@ fn preload_main(
                 if oi_unsupported.contains(symbol) {
                     continue;
                 }
-                let Some(period) = oi_period(timeframe) else { continue };
+                let Some(period) = oi_period(timeframe) else {
+                    continue;
+                };
                 if !oi_grids.insert((symbol.clone(), period.to_string())) {
                     continue; // this grid was already handled in this batch
                 }
-                if oi_cache_hit(&job.exchange, symbol, timeframe, &data_dir) {
+                let exchange = resolved_exchanges
+                    .get(symbol)
+                    .map(String::as_str)
+                    .unwrap_or(&job.exchange);
+                if oi_cache_hit(exchange, symbol, timeframe, &data_dir) {
                     continue; // nothing to fetch
                 }
-                match warm_oi_cache(&job.exchange, symbol, timeframe, &data_dir, allow_net) {
+                match warm_oi_cache(exchange, symbol, timeframe, &data_dir, allow_net) {
                     Ok(note) => {
-                        log!("[preload] {} {symbol} {timeframe}: {note}", job.exchange);
-                        report(&out, PreloadReport {
-                            client_id, done, total, failed,
-                            symbol, timeframe, status: "cached", note,
-                        });
+                        log!("[preload] {exchange} {symbol} {timeframe}: {note}");
+                        report(
+                            &out,
+                            PreloadReport {
+                                client_id,
+                                done,
+                                total,
+                                failed,
+                                symbol,
+                                timeframe,
+                                status: "cached",
+                                note,
+                            },
+                        );
                     }
                     Err(error) => {
-                        log!("[preload] {} {symbol} {timeframe} OI: {error}", job.exchange);
+                        log!(
+                            "[preload] {exchange} {symbol} {timeframe} OI: {error}"
+                        );
                         oi_unsupported.insert(symbol.clone());
-                        report(&out, PreloadReport {
-                            client_id, done, total, failed,
-                            symbol, timeframe, status: "error", note: error,
-                        });
+                        report(
+                            &out,
+                            PreloadReport {
+                                client_id,
+                                done,
+                                total,
+                                failed,
+                                symbol,
+                                timeframe,
+                                status: "error",
+                                note: error,
+                            },
+                        );
                     }
                 }
             }
@@ -2661,7 +3081,9 @@ async fn main() {
             )
         })
         .expect("spawn engine thread");
-    let listener = TcpListener::bind(("127.0.0.1", port)).await.expect("bind ws port");
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind ws port");
     log!("[ws] simccxt-server listening on ws://127.0.0.1:{port}/");
     let http_port = port + 1;
     // The diary HTTP API is optional: if `ws_port + 1` is taken (another
@@ -2702,7 +3124,13 @@ async fn main() {
         };
         let id = next_id;
         next_id += 1;
-        tokio::spawn(handle_conn(stream, addr, id, jobs_tx.clone(), out_tx.clone()));
+        tokio::spawn(handle_conn(
+            stream,
+            addr,
+            id,
+            jobs_tx.clone(),
+            out_tx.clone(),
+        ));
     }
 }
 
@@ -2766,7 +3194,10 @@ fn route_request(method: &str, target: &str) -> HttpRoute {
             return HttpRoute::NotFound;
         }
         let num = |key: &str| -> i64 {
-            params.get(key).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)
+            params
+                .get(key)
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
         };
         return HttpRoute::Candles {
             exchange: exchange_or_default(params.get("exchange").map(|v| v.as_str())),
@@ -2828,7 +3259,10 @@ async fn read_request_head(stream: &mut tokio::net::TcpStream) -> Option<String>
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-async fn handle_http_request(mut stream: tokio::net::TcpStream, jobs_tx: std::sync::mpsc::Sender<EngineJob>) {
+async fn handle_http_request(
+    mut stream: tokio::net::TcpStream,
+    jobs_tx: std::sync::mpsc::Sender<EngineJob>,
+) {
     use tokio::io::AsyncWriteExt;
 
     let head = match read_request_head(&mut stream).await {
@@ -2844,11 +3278,12 @@ async fn handle_http_request(mut stream: tokio::net::TcpStream, jobs_tx: std::sy
     // engine may be busy warming caches).
     async fn ask(
         jobs_tx: &std::sync::mpsc::Sender<EngineJob>,
+        timeout: std::time::Duration,
         make: impl FnOnce(oneshot::Sender<Value>) -> EngineJob,
     ) -> Result<Value, ()> {
         let (tx, rx) = oneshot::channel::<Value>();
         jobs_tx.send(make(tx)).map_err(|_| ())?;
-        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(v)) => Ok(v),
             _ => Err(()),
         }
@@ -2859,30 +3294,57 @@ async fn handle_http_request(mut stream: tokio::net::TcpStream, jobs_tx: std::sy
     let json_reply = |v: &Value| -> String {
         let status = if v.get("error").is_some() { 404 } else { 200 };
         let reason = if status == 404 { "Not Found" } else { "OK" };
-        http_response(status, reason, &serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+        http_response(
+            status,
+            reason,
+            &serde_json::to_string(v).unwrap_or_else(|_| "{}".into()),
+        )
     };
 
     let response = match route_request(method, target) {
         HttpRoute::Options => http_response(204, "No Content", ""),
-        HttpRoute::Traders => match ask(&jobs_tx, |reply| EngineJob::Traders { reply }).await {
+        HttpRoute::Traders => match ask(
+            &jobs_tx,
+            std::time::Duration::from_secs(10),
+            |reply| EngineJob::Traders { reply },
+        )
+        .await
+        {
             Ok(v) => json_reply(&v),
             Err(()) => http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}"),
         },
         HttpRoute::Trader(nick) => {
-            match ask(&jobs_tx, |reply| EngineJob::Diary { nick, reply }).await {
+            match ask(
+                &jobs_tx,
+                std::time::Duration::from_secs(10),
+                |reply| EngineJob::Diary { nick, reply },
+            )
+            .await
+            {
                 Ok(v) => json_reply(&v),
                 Err(()) => http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}"),
             }
         }
-        HttpRoute::Candles { exchange, symbol, timeframe, start_ms, end_ms } => {
-            match ask(&jobs_tx, |reply| EngineJob::Candles {
-                exchange,
-                symbol,
-                timeframe,
-                start_ms,
-                end_ms,
-                reply,
-            })
+        HttpRoute::Candles {
+            exchange,
+            symbol,
+            timeframe,
+            start_ms,
+            end_ms,
+        } => {
+            // Cold exchange history may require many paginated CCXT requests.
+            match ask(
+                &jobs_tx,
+                std::time::Duration::from_secs(180),
+                |reply| EngineJob::Candles {
+                    exchange,
+                    symbol,
+                    timeframe,
+                    start_ms,
+                    end_ms,
+                    reply,
+                },
+            )
             .await
             {
                 Ok(v) => json_reply(&v),
@@ -2890,9 +3352,11 @@ async fn handle_http_request(mut stream: tokio::net::TcpStream, jobs_tx: std::sy
             }
         }
         HttpRoute::NotFound => http_response(404, "Not Found", "{\"error\":\"not found\"}"),
-        HttpRoute::MethodNotAllowed => {
-            http_response(405, "Method Not Allowed", "{\"error\":\"method not allowed\"}")
-        }
+        HttpRoute::MethodNotAllowed => http_response(
+            405,
+            "Method Not Allowed",
+            "{\"error\":\"method not allowed\"}",
+        ),
     };
     let _ = stream.write_all(response.as_bytes()).await;
 }
@@ -2948,7 +3412,13 @@ mod tests {
         )
         .unwrap();
         match cmd {
-            ClientCmd::PlaceOrder { symbol, side, quantity, price, .. } => {
+            ClientCmd::PlaceOrder {
+                symbol,
+                side,
+                quantity,
+                price,
+                ..
+            } => {
                 assert_eq!(symbol, "BTC/USDT");
                 assert_eq!(side, "buy");
                 assert_eq!(quantity, 0.1);
@@ -2973,7 +3443,11 @@ mod tests {
 
     #[test]
     fn preload_plan_dedupes_and_validates() {
-        let symbols = vec!["btc/usdt".to_string(), "ETH/USDT".to_string(), "bogus".to_string()];
+        let symbols = vec![
+            "btc/usdt".to_string(),
+            "ETH/USDT".to_string(),
+            "bogus".to_string(),
+        ];
         let timeframes = vec![
             "5m".to_string(),
             "1m".to_string(),
@@ -2987,10 +3461,10 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                ("BTC/USDT".to_string(), "5m".to_string()),
-                ("BTC/USDT".to_string(), "1m".to_string()),
                 ("ETH/USDT".to_string(), "5m".to_string()),
                 ("ETH/USDT".to_string(), "1m".to_string()),
+                ("BTC/USDT".to_string(), "5m".to_string()),
+                ("BTC/USDT".to_string(), "1m".to_string()),
             ]
         );
     }
@@ -2998,8 +3472,13 @@ mod tests {
     #[test]
     fn preload_plan_is_capped() {
         let symbols = (0..40).map(|i| format!("C{i}/USDT")).collect::<Vec<_>>();
-        let timeframes = PRELOAD_TIMEFRAMES.iter().map(|tf| tf.to_string()).collect::<Vec<_>>();
-        assert!(preload_plan(&symbols, &timeframes).len() <= PRELOAD_MAX_PAIRS);
+        let timeframes = PRELOAD_TIMEFRAMES
+            .iter()
+            .map(|tf| tf.to_string())
+            .collect::<Vec<_>>();
+        let plan = preload_plan(&symbols, &timeframes);
+        assert!(plan.len() <= PRELOAD_MAX_PAIRS);
+        assert_eq!(plan.first().map(|pair| pair.0.as_str()), Some("C39/USDT"));
     }
 
     #[test]
@@ -3010,7 +3489,14 @@ mod tests {
         )
         .expect("preload parses");
         match cmd {
-            ClientCmd::Preload { symbols, timeframes, exchange, start_ms, end_ms, .. } => {
+            ClientCmd::Preload {
+                symbols,
+                timeframes,
+                exchange,
+                start_ms,
+                end_ms,
+                ..
+            } => {
                 assert_eq!(symbols, vec!["BTC/USDT".to_string()]);
                 assert_eq!(timeframes, vec!["1h".to_string(), "1d".to_string()]);
                 assert_eq!(exchange, "bybit");
@@ -3022,6 +3508,23 @@ mod tests {
     }
 
     #[test]
+    fn client_cmd_market_lookup_parses() {
+        let cmd: ClientCmd = serde_json::from_str(
+            r#"{"type":"market_lookup","symbols":["BR/USDT"],"exchange":"binance"}"#,
+        )
+        .expect("market lookup parses");
+        match cmd {
+            ClientCmd::MarketLookup {
+                symbols, exchange, ..
+            } => {
+                assert_eq!(symbols, vec!["BR/USDT"]);
+                assert_eq!(exchange, "binance");
+            }
+            other => panic!("expected market lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn client_cmd_subscribe_parses_replay_window() {
         let cmd: ClientCmd = serde_json::from_str(
             r#"{"type":"subscribe","symbol":"BTC/USDT","timeframe":"5m",
@@ -3029,12 +3532,48 @@ mod tests {
         )
         .unwrap();
         match cmd {
-            ClientCmd::Subscribe { start_ms, reveal_start_ms, end_ms, .. } => {
+            ClientCmd::Subscribe {
+                start_ms,
+                reveal_start_ms,
+                end_ms,
+                ..
+            } => {
                 assert_eq!(start_ms, Some(1000));
                 assert_eq!(reveal_start_ms, Some(2000));
                 assert_eq!(end_ms, Some(3000));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_cmd_local_sync_parses_browser_state() {
+        let cmd: ClientCmd = serde_json::from_str(
+            r#"{"type":"local_sync","account":{"equity":1000,"pnl":{"realized":4,"unrealized":2}},
+                "fills":[{"id":"o1_0","orderId":"o1","timestamp":1000}],
+                "replace_fills":true,"entry_protections":{},"exit_reasons":{},
+                "symbol":"BTC/USDT","timeframe":"1m","exchange":"bybit",
+                "range":{"start_ms":0,"reveal_start_ms":1000,"end_ms":2000}}"#,
+        )
+        .expect("local sync parses");
+        match cmd {
+            ClientCmd::LocalSync {
+                account,
+                fills,
+                replace_fills,
+                symbol,
+                exchange,
+                range,
+                ..
+            } => {
+                assert_eq!(account["equity"], 1000);
+                assert_eq!(fills.len(), 1);
+                assert!(replace_fills);
+                assert_eq!(symbol, "BTC/USDT");
+                assert_eq!(exchange, "bybit");
+                assert_eq!(range["reveal_start_ms"], 1000);
+            }
+            other => panic!("expected local sync, got {other:?}"),
         }
     }
 
@@ -3089,11 +3628,19 @@ mod tests {
     }
 
     fn login_cmd(name: &str) -> ClientCmd {
-        ClientCmd::Login { name: name.into(), request_id: None }
+        ClientCmd::Login {
+            name: name.into(),
+            request_id: None,
+        }
     }
 
     fn challenge_cmd(join: bool, risk: Option<f64>) -> ClientCmd {
-        ClientCmd::Challenge { join, risk_usdt: risk, capital_usdt: Some(1000.0), request_id: None }
+        ClientCmd::Challenge {
+            join,
+            risk_usdt: risk,
+            capital_usdt: Some(1000.0),
+            request_id: None,
+        }
     }
 
     /// Drain the bus, returning only challenge_board messages.
@@ -3164,8 +3711,13 @@ mod tests {
         eng.handle_command(1, replay_cmd("reset"), data);
 
         let snapshot = last_snapshot(&mut rx).expect("reset must send a snapshot");
-        let bars = snapshot["candles"].as_array().expect("snapshot has candles");
-        assert!(!bars.is_empty(), "reset must leave the revealed history on screen: {snapshot}");
+        let bars = snapshot["candles"]
+            .as_array()
+            .expect("snapshot has candles");
+        assert!(
+            !bars.is_empty(),
+            "reset must leave the revealed history on screen: {snapshot}"
+        );
         // Candle rows are JSON numbers parsed from f64, so read them as f64.
         let first = bars[0][0].as_f64().expect("bar timestamp") as i64;
         let last = bars[bars.len() - 1][0].as_f64().expect("bar timestamp") as i64;
@@ -3213,15 +3765,15 @@ mod tests {
         // be fed by the requested grid alone and the regression would hide.
         assert!(
             clock < now - 48 * hour,
-            "setup: the reveal point ({clock}) must precede the 5m rows ({})", now - 24 * hour
+            "setup: the reveal point ({clock}) must precede the 5m rows ({})",
+            now - 24 * hour
         );
         let window = s.range_start_ms..=s.range_end_ms;
-        let revealed: Vec<i64> = s
-            .oi
-            .iter()
-            .map(|(oi_ts, _)| *oi_ts)
-            .filter(|oi_ts| *oi_ts <= clock)
-            .collect();
+        let revealed: Vec<i64> =
+            s.oi.iter()
+                .map(|(oi_ts, _)| *oi_ts)
+                .filter(|oi_ts| *oi_ts <= clock)
+                .collect();
         assert!(
             !revealed.is_empty(),
             "the pane needs at least one sample the clock has passed (clock {clock}, {} rows)",
@@ -3375,7 +3927,10 @@ mod tests {
         let same_window = new_window.0 == Some(session.range_start_ms)
             && new_window.1 == Some(session.reveal_start_ms)
             && new_window.2 == Some(session.range_end_ms);
-        assert!(!same_window, "a new date range must count as a window change");
+        assert!(
+            !same_window,
+            "a new date range must count as a window change"
+        );
     }
 
     #[test]
@@ -3451,6 +4006,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: None,
+                risk_usdt: None,
                 tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
@@ -3463,11 +4019,17 @@ mod tests {
         let a1 = eng.sessions[&1].ex.account_snapshot();
         let a2 = eng.sessions[&2].ex.account_snapshot();
         assert!(
-            !a1["positions"].as_array().map(|p| p.is_empty()).unwrap_or(true),
+            !a1["positions"]
+                .as_array()
+                .map(|p| p.is_empty())
+                .unwrap_or(true),
             "session 1 should hold a position after the market buy"
         );
         assert!(
-            a2["positions"].as_array().map(|p| p.is_empty()).unwrap_or(false),
+            a2["positions"]
+                .as_array()
+                .map(|p| p.is_empty())
+                .unwrap_or(false),
             "session 2 must not see session 1's position"
         );
         let equity2 = a2["equity"].as_f64().expect("equity");
@@ -3492,7 +4054,10 @@ mod tests {
             },
             data,
         );
-        let entry = eng.sessions[&client_id].ex.last_price_for("BTC/USDT").unwrap();
+        let entry = eng.sessions[&client_id]
+            .ex
+            .last_price_for("BTC/USDT")
+            .unwrap();
         eng.handle_command(
             client_id,
             ClientCmd::PlaceOrder {
@@ -3503,6 +4068,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: Some(entry * 0.99),
+                risk_usdt: None,
                 tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
@@ -3522,7 +4088,11 @@ mod tests {
         let entry = place_protected_market_entry(&mut eng, 9, data);
         let s = eng.sessions.get_mut(&9).unwrap();
         let orders = s.ex.fetch_open_orders(Some("BTC/USDT"));
-        assert_eq!(orders.len(), 1, "the filled entry should have one protective stop");
+        assert_eq!(
+            orders.len(),
+            1,
+            "the filled entry should have one protective stop"
+        );
         assert_eq!(orders[0]["type"], "stop");
         assert_eq!(orders[0]["side"], "sell");
         assert_eq!(orders[0]["reduceOnly"], true);
@@ -3532,19 +4102,15 @@ mod tests {
         let timestamp = s.ex.now() + chrono::Duration::minutes(1);
         s.ex.apply_candle(
             &simccxt_core::Symbol::parse("BTC/USDT").unwrap(),
-            &simccxt_core::OHLCV::new(
-                timestamp,
-                entry,
-                entry * 1.01,
-                stop * 0.99,
-                entry,
-                10.0,
-            ),
+            &simccxt_core::OHLCV::new(timestamp, entry, entry * 1.01, stop * 0.99, entry, 10.0),
         );
         let events = fresh_fill_events(s);
         assert!(events.iter().any(|event| event["type"] == "trade"));
         assert!(s.ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
-        assert!(s.ex.account_snapshot()["positions"].as_array().unwrap().is_empty());
+        assert!(s.ex.account_snapshot()["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3567,6 +4133,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: Some(stop),
+                risk_usdt: None,
                 tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
@@ -3591,10 +4158,13 @@ mod tests {
             &simccxt_core::OHLCV::new(timestamp, entry, stop * 1.01, entry * 0.99, entry, 10.0),
         );
         let events = fresh_fill_events(session);
-        assert!(events.iter().any(|event| {
-            event["type"] == "trade" && event["fill"]["side"] == "buy"
-        }));
-        assert!(session.ex.account_snapshot()["positions"].as_array().unwrap().is_empty());
+        assert!(events
+            .iter()
+            .any(|event| { event["type"] == "trade" && event["fill"]["side"] == "buy" }));
+        assert!(session.ex.account_snapshot()["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert!(session.ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
     }
 
@@ -3604,7 +4174,13 @@ mod tests {
         let mut eng = Engine::new(tx);
         let data = test_data_dir();
         place_protected_market_entry(&mut eng, 10, data);
-        assert_eq!(eng.sessions[&10].ex.fetch_open_orders(Some("BTC/USDT")).len(), 1);
+        assert_eq!(
+            eng.sessions[&10]
+                .ex
+                .fetch_open_orders(Some("BTC/USDT"))
+                .len(),
+            1
+        );
         eng.handle_command(
             10,
             ClientCmd::ClosePosition {
@@ -3616,7 +4192,10 @@ mod tests {
         );
         let session = &eng.sessions[&10];
         assert!(session.ex.fetch_open_orders(Some("BTC/USDT")).is_empty());
-        assert!(session.ex.account_snapshot()["positions"].as_array().unwrap().is_empty());
+        assert!(session.ex.account_snapshot()["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3640,6 +4219,7 @@ mod tests {
                 price: Some(entry),
                 stop_price: None,
                 stop_loss_price: Some(stop),
+                risk_usdt: None,
                 tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
@@ -3649,7 +4229,11 @@ mod tests {
             data,
         );
         let waiting = eng.sessions[&11].ex.fetch_open_orders(Some("BTC/USDT"));
-        assert_eq!(waiting.len(), 1, "only the resting entry limit should be open");
+        assert_eq!(
+            waiting.len(),
+            1,
+            "only the resting entry limit should be open"
+        );
         assert_eq!(waiting[0]["type"], "limit");
         assert_eq!(waiting[0]["triggerPrice"], Value::Null);
         assert_eq!(eng.sessions[&11].pending_protections.len(), 1);
@@ -3664,7 +4248,11 @@ mod tests {
         let events = fresh_fill_events(session);
         assert!(events.iter().any(|event| event["type"] == "trade"));
         let orders = session.ex.fetch_open_orders(Some("BTC/USDT"));
-        assert_eq!(orders.len(), 1, "the stop should be created after the limit fills");
+        assert_eq!(
+            orders.len(),
+            1,
+            "the stop should be created after the limit fills"
+        );
         assert_eq!(orders[0]["triggerPrice"], stop);
     }
 
@@ -3689,6 +4277,7 @@ mod tests {
                 price: None,
                 stop_price: Some(trigger),
                 stop_loss_price: Some(stop),
+                risk_usdt: None,
                 tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
@@ -3720,10 +4309,16 @@ mod tests {
         let data = test_data_dir();
 
         eng.handle_command(7, subscribe_cmd("BTC/USDT", "1m"), data);
-        assert!(eng.sessions.contains_key(&7), "first subscribe creates the session");
+        assert!(
+            eng.sessions.contains_key(&7),
+            "first subscribe creates the session"
+        );
 
         eng.handle_job(EngineJob::Disconnect { client_id: 7 }, data);
-        assert!(!eng.sessions.contains_key(&7), "disconnect must free the session");
+        assert!(
+            !eng.sessions.contains_key(&7),
+            "disconnect must free the session"
+        );
     }
 
     #[test]
@@ -3815,7 +4410,10 @@ mod tests {
         assert_eq!(clean_nick(""), None);
         assert_eq!(clean_nick("   "), None);
         assert_eq!(clean_nick(&"x".repeat(25)), None);
-        assert_eq!(clean_nick(&"y".repeat(24)).map(|s| s.chars().count()), Some(24));
+        assert_eq!(
+            clean_nick(&"y".repeat(24)).map(|s| s.chars().count()),
+            Some(24)
+        );
         assert_eq!(clean_nick("a\nb"), None);
         assert_eq!(r_of(20.0, 10.0), Some(2.0));
         assert_eq!(r_of(0.0, 10.0), Some(0.0));
@@ -3847,7 +4445,10 @@ mod tests {
         eng.handle_command(1, login_cmd("Тестер"), data);
         assert_eq!(eng.sessions[&1].nick, "Тестер");
         eng.handle_command(1, login_cmd(""), data);
-        assert_eq!(eng.sessions[&1].nick, "Тестер", "empty login keeps the nick");
+        assert_eq!(
+            eng.sessions[&1].nick, "Тестер",
+            "empty login keeps the nick"
+        );
         eng.handle_command(1, login_cmd(&"z".repeat(30)), data);
         assert_eq!(eng.sessions[&1].nick, "Тестер", "oversize nick rejected");
     }
@@ -3884,7 +4485,10 @@ mod tests {
         assert_eq!(boards.len(), 1);
         assert!(boards[0]["board"].as_array().unwrap().is_empty());
         eng.handle_command(1, challenge_cmd(true, Some(20.0)), data);
-        assert!(!eng.sessions[&1].in_challenge, "risk cannot be changed after a round starts");
+        assert!(
+            !eng.sessions[&1].in_challenge,
+            "risk cannot be changed after a round starts"
+        );
         assert_eq!(eng.sessions[&1].risk_usdt, 10.0);
     }
 
@@ -3922,6 +4526,7 @@ mod tests {
                 price: None,
                 stop_price: None,
                 stop_loss_price: None,
+                risk_usdt: None,
                 tp_price: None,
                 time_in_force: "GTC".into(),
                 post_only: false,
@@ -4026,8 +4631,14 @@ mod tests {
         assert_eq!(route_request("GET", "/"), HttpRoute::NotFound);
         assert_eq!(route_request("GET", "/api"), HttpRoute::NotFound);
         assert_eq!(route_request("GET", "/api/trader/"), HttpRoute::NotFound);
-        assert_eq!(route_request("POST", "/api/traders"), HttpRoute::MethodNotAllowed);
-        assert_eq!(route_request("DELETE", "/api/trader/x"), HttpRoute::MethodNotAllowed);
+        assert_eq!(
+            route_request("POST", "/api/traders"),
+            HttpRoute::MethodNotAllowed
+        );
+        assert_eq!(
+            route_request("DELETE", "/api/trader/x"),
+            HttpRoute::MethodNotAllowed
+        );
         assert_eq!(route_request("OPTIONS", "/api/traders"), HttpRoute::Options);
     }
 
@@ -4040,8 +4651,8 @@ mod tests {
         // Truncated / invalid hex is left as-is (no panic, no garbage).
         assert_eq!(percent_decode("%zz"), "%zz");
         assert_eq!(percent_decode("%D"), "%D"); // truncated: needs 2 hex digits
-        // "%D0" IS valid hex → one byte 0xD0, but that byte alone is not a
-        // complete UTF-8 char, so lossy conversion yields U+FFFD (no panic).
+                                                // "%D0" IS valid hex → one byte 0xD0, but that byte alone is not a
+                                                // complete UTF-8 char, so lossy conversion yields U+FFFD (no panic).
         assert_eq!(percent_decode("%D0"), "\u{fffd}");
         // Raw UTF-8 input passes through untouched.
         assert_eq!(percent_decode("Тихий-Медведь-3"), "Тихий-Медведь-3");
@@ -4052,13 +4663,19 @@ mod tests {
     #[test]
     fn http_response_is_a_well_formed_json_reply() {
         let resp = http_response(200, "OK", "{\"a\":1}");
-        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "version required: {resp:?}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "version required: {resp:?}"
+        );
         assert!(resp.contains("Content-Type: application/json; charset=utf-8\r\n"));
         assert!(resp.contains("Content-Length: 7\r\n"), "body bytes = 7");
         assert!(resp.contains("Access-Control-Allow-Origin: *\r\n"));
         // Headers strictly before body: split on the blank line.
         let (head, body) = resp.split_once("\r\n\r\n").expect("head/body separator");
-        assert!(head.ends_with("Connection: close"), "last header before body");
+        assert!(
+            head.ends_with("Connection: close"),
+            "last header before body"
+        );
         assert_eq!(body, "{\"a\":1}");
         // Content-Length must equal actual body byte length (Cyrillic = 2 bytes/char).
         let cyr = http_response(404, "Not Found", "{\"error\":\"Бык\"}");

@@ -5,3 +5,4 @@
 # frontend deps and build output (bun install / npm install recreates these)
 /frontend/node_modules/
 /frontend/dist/
+/frontend/public/simccxt_wasm.wasm

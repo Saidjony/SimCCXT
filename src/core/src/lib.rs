@@ -43,6 +43,11 @@ pub struct TimeConfig {
 
 impl Default for Config {
     fn default() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let initial_time = Utc::now();
+        #[cfg(target_arch = "wasm32")]
+        let initial_time =
+            DateTime::<Utc>::from_timestamp_millis(0).expect("the Unix epoch is a valid timestamp");
         Self {
             default_seed: 42,
             default_leverage: 1.0,
@@ -54,7 +59,7 @@ impl Default for Config {
                 funding: 0.0001,
             },
             time_config: TimeConfig {
-                initial_time: Utc::now(),
+                initial_time,
                 step_ms: 1000,
                 paused: false,
             },

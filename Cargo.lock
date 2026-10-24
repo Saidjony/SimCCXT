@@ -1731,7 +1731,6 @@ dependencies = [
  "chrono",
  "serde",
  "simccxt-core",
- "tokio",
 ]
 
 [[package]]
@@ -1742,7 +1741,6 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -1841,7 +1839,17 @@ dependencies = [
  "simccxt-clock",
  "simccxt-core",
  "simccxt-market",
- "tokio",
+]
+
+[[package]]
+name = "simccxt-wasm"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "simccxt-broker",
+ "simccxt-core",
+ "simccxt-exchange",
 ]
 
 [[package]]

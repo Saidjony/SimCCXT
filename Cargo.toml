@@ -11,6 +11,7 @@ members = [
     "src/order-engine",
     "src/portfolio",
     "src/wallet",
+    "src/wasm",
     "src/server"
 ]
 

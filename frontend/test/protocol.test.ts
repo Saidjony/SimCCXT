@@ -100,6 +100,19 @@ describe("parseServerMessage", () => {
       assert.equal(done.failed, 0);
     }
   });
+
+  it("accepts market quotes with their source exchange", () => {
+    const message = parseServerMessage(
+      '{"type":"market_lookup","to":7,"quotes":[{"symbol":"BR/USDT","exchange":"bybit","last":0.1234}],"failures":[]}',
+    );
+    if (message?.type === "market_lookup") {
+      assert.equal(message.quotes[0]?.symbol, "BR/USDT");
+      assert.equal(message.quotes[0]?.exchange, "bybit");
+      assert.equal(message.quotes[0]?.last, 0.1234);
+    } else {
+      assert.fail("expected market_lookup");
+    }
+  });
 });
 
 describe("applyCandleDelta", () => {

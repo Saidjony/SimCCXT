@@ -81,10 +81,8 @@ export function classifyExit(
   open = false,
 ): ExitKind {
   if (open) return "open";
-  // The server knows which protective order fired — trust it. A stop is a
-  // MARKET order, so on a wide bar it can fill far past its trigger (replay
-  // measured: trigger 79519, fill 79233) and price proximity alone would
-  // misreport that stop-out as a manual exit.
+  // The server knows which protective order fired — trust it; executions can
+  // predate the current replay rule that caps stop-loss fills at their trigger.
   if (trade.exit_reason === "stop") return "stop";
   if (trade.exit_reason === "take") return "target";
   if (trade.exit_reason) return "manual";
@@ -210,8 +208,8 @@ export function buildReview(
     if (kind === "manual" && typeof level.stop === "number") {
       flags.push("закрыл до стопа: правило не выдержано");
     }
-    // A protective stop is a market order: on a wide bar it fills past its
-    // trigger. Worth saying out loud — that gap is the real cost of the stop.
+    // Keep the diagnostic for legacy sessions created before stop fills were
+    // capped at their trigger; current replay stop fills should match the level.
     if (kind === "stop" && typeof level.stop === "number" && trade.entry_price > 0) {
       const slipPct = ((trade.exit_price - level.stop) / trade.entry_price) * 100;
       if (Math.abs(slipPct) > 0.1) {

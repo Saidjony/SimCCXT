@@ -28,7 +28,7 @@ export function OrderPanel(): JSX.Element {
   const initialCapitalUsdt = useSim((s) => s.initialCapitalUsdt);
   const fixedRiskUsdt = useSim((s) => s.fixedRiskUsdt);
   const feeRates = useSim((s) => s.feeRates);
-  // A stop is executed as a market order, so budget the taker rate.
+  // Stop-loss and market executions both use the venue taker rate.
   const taker = feeRates?.taker ?? 0;
   const inChallenge = useSim((s) => s.inChallenge);
   const base = symbol.split("/")[0] ?? "";
@@ -79,6 +79,10 @@ export function OrderPanel(): JSX.Element {
     const qty = calcQty(fixedRiskUsdt, entry, sl, taker);
     if (qty === null) return;
     msg.quantity = qty;
+    // The engine may execute at a later price than this preview (the replay
+    // advanced between render and command). It re-sizes from the actual fill
+    // and this budget, so a stop-out stays at -1R instead of -1.5R.
+    msg.risk_usdt = fixedRiskUsdt;
     msg.stop_loss_price = sl;
     const tpVal = num(tp);
     if (tpVal !== null) msg.tp_price = tpVal;

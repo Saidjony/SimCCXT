@@ -124,8 +124,7 @@ export interface DiaryTrade {
   stop_price?: number | null;
   take_price?: number | null;
   /** Which protective order closed the trade (`"stop"` / `"take"`), or null for
-   *  a manual exit. The server knows this from the fill; price proximity does
-   *  not — a stop is a market order and can fill far past its trigger. */
+   *  a manual exit. The server knows this from the fill, independently of price. */
   exit_reason?: "stop" | "take" | null;
   entry_order_id: string;
   exit_order_id: string;
@@ -252,6 +251,9 @@ export type ClientMessage =
       stop_price?: number | null;
       stop_loss_price?: number | null;
       tp_price?: number | null;
+      /** Fixed risk budget. When present with a stop, the engine sizes at the
+       *  actual fill price so a stop-out costs this amount, not more. */
+      risk_usdt?: number;
       time_in_force?: string;
       post_only?: boolean;
       reduce_only?: boolean;
@@ -259,6 +261,18 @@ export type ClientMessage =
     }
   | { type: "cancel_order"; order_id: string; symbol: string; request_id?: string }
   | { type: "close_position"; symbol: string; quantity?: number | null; request_id?: string }
+  | {
+      type: "local_sync";
+      account: AccountSnapshot;
+      fills: FillLine[];
+      replace_fills?: boolean;
+      entry_protections: Record<string, Record<string, unknown>>;
+      exit_reasons: Record<string, string>;
+      symbol: string;
+      timeframe: string;
+      exchange: ExchangeId;
+      range: ReplayWindow;
+    }
   // Visual context of this session (annotations + enabled criteria) published
   // to the server so the read-only diary API can surface them.
   | {
@@ -280,8 +294,8 @@ export type ClientMessage =
   | { type: "attach"; token: string; request_id?: string }
   | { type: "challenge"; join: boolean; risk_usdt?: number; capital_usdt?: number; request_id?: string }
   /**
-   * Background warm-up of the Rust disk caches for watchlist x timeframes, so
-   * switching a coin or a timeframe later resolves from disk instead of
+   * Background warm-up of the Rust memory/disk caches for watchlist x timeframes, so
+   * switching a coin or a timeframe later resolves from cache instead of
    * waiting for a download. Touches no session state; the answer is
    * `preload_progress` events plus one `preload_done`.
    */
@@ -292,6 +306,12 @@ export type ClientMessage =
       exchange?: ExchangeId;
       start_ms?: number;
       end_ms?: number;
+      request_id?: string;
+    }
+  | {
+      type: "market_lookup";
+      symbols: string[];
+      exchange?: ExchangeId;
       request_id?: string;
     }
   | { type: "ping" };
@@ -363,6 +383,13 @@ export type ServerMessage =
       note: string;
     }
   | { type: "preload_done"; to?: number; done: number; total: number; failed: number }
+  | {
+      type: "market_lookup";
+      to?: number;
+      quotes: Array<{ symbol: string; exchange: ExchangeId; last: number }>;
+      failures: Array<{ symbol: string; error: string }>;
+      request_id?: string;
+    }
   | { type: "error"; to?: number; message: string; request_id?: string }
   | { type: "pong"; to?: number };
 
@@ -398,6 +425,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "challenge_board":
     case "preload_progress":
     case "preload_done":
+    case "market_lookup":
     case "error":
     case "pong":
       return v as ServerMessage;

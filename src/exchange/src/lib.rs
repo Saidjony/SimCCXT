@@ -521,6 +521,12 @@ impl Exchange {
             .collect()
     }
 
+    /// Number of fills in the account's execution log without materializing
+    /// the CCXT-shaped rows returned by `fetch_fills`.
+    pub fn fill_count(&self) -> usize {
+        self.broker.fill_count()
+    }
+
     /// Total account equity: quote free + marked-to-market positions + spot value.
     pub fn equity(&self) -> f64 {
         let mut eq = 0.0;
@@ -612,13 +618,27 @@ impl Exchange {
     /// stored data exactly like a live exchange feed, but sourced from local
     /// memory/disk instead of the internet.
     pub fn fetch_ohlcv_live(&self, symbol: &str, timeframe: &str) -> Vec<Vec<f64>> {
+        self.fetch_ohlcv_live_from(symbol, timeframe, 0)
+    }
+
+    /// Return live candles from `start_index` onward without materializing
+    /// the already-delivered prefix. Candle series are chronological, so the
+    /// visible end can be found with a binary search.
+    pub fn fetch_ohlcv_live_from(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        start_index: usize,
+    ) -> Vec<Vec<f64>> {
         let now = self.clock.now();
         self.candles
             .get(&(symbol.to_string(), timeframe.to_string()))
             .map(|candles| {
+                let end = candles.partition_point(|c| c.timestamp <= now);
                 candles
+                    .get(start_index.min(end)..end)
+                    .unwrap_or_default()
                     .iter()
-                    .filter(|c| c.timestamp <= now)
                     .map(|c| {
                         vec![
                             c.timestamp.timestamp_millis() as f64,
@@ -1305,6 +1325,7 @@ mod tests {
         ex.create_order("BTC/USDT", "market", "buy", 1.0, None, CreateOrderParams::new())
             .unwrap();
         let first_before = ex.fetch_fills(None, None);
+        assert_eq!(ex.fill_count(), first_before.len());
         let original_id = first_before[0]["id"].clone();
         let order_id = first_before[0]["orderId"].clone();
         let timestamp = ex.now();
@@ -1411,6 +1432,28 @@ mod tests {
         ex.step(); // now = 3000
         assert_eq!(ex.fetch_ohlcv_live("BTC/USDT", "1s").len(), 3);
         assert!(ex.replay_done("BTC/USDT", "1s"));
+    }
+
+    #[test]
+    fn test_live_candle_cursor_and_counts() {
+        let mut ex = Exchange::default();
+        ex.set_step_ms(1_000);
+        ex.load_candles(
+            "BTC/USDT",
+            "1s",
+            vec![
+                candle(1_000, 100.0),
+                candle(2_000, 101.0),
+                candle(3_000, 102.0),
+            ],
+        );
+        ex.reset(DateTime::from_timestamp_millis(2_000).unwrap());
+
+        assert_eq!(ex.ohlcv_counts("BTC/USDT", "1s"), (2, 3));
+        let all = ex.fetch_ohlcv_live("BTC/USDT", "1s");
+        let remainder = ex.fetch_ohlcv_live_from("BTC/USDT", "1s", 1);
+        assert_eq!(remainder, all[1..]);
+        assert!(ex.fetch_ohlcv_live_from("BTC/USDT", "1s", usize::MAX).is_empty());
     }
 
     #[test]

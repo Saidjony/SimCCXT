@@ -137,6 +137,7 @@ export function Trades(): JSX.Element {
   return (
     <div>
       <h4>Trades</h4>
+      <div className="lbl">Последние 500 исполнений сохраняются в этом браузере; счёт и позиции не восстанавливаются после разрыва сессии.</div>
       {fills.length === 0 && <div className="lbl">no fills yet</div>}
       {fills.length > 0 && (
         <table className="grid-table">

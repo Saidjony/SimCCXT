@@ -9,4 +9,4 @@ license = "MIT"
 [dependencies]
 simccxt-core = { path = "../core" }
 serde = { version = "1.0", features = ["derive"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }

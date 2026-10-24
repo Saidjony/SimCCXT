@@ -1,7 +1,15 @@
 import { useEffect } from "react";
 import type { ServerMessage } from "../types/protocol";
-import { getConnection, sendSim, subscribeSim } from "./connection";
+import { getConnection, sendServer, sendSim, subscribeSim } from "./connection";
 import { getState, store } from "../state/store";
+import { apiUrl } from "./connection";
+import {
+  initializeLocalEngine,
+  isLocalEngineActive,
+  isLocalEngineInitializing,
+  isLocalSnapshotCurrent,
+  requestLocalSync,
+} from "../replay/localEngine";
 
 export { nextRequestId, sendSim } from "./connection";
 
@@ -66,7 +74,7 @@ function route(m: ServerMessage): void {
       store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period, m.fills);
       break;
     case "candle":
-      if (m.symbol === getState().symbol && (!m.exchange || m.exchange === getState().exchange)) {
+      if (!isLocalEngineActive() && m.symbol === getState().symbol && (!m.exchange || m.exchange === getState().exchange)) {
         store.applyCandle(m.candle);
       }
       break;
@@ -74,19 +82,19 @@ function route(m: ServerMessage): void {
       store.applyOi(m.samples);
       break;
     case "market_update":
-      store.applyMarket(m.last);
+      if (!isLocalEngineActive()) store.applyMarket(m.last);
       break;
     case "account_update":
-      store.applyAccount(m.account);
+      if (!isLocalEngineActive()) store.applyAccount(m.account);
       break;
     case "order_update":
-      store.applyOrder(m.order);
+      if (!isLocalEngineActive()) store.applyOrder(m.order);
       break;
     case "trade":
-      store.applyFill(m.fill);
+      if (!isLocalEngineActive()) store.applyFill(m.fill);
       break;
     case "replay_state":
-      store.applyReplay(m);
+      if (!isLocalEngineActive()) store.applyReplay(m);
       break;
     case "heartbeat":
       // Liveness only (already timestamped by the connection); nothing to render.
@@ -116,6 +124,9 @@ function route(m: ServerMessage): void {
       break;
     case "preload_done":
       store.finishPreload(m.done, m.total, m.failed);
+      break;
+    case "market_lookup":
+      store.applyMarketLookup(m.quotes, m.failures);
       break;
     case "error":
       store.setSeriesLoading(null);
