@@ -16,6 +16,39 @@ export interface TradeLink {
   exitTimestamp: number;
   exitPrice: number;
   direction: Direction;
+  /** Order that opened the leg: its `entry_protections` carry the planned stop. */
+  entryOrderId: string;
+}
+
+/**
+ * The engine's own sequence for a fill: `orderId` (the matching engine hands
+ * them out in creation order) and the per-order fill index encoded in `id` as
+ * `orderId_index`.
+ */
+function fillSequence(fill: FillLine): [number, number] {
+  const order = Number.parseInt(fill.orderId, 10);
+  const index = Number.parseInt(fill.id.split("_").pop() ?? "", 10);
+  return [
+    Number.isFinite(order) ? order : Number.MAX_SAFE_INTEGER,
+    Number.isFinite(index) ? index : 0,
+  ];
+}
+
+/**
+ * Chronological order of fills.
+ *
+ * The timestamp alone is not a total order: an entry and its exit can land on
+ * the same millisecond (close inside the entry bar, a stop hit by the entry
+ * candle), and the store keeps fills newest-first with an arbitrary order for
+ * such ties. Relying on the array order then reversed the trade: a BUY entry
+ * was paired as the exit, so a long was drawn and labelled as a short. The
+ * engine's sequence breaks the tie deterministically.
+ */
+export function fillChronology(a: FillLine, b: FillLine): number {
+  if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+  const [aOrder, aIndex] = fillSequence(a);
+  const [bOrder, bIndex] = fillSequence(b);
+  return aOrder - bOrder || aIndex - bIndex;
 }
 
 /** Pair opposing fills FIFO into closed position legs, including partial exits and reversals. */
@@ -23,9 +56,14 @@ export function pairTradeFills(fills: FillLine[], symbol: string): TradeLink[] {
   const chronological = fills
     .filter((fill) => fill.symbol === symbol)
     .slice()
-    .reverse()
-    .sort((a, b) => a.timestamp - b.timestamp);
-  const lots: Array<{ remaining: number; timestamp: number; price: number; direction: 1 | -1 }> = [];
+    .sort(fillChronology);
+  const lots: Array<{
+    remaining: number;
+    timestamp: number;
+    price: number;
+    direction: 1 | -1;
+    orderId: string;
+  }> = [];
   const links: TradeLink[] = [];
   for (const fill of chronological) {
     let remaining = fill.amount;
@@ -39,6 +77,7 @@ export function pairTradeFills(fills: FillLine[], symbol: string): TradeLink[] {
         exitTimestamp: fill.timestamp,
         exitPrice: fill.price,
         direction: lot.direction > 0 ? "long" : "short",
+        entryOrderId: lot.orderId,
       });
       lot.remaining -= closed;
       remaining -= closed;
@@ -49,9 +88,134 @@ export function pairTradeFills(fills: FillLine[], symbol: string): TradeLink[] {
       timestamp: fill.timestamp,
       price: fill.price,
       direction,
+      orderId: fill.orderId,
     });
   }
   return links;
+}
+
+/** Realized result of one closed leg, in price, percent and (when the stop is known) R. */
+export interface TradeOutcome {
+  /** Favorable-minus-adverse price move; positive = profit. */
+  move: number;
+  /** Move as a percentage of the entry price. */
+  pct: number;
+  /** Move divided by the planned risk; null when there was no usable stop. */
+  r: number | null;
+  profitable: boolean;
+}
+
+export function tradeOutcome(link: TradeLink, stopPrice: number | null): TradeOutcome {
+  const long = link.direction === "long";
+  const move = long ? link.exitPrice - link.entryPrice : link.entryPrice - link.exitPrice;
+  const pct = link.entryPrice > 0 ? (move / link.entryPrice) * 100 : 0;
+  let r: number | null = null;
+  if (stopPrice !== null && stopPrice > 0) {
+    const risk = long ? link.entryPrice - stopPrice : stopPrice - link.entryPrice;
+    if (risk > 0) r = move / risk;
+  }
+  return { move, pct, r, profitable: move > 0 };
+}
+
+/**
+ * A closed trade may only be drawn once the bars it happened on are on the
+ * chart. Persisted fills survive a reload, but the replay starts over at the
+ * window's reveal boundary — without this check every old trade from "the
+ * future" would pile up on the last visible bar.
+ */
+export function tradeVisible(
+  link: Pick<TradeLink, "entryTimestamp" | "exitTimestamp">,
+  times: ReadonlyArray<number>,
+): boolean {
+  if (times.length === 0) return false;
+  const first = times[0];
+  const last = times[times.length - 1];
+  return link.entryTimestamp >= first
+    && link.exitTimestamp >= first
+    && link.entryTimestamp <= last
+    && link.exitTimestamp <= last;
+}
+
+/**
+ * The two price legs of a closed trade, as TradingView's position tool draws
+ * them: a reward leg above the entry (long) and a risk leg below it.
+ *
+ * The reward leg is the planned take-profit when there was one, otherwise the
+ * realized exit if the trade ended in profit. Without a target the leg stays
+ * empty rather than inventing a level — a stop-out with no TP has nothing on
+ * the profit side to show.
+ */
+export interface TradeZones {
+  /** Price bounding the profit zone (target, or the profitable exit). */
+  rewardPrice: number | null;
+  /** Price bounding the risk zone (stop, extended to a losing exit). */
+  adversePrice: number | null;
+}
+
+export function tradeZones(
+  link: TradeLink,
+  stopPrice: number | null,
+  takePrice: number | null,
+): TradeZones {
+  const long = link.direction === "long";
+  const favorable = (price: number): boolean =>
+    long ? price > link.entryPrice : price < link.entryPrice;
+  /** The more favourable of two prices (higher for a long). */
+  const farther = (a: number, b: number): number => (long ? Math.max(a, b) : Math.min(a, b));
+  /** The more adverse of two prices (lower for a long). */
+  const deeper = (a: number, b: number): number => (long ? Math.min(a, b) : Math.max(a, b));
+
+  let rewardPrice: number | null = null;
+  if (takePrice !== null && takePrice > 0 && favorable(takePrice)) rewardPrice = takePrice;
+  if (favorable(link.exitPrice)) {
+    rewardPrice = rewardPrice === null ? link.exitPrice : farther(rewardPrice, link.exitPrice);
+  }
+
+  let adversePrice: number | null = null;
+  if (stopPrice !== null && stopPrice > 0 && !favorable(stopPrice)) adversePrice = stopPrice;
+  if (!favorable(link.exitPrice) && link.exitPrice !== link.entryPrice) {
+    adversePrice = adversePrice === null
+      ? link.exitPrice
+      : deeper(adversePrice, link.exitPrice);
+  }
+
+  return { rewardPrice, adversePrice };
+}
+
+/** Pixel box of one closed trade: time span x, entry/exit/stop/target y. */
+export interface TradeBoxShape {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  entryY: number;
+  exitY: number;
+  stopY: number | null;
+  rewardY: number | null;
+}
+
+/**
+ * TradingView-style position box: the rectangle spans the trade's lifetime and
+ * covers entry, exit and (when known) the planned stop and target, so every
+ * level is visible at once instead of a single diagonal entry→exit line.
+ */
+export function tradeBoxShape(
+  x1: number,
+  entryY: number,
+  x2: number,
+  exitY: number,
+  stopY: number | null,
+  rewardY: number | null = null,
+): TradeBoxShape {
+  const left = Math.min(x1, x2);
+  // Same-bar trades would otherwise be invisible: keep a sliver of width.
+  const width = Math.max(Math.abs(x2 - x1), 3);
+  const ys = [entryY, exitY];
+  if (stopY !== null) ys.push(stopY);
+  if (rewardY !== null) ys.push(rewardY);
+  const top = Math.min(...ys);
+  const bottom = Math.max(...ys);
+  return { left, top, width, height: bottom - top, entryY, exitY, stopY, rewardY };
 }
 
 /** Normalize two pixel corners into a box (handles any click order). */

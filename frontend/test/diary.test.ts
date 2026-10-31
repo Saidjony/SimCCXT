@@ -12,6 +12,7 @@ import {
   markersOutsideCandles,
   overallR,
   safeStats,
+  tradeRef,
   traderFromSearch,
 } from "../src/trade/diary.ts";
 import type { CandleRow, DiaryData, DiaryPosition, DiaryTrade } from "../src/types/protocol.ts";
@@ -276,5 +277,18 @@ describe("formatters", () => {
     assert.equal(fmtPnl(1234.5), "+1,234.5");
     assert.equal(fmtPnl(-12), "-12");
     assert.equal(fmtPnl(Number.NaN), "—");
+    // A fee-free session passes `-Math.abs(0)`; it must not read "-0".
+    assert.equal(fmtPnl(-Math.abs(0)), "0");
+  });
+
+  it("tradeRef keeps page loads apart, order ids restart at 1", () => {
+    // Two different trades, same symbol, same order ids (a reloaded tab
+    // replays from the same bar). The engine instance must distinguish them,
+    // otherwise the diary gives both the same review row and one "Итог".
+    const first = { engine_id: "page-1", entry_order_id: "1", exit_order_id: "2" };
+    const second = { engine_id: "page-2", entry_order_id: "1", exit_order_id: "2" };
+    assert.notEqual(tradeRef(first), tradeRef(second));
+    // Legacy payloads without an engine id still produce the old key.
+    assert.equal(tradeRef({ entry_order_id: "1", exit_order_id: "2" }), "1-2");
   });
 });

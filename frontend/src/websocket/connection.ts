@@ -1,7 +1,10 @@
-import type { ClientMessage, ExchangeId, ServerMessage } from "../types/protocol";
+import type { ClientMessage, ExchangeId, ReplayWindow, ServerMessage } from "../types/protocol";
 import { apiBaseFrom, parseServerMessage } from "../types/protocol";
 import { getState, store } from "../state/store";
-import { handleLocalCommand } from "../replay/localEngine";
+import { handleLocalCommand, initializeLocalEngine } from "../replay/localEngine";
+import { prefetchSeries } from "../market/provider";
+import { downloadTicker } from "../market/exchanges";
+import { BASE_TIMEFRAME, TIMEFRAMES, type Timeframe } from "../market/timeframes";
 
 export function wsUrl(): string {
   const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
@@ -19,6 +22,8 @@ export function wsUrl(): string {
 /**
  * Base URL of the read-only diary HTTP API (see `apiBaseFrom` for the
  * port+1 rule). Kept next to `wsUrl` so both URLs come from one place.
+ * Market data does NOT come from here any more — it is downloaded straight
+ * from the exchange by this browser (see ../market/provider).
  */
 export function apiUrl(): string {
   const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
@@ -28,51 +33,121 @@ export function apiUrl(): string {
 
 export type Route = (m: ServerMessage) => void;
 
+/**
+ * Switch this tab's series. The bars are downloaded by THIS browser and
+ * aggregated locally; the Rust/WASM engine in the Web Worker owns the clock,
+ * orders and PnL from that point on. Nothing about the selection is sent to
+ * our server: it only receives the account/fill mirror for the challenge board
+ * and the diary.
+ */
 export function subscribeSim(
   symbol: string,
   timeframe: string,
   exchange: ExchangeId,
 ): void {
-  const range = getState().replayWindow;
-  getConnection().expectSnapshot();
-  sendSim({
-    type: "subscribe",
-    symbol,
-    timeframe,
-    exchange,
-    ...range,
+  void initializeLocalEngine(symbol, timeframe, exchange, (message) => {
+    getConnection().sendToServer(message);
   });
 }
 
 /**
- * Ask Rust to warm the memory and disk caches for the whole watchlist x every timeframe
- * in the background. Unlike a burst of `subscribe`s this touches no session
- * state (no snapshot, no clock reset, no account change): Rust fills caches
- * on a background thread, so switching a coin or timeframe later is instant.
- * The replay date window rides along, so its range cache is warm too.
+ * Background download of the whole watchlist into THIS browser's cache.
+ *
+ * The point is that a coin is ready BEFORE the user clicks it: coins whose
+ * data is already cached (and not due for a refresh) cost one disk read, and
+ * the rest are downloaded one after another so the venue's per-IP rate limit
+ * is never spent in a burst.
+ *
+ * Re-runs are safe by design: the provider serves anything already cached for
+ * the same date window from disk, so re-entering the page the same day does not
+ * re-download a coin that was fetched once.
  */
-export function preloadSim(
-  symbols: string[],
-  timeframes: string[],
-  exchange: ExchangeId,
-): void {
-  if (symbols.length === 0 || timeframes.length === 0) return;
+let warming = false;
+let warmAgain = false;
+export function warmMarketData(symbols: string[]): void {
+  if (symbols.length === 0) return;
+  if (warming) {
+    warmAgain = true; // a coin was added while the loop ran
+    return;
+  }
+  const exchange = getState().exchange;
+  // Pin the date window: the default one is derived from `Date.now()` and is
+  // re-created on every page load, so an unpinned warm-up could ask for a
+  // window a few bars wider than the one on disk — and "a few bars wider" is a
+  // different window, i.e. a full re-download. Persisting it also makes the
+  // "Даты истории" controls show exactly what was downloaded.
+  const stored = store.replayWindowFromStorage();
+  if (stored) {
+    store.setReplayWindow(stored);
+  } else {
+    const range: ReplayWindow = { ...getState().replayWindow };
+    store.setReplayWindow(range);
+  }
   const range = getState().replayWindow;
-  sendSim({
-    type: "preload",
-    symbols,
-    timeframes,
-    exchange,
-    start_ms: range.start_ms,
-    end_ms: range.end_ms,
-  });
-  store.startPreload(symbols.length * timeframes.length);
+  warming = true;
+  store.startPreload(symbols.length);
+  void (async () => {
+    let done = 0;
+    let failed = 0;
+    try {
+      await prefetchSeries(symbols, exchange, range.start_ms, range.end_ms, {
+        onStart: (symbol) => store.advancePreload(done, symbols.length, failed, `${symbol} · ${BASE_TIMEFRAME}`),
+        onDone: (_symbol, didFail) => {
+          done += 1;
+          if (didFail) failed += 1;
+        },
+        shouldStop: () => {
+          const current = getState();
+          // A different venue or a new date window makes the rest moot; the
+          // effect that re-ran the warm-up starts the right batch.
+          return current.exchange !== exchange
+            || current.replayWindow.start_ms !== range.start_ms
+            || current.replayWindow.end_ms !== range.end_ms;
+        },
+      });
+    } finally {
+      store.finishPreload(done, symbols.length, failed);
+      warming = false;
+    }
+    if (warmAgain) {
+      warmAgain = false;
+      const state = getState();
+      warmMarketData(state.watchlist.map((coin) => coin.symbol));
+    }
+  })();
+}
+
+/** Intervals that exist in this terminal (5m downloaded, 1h/1d aggregated). */
+export function availableTimeframes(): readonly Timeframe[] {
+  return TIMEFRAMES;
+}
+
+/** Request current prices for the watchlist directly from the venue. */
+export function lookupMarketsSim(symbols: string[], exchange: ExchangeId): void {
+  if (symbols.length === 0) return;
+  void (async () => {
+    const quotes: Array<{ symbol: string; exchange: ExchangeId; last: number }> = [];
+    const failures: Array<{ symbol: string; error: string }> = [];
+    await Promise.all(symbols.map(async (symbol) => {
+      try {
+        const last = await downloadTicker(exchange, symbol);
+        if (last !== null && last > 0) quotes.push({ symbol, exchange, last });
+        else failures.push({ symbol, error: "нет цены" });
+      } catch (error) {
+        failures.push({ symbol, error: error instanceof Error ? error.message : String(error) });
+      }
+    }));
+    store.applyMarketLookup(quotes, failures);
+  })();
 }
 
 /** Silence longer than this (with a live socket) means the link is dead.
  *  The server sends a connection-level keepalive every 5 s, independent of
  *  the engine thread, so a long CCXT load no longer looks like a dead link. */
 const WATCHDOG_MS = 45000;
+/** A subscribe can park on the background series loader for a long time:
+ *  keep the watchdog quiet that long so a cold cache looks "loading", not dead. */
+const SNAPSHOT_TIMEOUT_MS = 180000;
 
 /**
  * Stable per-tab session token. A reload keeps it (sessionStorage survives a
@@ -242,6 +317,18 @@ export function sendSim(msg: ClientMessage): void {
   getConnection().send(msg);
 }
 
+/**
+ * Send a message that is NOT a replay/trading command (local_sync, diary_meta,
+ * login...).
+ *
+ * It deliberately bypasses `send()`: that one routes replay/trading commands to
+ * the local engine, but a `local_sync` sent THROUGH it was silently swallowed by
+ * `handleLocalCommand` — the server then never learned the selected series and
+ * (in the window where its own subscribe reply was not yet applied) echoed back
+ * `session_state` for the DEFAULT series. That echo reset the replay window and
+ * re-triggered a download of the wrong date range, which is what made the
+ * "Даты истории" window look broken and made every coin switch re-download.
+ */
 export function sendServer(msg: ClientMessage): void {
   getConnection().sendToServer(msg);
 }

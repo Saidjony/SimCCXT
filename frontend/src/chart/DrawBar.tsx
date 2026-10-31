@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { store, useSim } from "../state/store";
 import type { Tool } from "../state/store";
 
@@ -102,9 +103,27 @@ const TOOLS: { id: Exclude<Tool, "none">; title: string; Icon: () => JSX.Element
 /** Drawing toolbar docked top-right inside the chart. Icon-only buttons. */
 export function DrawBar(): JSX.Element {
   const tool = useSim((s) => s.tool);
+  /** Trash is armed by the first click and fires on the second. */
+  const [armed, setArmed] = useState(false);
+
+  useEffect(() => {
+    if (!armed) return;
+    const timer = window.setTimeout(() => setArmed(false), 4000);
+    return () => window.clearTimeout(timer);
+  }, [armed]);
 
   const arm = (t: Exclude<Tool, "none">): void => {
+    setArmed(false);
     store.setTool(tool === t ? "none" : t);
+  };
+
+  const wipe = (): void => {
+    if (!armed) {
+      setArmed(true);
+      return;
+    }
+    setArmed(false);
+    store.resetSymbolData();
   };
 
   return (
@@ -119,7 +138,13 @@ export function DrawBar(): JSX.Element {
           <Icon />
         </button>
       ))}
-      <button className="tool-btn danger" title="Удалить все рисунки" onClick={() => store.clearDrawings()}>
+      <button
+        className={"tool-btn danger" + (armed ? " armed" : "")}
+        title={armed
+          ? "Нажмите ещё раз: удалить все сделки и рисунки этой монеты"
+          : "Удалить всё по монете: рисунки, сделки, результаты"}
+        onClick={wipe}
+      >
         <TrashIcon />
       </button>
     </div>

@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { getState, normalizeSymbol, store, useSim } from "../state/store";
 import type { CoinEntry, MarketQuote } from "../state/store";
-import { subscribeSim } from "../websocket/connection";
+import { subscribeSim, warmMarketData } from "../websocket/connection";
+import { evictSeries } from "../market/provider";
 
 /** Outline/filled flag: the "pinned" marker for a watchlist coin. */
 function FlagIcon({ filled }: { filled: boolean }): JSX.Element {
@@ -50,7 +51,11 @@ function CoinRow(props: {
       <span className="coin-name">{coin.symbol}</span>
       <span
         className="coin-px"
-        title={quote?.error ?? "ожидание котировки"}
+        title={
+          active
+            ? "цена реплея на графике"
+            : quote?.error ?? "цена на момент загрузки"
+        }
       >
         {quote && !quote.error && quote.last > 0
           ? <>
@@ -99,6 +104,11 @@ export function CoinList(): JSX.Element {
 
   const remove = (sym: string): void => {
     const wasActive = sym === symbol;
+    // Nothing for a removed coin may stay around: drop its in-memory series,
+    // its OPFS file and its manifest entry, so it can't come back from a stale
+    // cache later and doesn't keep holding browser quota. Use the venue its
+    // data was fetched from.
+    void evictSeries(getState().exchange, sym);
     store.removeCoin(sym);
     // Removing the coin on screen: jump to the first remaining one.
     if (wasActive) {
@@ -121,21 +131,34 @@ export function CoinList(): JSX.Element {
     }
     setFormErr(null);
     setInput("");
+    // Warm the new coin in the background (5m only; 1h/1d are aggregated
+    // locally). The chart on screen keeps playing: switching the engine away
+    // and back to "preload" a coin would reset the replay clock for nothing.
+    warmMarketData([norm]);
   };
 
   const flagged = watchlist.filter((c) => c.flagged);
   const rest = watchlist.filter((c) => !c.flagged);
-  const row = (c: CoinEntry): JSX.Element => (
-    <CoinRow
-      key={c.symbol}
-      coin={c}
-      active={c.symbol === symbol}
-      quote={marketQuotes[c.symbol]}
-      onSwitch={switchTo}
-      onFlag={store.toggleFlag}
-      onRemove={remove}
-    />
-  );
+  const row = (c: CoinEntry): JSX.Element => {
+    const active = c.symbol === symbol;
+    // The active row follows the replay clock. Every other row keeps the one
+    // quote it received when it joined the watchlist, so unselected coins
+    // stand still instead of looking like they are replaying too.
+    const quote = active && lastPrice > 0
+      ? { exchange, last: lastPrice }
+      : marketQuotes[c.symbol];
+    return (
+      <CoinRow
+        key={c.symbol}
+        coin={c}
+        active={active}
+        quote={quote}
+        onSwitch={switchTo}
+        onFlag={store.toggleFlag}
+        onRemove={remove}
+      />
+    );
+  };
 
   return (
     <div className="card">

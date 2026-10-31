@@ -17,6 +17,14 @@ struct Engine {
     symbol: String,
     timeframe: String,
     exchange_name: String,
+    /// Random id of this browser engine instance (one per page load).
+    ///
+    /// Order ids restart at 1 every time the page (and therefore the engine)
+    /// is rebuilt, and a reloaded tab replays from the same bar, so the same
+    /// `symbol|orderId|time` describes two different trades. Everything the
+    /// diary keys per trade carries this id so an older session's stop/TP or
+    /// exit verdict can never be applied to a newer trade.
+    engine_id: String,
     step_ms: u64,
     speed: f64,
     reveal_reset_ms: i64,
@@ -24,7 +32,6 @@ struct Engine {
     candles: Vec<Vec<f64>>,
     oi: Vec<[f64; 2]>,
     oi_period: String,
-    loaded_series: Vec<(String, String)>,
     fills_seen: usize,
     fills_reported: usize,
     candles_reported: usize,
@@ -71,6 +78,7 @@ fn init(message: &Value) -> Result<(), String> {
         .as_str()
         .ok_or_else(|| "market_kind is required".to_string())?;
     let exchange_name = message["exchange"].as_str().unwrap_or("binance");
+    let engine_id = message["engine_id"].as_str().unwrap_or_default().to_string();
     let speed = message["speed"].as_f64().unwrap_or(1.0);
     let reveal_reset_ms = message["reveal_reset_ms"].as_i64().unwrap_or(start_ms);
     let range_end_ms = message["range_end_ms"].as_i64().unwrap_or(i64::MAX);
@@ -99,8 +107,8 @@ fn init(message: &Value) -> Result<(), String> {
         max_order_size: 1_000_000.0,
         min_order_size: 0.001,
         fee_tiers: FeeTiers {
-            maker: 0.001,
-            taker: 0.0025,
+            maker: 0.0,
+            taker: 0.0,
             funding: 0.0001,
         },
         time_config: TimeConfig {
@@ -126,6 +134,7 @@ fn init(message: &Value) -> Result<(), String> {
             symbol: symbol.to_string(),
             timeframe: timeframe.to_string(),
             exchange_name: exchange_name.to_string(),
+            engine_id,
             step_ms,
             speed,
             reveal_reset_ms,
@@ -134,7 +143,6 @@ fn init(message: &Value) -> Result<(), String> {
             candles: rows,
             oi,
             oi_period,
-            loaded_series: vec![(symbol.to_string(), timeframe.to_string())],
             fills_seen: 0,
             fills_reported: 0,
             candles_reported: 0,
@@ -218,12 +226,15 @@ fn command(command: &Value) -> Result<(), String> {
                     .ok_or_else(|| "timestamp_ms is out of range".to_string())?;
                 engine.exchange.reset(timestamp);
                 engine.candles_reported = 0;
-                for (symbol, timeframe) in &engine.loaded_series {
-                    if let Ok(symbol) = Symbol::parse(symbol) {
-                        engine
-                            .exchange
-                            .mark_history_played(&symbol, timeframe, timestamp);
-                    }
+                // `reset` clears every replay cursor; mark the one series this
+                // tab owns as already played, so bars before the barrier do not
+                // fire stops/TPs again.
+                if let Ok(symbol) = Symbol::parse(&engine.symbol) {
+                    engine.exchange.mark_history_played(
+                        &symbol,
+                        &engine.timeframe,
+                        timestamp,
+                    );
                 }
             }
             "switch_series" => {
@@ -252,22 +263,32 @@ fn command(command: &Value) -> Result<(), String> {
                 let now_ms = engine.exchange.now_ms();
                 engine.exchange.add_market(&symbol_value, kind);
                 engine.exchange.load_candles(symbol, timeframe, candles);
+                // This tab replays ONE series. Dropping every previously loaded
+                // coin/interval matters: `feed_due` walks all loaded series, so
+                // otherwise pressing play advanced the old coins in the
+                // background too (their stops/TPs fired off-screen).
+                engine.exchange.retain_candles(symbol, timeframe);
                 engine.exchange.set_step_ms(step_ms);
+                let same_window = command["preserve_clock"].as_bool().unwrap_or(false);
+                let reveal_reset_ms = command["reveal_reset_ms"].as_i64().unwrap_or(now_ms);
+                // A different coin/venue starts at its OWN reveal boundary. The
+                // price and the "already played" mark must use that same time:
+                // taking them from the previous coin's clock left the new series
+                // showing a bar (and a watchlist price) from the future relative
+                // to its own replay start.
+                let clock_ms = if same_window { now_ms } else { reveal_reset_ms };
                 let current_time = Utc
-                    .timestamp_millis_opt(now_ms)
+                    .timestamp_millis_opt(clock_ms)
                     .single()
                     .ok_or_else(|| "current replay time is out of range".to_string())?;
-                engine
-                    .exchange
-                    .mark_symbol_history_played(&symbol_value, current_time);
-                let rows_before_now = rows
+                let rows_before_clock = rows
                     .iter()
                     .filter(|row| {
                         row.first()
-                            .is_some_and(|timestamp| *timestamp <= now_ms as f64)
+                            .is_some_and(|timestamp| *timestamp <= clock_ms as f64)
                     })
                     .collect::<Vec<_>>();
-                if let Some(last) = rows_before_now.last() {
+                if let Some(last) = rows_before_clock.last() {
                     let price = engine
                         .exchange
                         .last_price_for(symbol)
@@ -278,31 +299,15 @@ fn command(command: &Value) -> Result<(), String> {
                         .exchange
                         .apply_price(&symbol_value, price, current_time);
                 }
-                let same_window = command["preserve_clock"].as_bool().unwrap_or(false);
-                let reveal_reset_ms = command["reveal_reset_ms"].as_i64().unwrap_or(now_ms);
                 if !same_window {
-                    let reset_time = Utc
-                        .timestamp_millis_opt(reveal_reset_ms)
-                        .single()
-                        .ok_or_else(|| "reveal reset time is out of range".to_string())?;
-                    engine.exchange.reset(reset_time);
-                    for (old_symbol, old_timeframe) in &engine.loaded_series {
-                        if let Ok(old_symbol) = Symbol::parse(old_symbol) {
-                            engine.exchange.mark_history_played(
-                                &old_symbol,
-                                old_timeframe,
-                                reset_time,
-                            );
-                        }
-                    }
-                    engine
-                        .exchange
-                        .mark_history_played(&symbol_value, timeframe, reset_time);
+                    engine.exchange.reset(current_time);
                 }
-                let series_key = (symbol.to_string(), timeframe.to_string());
-                if !engine.loaded_series.contains(&series_key) {
-                    engine.loaded_series.push(series_key);
-                }
+                // AFTER `reset`, which clears the replay marks: otherwise the
+                // next tick would feed the pre-revealed history through the
+                // broker and fire old stops/TPs at months-old prices.
+                engine
+                    .exchange
+                    .mark_history_played(&symbol_value, timeframe, current_time);
                 engine.symbol = symbol.to_string();
                 engine.timeframe = timeframe.to_string();
                 engine.exchange_name = exchange.to_string();
@@ -353,9 +358,14 @@ fn command(command: &Value) -> Result<(), String> {
                 if let Some(value) = command["stop_price"].as_f64() {
                     params = params.stop_price(value);
                 }
-                if let Some(value) = command["tp_price"].as_f64() {
-                    params.tp_price = Some(value);
-                }
+                // NOTE: `tp_price` is deliberately NOT attached to the entry
+                // order. For a stop/limit entry the broker would arm that
+                // take-profit immediately, before the entry ever fills: the
+                // trade then had TWO take-profits (this one and the one armed
+                // by `pending_protections`), the untracked one could fire while
+                // flat or survive a manual close, and cancelling the entry left
+                // it behind. The pending protection arms stop and target from
+                // the fill that actually opened the position.
                 params.time_in_force = match command["time_in_force"]
                     .as_str()
                     .unwrap_or("GTC")
@@ -398,7 +408,12 @@ fn command(command: &Value) -> Result<(), String> {
                     .map_err(|error| error.to_string())?;
             }
             "close_position" => {
-                let symbol = command["symbol"].as_str().unwrap_or(&engine.symbol);
+                // Own the string: `engine` is borrowed mutably further down
+                // (`process_fresh_fills`, cancelling the protections).
+                let symbol = command["symbol"]
+                    .as_str()
+                    .unwrap_or(&engine.symbol)
+                    .to_string();
                 let quantity = command["quantity"].as_f64();
                 let position = engine.exchange.account_snapshot()["positions"]
                     .as_array()
@@ -422,9 +437,37 @@ fn command(command: &Value) -> Result<(), String> {
                 params.reduce_only = true;
                 engine
                     .exchange
-                    .create_order(symbol, "market", side, amount, None, params)
+                    .create_order(&symbol, "market", side, amount, None, params)
                     .map_err(|error| error.to_string())?;
                 process_fresh_fills(engine)?;
+                // The armed stop/target are reduce-only orders of their own and
+                // a manual close never triggers them, so nothing would ever
+                // retire them: they would keep drawing lines on the chart and,
+                // worse, could close the NEXT position. A flat position owns no
+                // protection — cancel and forget them.
+                let flat = !engine.exchange.account_snapshot()["positions"]
+                    .as_array()
+                    .is_some_and(|positions| {
+                        positions.iter().any(|position| {
+                            position["symbol"] == symbol
+                                && position["qty"].as_f64().unwrap_or(0.0) > f64::EPSILON
+                        })
+                    });
+                if flat {
+                    let mut stale = Vec::new();
+                    engine.active_protections.retain(|active| {
+                        if active.symbol == symbol {
+                            stale.push(active.order_id.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for order_id in stale {
+                        // A protection that already fired is gone from the book.
+                        let _ = engine.exchange.cancel_order(&order_id, &symbol);
+                    }
+                }
             }
             _ => return Err("unsupported engine command".to_string()),
         }
@@ -449,6 +492,7 @@ fn process_fresh_fills(engine: &mut Engine) -> Result<(), String> {
         let symbol = fill["symbol"].as_str().unwrap_or_default().to_string();
         let side = fill["side"].as_str().unwrap_or_default().to_string();
         let order_id = fill["orderId"].as_str().unwrap_or_default().to_string();
+        let fill_timestamp = fill["timestamp"].as_i64().unwrap_or_default();
         let source_order_id = engine.exchange.take_triggered_order_source(&order_id);
         let protection_kind = engine
             .active_protections
@@ -459,9 +503,17 @@ fn process_fresh_fills(engine: &mut Engine) -> Result<(), String> {
             })
             .map(|active| active.kind);
         if let Some(kind) = protection_kind {
-            engine
-                .exit_reasons
-                .insert(order_id.clone(), kind.to_string());
+            // Order ids restart at 1 for every symbol engine and every replay
+            // session, so neither the bare id nor `symbol|id` is unique: a
+            // reloaded session's stop #2 would overwrite the previous stop #2
+            // of the same symbol and the diary would label the newer trade
+            // with the older trade's level. The engine id separates page loads
+            // and the fill time pins the execution within one engine.
+            let engine_id = engine.engine_id.clone();
+            engine.exit_reasons.insert(
+                format!("{engine_id}|{symbol}|{order_id}|{fill_timestamp}"),
+                kind.to_string(),
+            );
         }
 
         let amount = fill["amount"].as_f64().unwrap_or(0.0);
@@ -476,12 +528,20 @@ fn process_fresh_fills(engine: &mut Engine) -> Result<(), String> {
             let protect_amount = amount.min(pending.remaining);
             let stop_price = pending.stop_price;
             let take_price = pending.take_price;
-            let entry_order_id = pending.entry_order_id.clone();
             let entry_side = pending.entry_side.clone();
             let protect_side = if entry_side == "buy" { "sell" } else { "buy" };
+            // Key the plan by the fill that actually opened the trade, not by
+            // the order the user clicked: a stop/limit entry that triggers is
+            // executed by a NEW market order, and the fill reports that id.
+            // Order ids restart at 1 per symbol AND per page load (the engine
+            // id separates the loads), so both are part of the key.
+            let plan_key = format!(
+                "{}|{symbol}|{order_id}|{fill_timestamp}",
+                engine.engine_id
+            );
             let plan = engine
                 .entry_protections
-                .entry(entry_order_id)
+                .entry(plan_key)
                 .or_insert_with(|| json!({ "stop_price": Value::Null, "take_price": Value::Null }));
             if stop_price > 0.0 {
                 plan["stop_price"] = json!(stop_price);
@@ -821,6 +881,7 @@ mod tests {
             "start_ms": 0,
             "step_ms": 60_000,
             "market_kind": "linear",
+            "engine_id": "test",
             "candles": [
                 [60_000, 100.0, 110.0, 99.0, 105.0, 12.0],
                 [120_000, 105.0, 106.0, 90.0, 95.0, 8.0]
@@ -859,10 +920,9 @@ mod tests {
             .unwrap()
             .is_empty());
         let exit_order_id = fills[0]["orderId"].as_str().unwrap();
-        assert_eq!(
-            exit_value["snapshot"]["exit_reasons"][exit_order_id],
-            "stop"
-        );
+        let exit_time_ms = fills[0]["timestamp"].as_i64().unwrap();
+        let exit_key = format!("test|BTC/USDT|{exit_order_id}|{exit_time_ms}");
+        assert_eq!(exit_value["snapshot"]["exit_reasons"][exit_key], "stop");
     }
 
     #[test]
@@ -902,8 +962,8 @@ mod tests {
             .unwrap();
         assert_eq!(positions.len(), 1);
         let qty = positions[0]["qty"].as_f64().unwrap();
-        // 10 / (15 + (105 + 90) * 0.0025), not the stale preview quantity.
-        let expected = 10.0 / (15.0 + 195.0 * 0.0025);
+        // 10 / 15 with no commission, not the stale preview quantity.
+        let expected = 10.0 / 15.0;
         assert!((qty - expected).abs() < 1e-9, "qty={qty} expected={expected}");
 
         let exit_response = process_message(br#"{"type":"step","steps":1}"#);
@@ -918,6 +978,154 @@ mod tests {
         );
         let fill = &exit_value["snapshot"]["fills"][0];
         assert_eq!(fill["price"].as_f64(), Some(90.0));
+    }
+
+    #[test]
+    fn switching_coins_stops_replaying_the_previous_coin() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "1m",
+            "start_ms": 0,
+            "step_ms": 60_000,
+            "market_kind": "linear",
+            "candles": [
+                [60_000, 100.0, 100.0, 100.0, 100.0, 10.0],
+                // A crash after the switch: if BTC kept replaying in the
+                // background this bar would hit the 90 stop.
+                [120_000, 100.0, 100.0, 50.0, 50.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        process_message(br#"{"type":"step","steps":1}"#);
+        let order = json!({
+            "type": "place_order",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": 1.0,
+            "stop_loss_price": 90.0
+        });
+        process_message(&serde_json::to_vec(&order).unwrap());
+
+        let switch = json!({
+            "type": "switch_series",
+            "symbol": "ETH/USDT",
+            "exchange": "binance",
+            "timeframe": "1m",
+            "step_ms": 60_000,
+            "speed": 1.0,
+            "market_kind": "linear",
+            "reveal_reset_ms": 60_000,
+            "range_end_ms": 600_000,
+            "oi": [],
+            "oi_period": "",
+            "preserve_clock": true,
+            "candles": [[120_000, 2_000.0, 2_000.0, 2_000.0, 2_000.0, 4.0]]
+        });
+        let switch_value: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&switch).unwrap())).unwrap();
+        assert_eq!(switch_value["ok"], true);
+
+        // Only the chart on screen may advance. The old BTC series must be
+        // gone from the replay feed, so its stop does not fire off-screen.
+        let tick_value: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        let snapshot = &tick_value["snapshot"];
+        assert_eq!(snapshot["symbol"], "ETH/USDT");
+        assert_eq!(snapshot["fills"].as_array().unwrap().len(), 0);
+        let positions = snapshot["account"]["positions"].as_array().unwrap();
+        assert_eq!(
+            positions.len(),
+            1,
+            "the off-screen BTC position must survive: {positions:?}"
+        );
+        assert_eq!(positions[0]["symbol"], "BTC/USDT");
+        assert_eq!(positions[0]["markPrice"].as_f64(), Some(100.0));
+    }
+
+    #[test]
+    fn switching_coins_resets_to_the_new_reveal_boundary_and_pauses() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "1m",
+            "start_ms": 60_000,
+            "step_ms": 60_000,
+            "market_kind": "linear",
+            "candles": [
+                [60_000, 100.0, 100.0, 100.0, 100.0, 10.0],
+                [120_000, 100.0, 100.0, 100.0, 100.0, 10.0],
+                [180_000, 100.0, 100.0, 100.0, 100.0, 10.0],
+                [240_000, 100.0, 100.0, 100.0, 100.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        // Replay BTC forward: the new coin must NOT inherit this clock.
+        let stepped: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":3}"#)).unwrap();
+        assert_eq!(stepped["snapshot"]["replay"]["now_ms"], 240_000);
+
+        let switch = json!({
+            "type": "switch_series",
+            "symbol": "ETH/USDT",
+            "exchange": "binance",
+            "timeframe": "1m",
+            "step_ms": 60_000,
+            "speed": 1.0,
+            "market_kind": "linear",
+            "reveal_reset_ms": 180_000,
+            "range_end_ms": 600_000,
+            "oi": [],
+            "oi_period": "",
+            "preserve_clock": false,
+            "candles": [
+                [120_000, 200.0, 200.0, 100.0, 200.0, 5.0],
+                [180_000, 200.0, 200.0, 200.0, 200.0, 5.0],
+                [240_000, 900.0, 900.0, 900.0, 900.0, 5.0]
+            ]
+        });
+        let switch_value: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&switch).unwrap())).unwrap();
+        assert_eq!(switch_value["ok"], true);
+        let replay = &switch_value["snapshot"]["replay"];
+        assert_eq!(
+            replay["now_ms"], 180_000,
+            "a new coin starts at its own reveal boundary, not the old clock"
+        );
+        assert_eq!(replay["paused"], true, "a new coin opens paused");
+
+        // The price must come from the boundary bar (200), never from the bar
+        // after it (900): inheriting the previous clock priced the new coin at
+        // a candle the chart had not revealed yet.
+        let order = json!({
+            "type": "place_order",
+            "symbol": "ETH/USDT",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": 1.0,
+            "stop_loss_price": 150.0
+        });
+        let order_value: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(
+            order_value["snapshot"]["fills"][0]["price"].as_f64(),
+            Some(200.0)
+        );
+
+        // Stepping must feed ONLY the bar after the new boundary. If the reset
+        // dropped the replay marks, the pre-revealed bar at 120k (low 100)
+        // would be fed again and stop this position out at an old price.
+        let tick_value: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        let snapshot = &tick_value["snapshot"];
+        assert_eq!(snapshot["replay"]["now_ms"], 240_000);
+        assert_eq!(
+            snapshot["fills"].as_array().unwrap().len(),
+            0,
+            "pre-revealed history must never be re-fed after a coin switch"
+        );
+        assert_eq!(snapshot["account"]["positions"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -964,6 +1172,244 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// A stop/limit entry is executed by a NEW market order, so the fill's
+    /// `orderId` is not the id the user clicked. The chart pairs trades by the
+    /// fill's id, so the plan must be keyed that way too — otherwise the stop
+    /// and target are looked up under a key that never exists and the box picks
+    /// up whatever stale plan shares the number.
+    #[test]
+    fn entry_protections_are_keyed_by_the_fill_that_opened_the_trade() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "1m",
+            "start_ms": 0,
+            "step_ms": 60_000,
+            "market_kind": "linear",
+            "engine_id": "test",
+            "candles": [
+                [60_000, 100.0, 101.0, 99.0, 100.0, 10.0],
+                // Crosses the 108 trigger.
+                [120_000, 100.0, 112.0, 99.0, 111.0, 10.0],
+                [180_000, 111.0, 125.0, 110.0, 120.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        process_message(br#"{"type":"step","steps":1}"#);
+
+        let order = json!({
+            "type": "place_order",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "order_type": "stop",
+            "quantity": 1.0,
+            "stop_price": 108.0,
+            "stop_loss_price": 95.0,
+            "tp_price": 130.0
+        });
+        let placed: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(placed["ok"], true, "{placed}");
+        // The trigger order that was armed is not the order that fills.
+        let trigger_id = placed["snapshot"]["account"]["open"]
+            .as_array()
+            .and_then(|open| open.first())
+            .and_then(|order| order["id"].as_str())
+            .expect("the stop entry should rest as a conditional order")
+            .to_string();
+
+        let step: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        assert_eq!(step["ok"], true, "{step}");
+        let fills = step["snapshot"]["fills"].as_array().unwrap();
+        let entry = fills
+            .iter()
+            .find(|fill| fill["side"] == "buy")
+            .expect("the triggered entry should fill");
+        let order_id = entry["orderId"].as_str().unwrap();
+        assert_ne!(order_id, trigger_id, "triggered entries fill on a new order");
+
+        let key = format!(
+            "test|{}|{}|{}",
+            entry["symbol"].as_str().unwrap(),
+            order_id,
+            entry["timestamp"].as_i64().unwrap()
+        );
+        let plans = step["snapshot"]["entry_protections"].as_object().unwrap();
+        let plan = plans
+            .get(&key)
+            .unwrap_or_else(|| panic!("no plan under {key}, got {:?}", plans.keys()));
+        assert_eq!(plan["stop_price"].as_f64(), Some(95.0));
+        assert_eq!(plan["take_price"].as_f64(), Some(130.0));
+    }
+
+    /// A manual close is not one of the armed protective orders, so nothing
+    /// would ever retire them: the stop and target would stay in the book,
+    /// keep drawing lines and could close the NEXT position.
+    #[test]
+    fn manual_close_cancels_the_armed_protections() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "1m",
+            "start_ms": 0,
+            "step_ms": 60_000,
+            "market_kind": "linear",
+            "candles": [
+                [60_000, 100.0, 101.0, 99.0, 100.0, 10.0],
+                [120_000, 100.0, 102.0, 99.0, 101.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        process_message(br#"{"type":"step","steps":1}"#);
+
+        let order = json!({
+            "type": "place_order",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": 1.0,
+            "stop_loss_price": 95.0,
+            "tp_price": 130.0
+        });
+        let placed: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(placed["ok"], true, "{placed}");
+        let armed = placed["snapshot"]["account"]["open"].as_array().unwrap();
+        assert_eq!(armed.len(), 2, "stop and target should be armed: {armed:?}");
+
+        let closed: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"close_position"}"#)).unwrap();
+        assert_eq!(closed["ok"], true, "{closed}");
+        assert!(closed["snapshot"]["account"]["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let left = closed["snapshot"]["account"]["open"].as_array().unwrap();
+        assert!(
+            left.iter().all(|order| order["triggerPrice"].is_null()),
+            "protective orders survived the close: {left:?}"
+        );
+    }
+
+    /// The take-profit must be armed by the FILL, not by the entry order.
+    ///
+    /// Attaching `tp_price` to a resting stop entry made the broker arm a
+    /// take-profit immediately — before the entry ever filled — while
+    /// `pending_protections` armed a second one from the fill. The untracked
+    /// copy could fire while flat, survive a manual close, or be left behind
+    /// when the entry was cancelled.
+    #[test]
+    fn trigger_entry_arms_protections_only_after_the_fill() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "1m",
+            "start_ms": 0,
+            "step_ms": 60_000,
+            "market_kind": "linear",
+            "candles": [
+                [60_000, 100.0, 101.0, 99.0, 100.0, 10.0],
+                // Crosses the 108 trigger; the low stays above the 95 stop.
+                [120_000, 100.0, 112.0, 99.0, 111.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        process_message(br#"{"type":"step","steps":1}"#);
+
+        let order = json!({
+            "type": "place_order",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "order_type": "stop",
+            "quantity": 1.0,
+            "stop_price": 108.0,
+            "stop_loss_price": 95.0,
+            "tp_price": 130.0
+        });
+        let placed: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(placed["ok"], true, "{placed}");
+        let resting = placed["snapshot"]["account"]["open"].as_array().unwrap();
+        assert_eq!(
+            resting.len(),
+            1,
+            "before the fill only the entry trigger may rest: {resting:?}"
+        );
+        assert_eq!(resting[0]["type"], "stop");
+        assert!(
+            resting.iter().all(|o| o["type"] != "take_profit"),
+            "a take-profit was armed before the entry filled: {resting:?}"
+        );
+
+        let step: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        assert_eq!(step["ok"], true, "{step}");
+        let open = step["snapshot"]["account"]["open"].as_array().unwrap();
+        let stops = open.iter().filter(|o| o["type"] == "stop").count();
+        let takes = open.iter().filter(|o| o["type"] == "take_profit").count();
+        assert_eq!(stops, 1, "expected exactly one protective stop: {open:?}");
+        assert_eq!(takes, 1, "expected exactly one take-profit: {open:?}");
+        assert_eq!(open.len(), 2, "unexpected leftover orders: {open:?}");
+    }
+
+    /// Closing a trigger-entry trade by hand must retire the stop and target
+    /// that were armed from its fill, leaving nothing open to fire later.
+    #[test]
+    fn trigger_entry_manual_close_leaves_no_orders() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "1m",
+            "start_ms": 0,
+            "step_ms": 60_000,
+            "market_kind": "linear",
+            "candles": [
+                [60_000, 100.0, 101.0, 99.0, 100.0, 10.0],
+                [120_000, 100.0, 112.0, 99.0, 111.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        process_message(br#"{"type":"step","steps":1}"#);
+
+        let order = json!({
+            "type": "place_order",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "order_type": "stop",
+            "quantity": 1.0,
+            "stop_price": 108.0,
+            "stop_loss_price": 95.0,
+            "tp_price": 130.0
+        });
+        let placed: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(placed["ok"], true, "{placed}");
+        let step: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        assert_eq!(step["ok"], true, "{step}");
+        assert!(!step["snapshot"]["account"]["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty(), "the trigger entry should have opened a position");
+
+        let closed: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"close_position"}"#)).unwrap();
+        assert_eq!(closed["ok"], true, "{closed}");
+        assert!(closed["snapshot"]["account"]["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(
+            closed["snapshot"]["account"]["open"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "orders survived the manual close: {:?}",
+            closed["snapshot"]["account"]["open"]
         );
     }
 }

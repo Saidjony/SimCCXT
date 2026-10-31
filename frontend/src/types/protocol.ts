@@ -126,6 +126,10 @@ export interface DiaryTrade {
   /** Which protective order closed the trade (`"stop"` / `"take"`), or null for
    *  a manual exit. The server knows this from the fill, independently of price. */
   exit_reason?: "stop" | "take" | null;
+  /** Browser engine instance that produced the trade. Order ids restart at 1
+   *  on every page load, so `entry_order_id`/`exit_order_id` alone are not
+   *  unique across a trader's history. */
+  engine_id?: string;
   entry_order_id: string;
   exit_order_id: string;
 }
@@ -266,6 +270,8 @@ export type ClientMessage =
       account: AccountSnapshot;
       fills: FillLine[];
       replace_fills?: boolean;
+      /** Engine instance that produced these fills (see `localEngine.engineId`). */
+      engine_id?: string;
       entry_protections: Record<string, Record<string, unknown>>;
       exit_reasons: Record<string, string>;
       symbol: string;
@@ -342,6 +348,22 @@ export type ServerMessage =
       request_id?: string;
     }
   | { type: "loading"; to?: number; symbol: string; timeframe: string; request_id?: string }
+  /**
+   * The recorded selection after a `subscribe`. The server holds NO market
+   * data: this tab downloads its own 5m bars and aggregates 1h/1d locally.
+   */
+  | {
+      type: "series_ack";
+      to?: number;
+      symbol: string;
+      timeframe: string;
+      exchange: ExchangeId;
+      request_id?: string;
+    }
+  /**
+   * Kept for compatibility with older servers only. A server `snapshot` or a
+   * `candle` delta is ignored by this client: bars come from the browser.
+   */
   | {
       type: "snapshot";
       to?: number;
@@ -351,7 +373,6 @@ export type ServerMessage =
       candles: CandleRow[];
       account: AccountSnapshot;
       replay: ReplayState;
-      /** Open-interest context: [[ts_ms, usdt], ...], static (never replayed). */
       oi: Array<[number, number]>;
       oi_period: string;
       fills?: FillLine[];
@@ -410,6 +431,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "welcome":
     case "session_state":
     case "loading":
+    case "series_ack":
     case "snapshot":
     case "candle":
     case "oi_update":
@@ -432,6 +454,45 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     default:
       return null;
   }
+}
+
+/**
+ * Key of one planned stop/target in the engine's `entry_protections` map.
+ *
+ * The engine builds the same string (see `process_fresh_fills` in the wasm
+ * crate) with one extra prefix: the id of the engine instance that produced
+ * the entry. Order ids restart at 1 per symbol AND per page load, so without
+ * that prefix a reloaded tab's new trade would inherit the previous page's
+ * stop and target. The prefix is opaque to the UI: look entries up through
+ * `findProtection`, which tolerates it.
+ */
+export function protectionKey(symbol: string, orderId: string, entryTimestamp: number): string {
+  return `${symbol}|${orderId}|${entryTimestamp}`;
+}
+
+/** Symbol part of an engine `entry_protections` key (`engine|symbol|order|ts`). */
+export function protectionSymbol(key: string): string {
+  return key.split("|")[1] ?? "";
+}
+
+/**
+ * Look up the planned stop/target of one entry, whatever engine instance wrote
+ * it: the map is keyed `engine|symbol|orderId|timestamp`, and the chart does
+ * not track engine ids.
+ */
+export function findProtection<T>(
+  protections: Record<string, T>,
+  symbol: string,
+  orderId: string,
+  entryTimestamp: number,
+): T | undefined {
+  const suffix = protectionKey(symbol, orderId, entryTimestamp);
+  const exact = protections[suffix];
+  if (exact !== undefined) return exact;
+  for (const [key, value] of Object.entries(protections)) {
+    if (key.endsWith(`|${suffix}`)) return value;
+  }
+  return undefined;
 }
 
 /** Apply one incremental candle to a local series (pure, unit-tested). */

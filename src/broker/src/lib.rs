@@ -920,12 +920,16 @@ impl Broker {
             // trigger price. The trader sized the position from that price, so
             // filling at whatever the market happens to be would move the entry
             // away from the planned risk by up to the whole bar's range.
-            // Protective stop-losses in this replay fill at their trigger so a
-            // candle gap cannot turn the configured risk into a larger loss.
+            // Protective exits (stop-loss and take-profit) also fill at their
+            // trigger: a candle gap must not turn the configured risk into a
+            // larger loss, nor book a profit above the target the trader set.
             // Other reduce-only exits still use the current market reference.
-            let capped_stop_loss =
-                c.order_type == OrderType::Stop && c.reduce_only && triggered_market;
-            let fill_reference = if triggered_market && (!c.reduce_only || capped_stop_loss) {
+            let capped_protection = matches!(
+                c.order_type,
+                OrderType::Stop | OrderType::TakeProfit
+            ) && c.reduce_only
+                && triggered_market;
+            let fill_reference = if triggered_market && (!c.reduce_only || capped_protection) {
                 Some(c.trigger_price)
             } else {
                 None
@@ -958,7 +962,7 @@ impl Broker {
                 );
                 executed.push(order);
             }
-            if capped_stop_loss {
+            if capped_protection {
                 // The trigger price is only for this protective fill; do not
                 // leave the simulated book behind the actual replay price.
                 self.update_midpoint(&c.symbol.symbol, price, 1e12);
@@ -1239,6 +1243,32 @@ mod tests {
         assert!(
             (executed[0].average_price - 110.0).abs() < 1e-9,
             "short protective stop should fill at the stop after a gap: {:?}",
+            executed[0]
+        );
+        assert!(b.portfolio().position("BTC/USDT").is_none());
+    }
+
+    #[test]
+    fn protective_take_profit_fills_at_its_trigger_to_cap_replay_gain() {
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+        b.engine_mut("BTC/USDT").unwrap().update_bid(100.0, 10.0);
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Buy, 1.0), ts())
+            .unwrap();
+
+        let mut take = BrokerOrderRequest::market(btc(), Side::Sell, 1.0);
+        take.order_type = OrderType::TakeProfit;
+        take.stop_price = Some(110.0);
+        take.reduce_only = true;
+        b.submit_order(take, ts()).unwrap();
+
+        let executed = b.on_price_update(&btc(), 120.0, ts());
+        assert_eq!(executed.len(), 1);
+        assert!(
+            (executed[0].average_price - 110.0).abs() < 1e-9,
+            "protective take-profit should fill at the target, not the gapped price: {:?}",
             executed[0]
         );
         assert!(b.portfolio().position("BTC/USDT").is_none());

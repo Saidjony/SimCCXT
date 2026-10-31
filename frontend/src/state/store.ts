@@ -9,8 +9,9 @@ import type {
   ReplayState,
   ReplayWindow,
 } from "../types/protocol";
-import { applyCandleDelta } from "../types/protocol";
+import { applyCandleDelta, protectionSymbol } from "../types/protocol";
 import { CRITERIA } from "../trade/criteria";
+import { isTimeframe, type Timeframe } from "../market/timeframes";
 
 // Visual-only drawing objects. Never sent to Rust, never trade signals.
 // - ray:      horizontal level starting at t0 (1 click), rendered as overlay
@@ -77,6 +78,7 @@ const WATCHLIST_KEY = "simccxt.watchlist.v1";
 const EXCHANGE_KEY = "simccxt.exchange.v1";
 const EXCHANGE_IDS: ExchangeId[] = ["binance", "bybit", "okx"];
 const REPLAY_WINDOW_KEY = "simccxt.replay-window.v1";
+const TIMEFRAME_KEY = "simccxt.timeframe.v1";
 const DRAWINGS_KEY = "simccxt.drawings.v1";
 const DEFAULT_WATCHLIST: CoinEntry[] = [
   { symbol: "BTC/USDT", flagged: false },
@@ -149,6 +151,25 @@ function loadReplayWindow(): ReplayWindow {
 }
 
 /** Normalize user input to BASE/QUOTE; null when the format is wrong. */
+/** Restore the last main-chart interval, dropping removed ones (1m, 15m, 4h). */
+function loadTimeframe(): Timeframe {
+  try {
+    const saved = window.localStorage.getItem(TIMEFRAME_KEY);
+    if (isTimeframe(saved)) return saved;
+  } catch {
+    // private mode: default below
+  }
+  return "5m";
+}
+
+function persistTimeframe(timeframe: Timeframe): void {
+  try {
+    window.localStorage.setItem(TIMEFRAME_KEY, timeframe);
+  } catch {
+    // keep it for this page load
+  }
+}
+
 export function normalizeSymbol(raw: string): string | null {
   const s = raw.trim().toUpperCase().replace(/\s+/g, "");
   return SYMBOL_RE.test(s) ? s : null;
@@ -249,9 +270,11 @@ function loadChartCriteria(): Record<string, string[]> {
           }
         }
         for (const [key, value] of Object.entries(values)) {
-          if (/^(1m|5m|15m|1h|4h|1d)$/.test(key)) {
+          // Only the three supported intervals survive a reload: criteria saved
+          // for the removed 1m/15m/4h charts are dropped, not re-created.
+          if (/^(5m|1h|1d)$/.test(key)) {
             next[chartCriteriaKey("BTC/USDT", key)] = validList(value);
-          } else if (/^[A-Z0-9]{2,12}\/[A-Z0-9]{2,12}::(1m|5m|15m|1h|4h|1d)$/.test(key)) {
+          } else if (/^[A-Z0-9]{2,12}\/[A-Z0-9]{2,12}::(5m|1h|1d)$/.test(key)) {
             next[key] = validList(value);
           }
         }
@@ -354,6 +377,71 @@ function persistFillHistory(fills: FillLine[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Planned stops per entry order (the engine's `entry_protections` mirror).
+// The chart draws a closed trade's risk zone from this, and it must survive a
+// reload just like the fill history does.
+//
+// Keys are opaque `symbol|orderId|entryTimestamp` strings built by the engine
+// and by `protectionKey()` — never a bare order id, which is only unique per
+// symbol and per session.
+// ---------------------------------------------------------------------------
+
+export interface TradeProtection {
+  stopPrice: number | null;
+  takePrice: number | null;
+}
+
+const PROTECTIONS_KEY = "simccxt.trade-protections.v2";
+const PROTECTIONS_LIMIT = 500;
+
+function positivePrice(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** Engine payload: `entry_protections` arrives as snake_case JSON. */
+function parseEngineProtection(value: unknown): TradeProtection | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as { stop_price?: unknown; take_price?: unknown };
+  const stopPrice = positivePrice(raw.stop_price);
+  const takePrice = positivePrice(raw.take_price);
+  return stopPrice === null && takePrice === null ? null : { stopPrice, takePrice };
+}
+
+/** localStorage payload: written by `persistProtections`, so camelCase. */
+function parseStoredProtection(value: unknown): TradeProtection | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as { stopPrice?: unknown; takePrice?: unknown };
+  const stopPrice = positivePrice(raw.stopPrice);
+  const takePrice = positivePrice(raw.takePrice);
+  return stopPrice === null && takePrice === null ? null : { stopPrice, takePrice };
+}
+
+function loadProtections(): Record<string, TradeProtection> {
+  try {
+    const raw = window.localStorage.getItem(PROTECTIONS_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, TradeProtection> = {};
+    for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const protection = parseStoredProtection(value);
+      if (protection) out[id] = protection;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistProtections(protections: Record<string, TradeProtection>): void {
+  try {
+    window.localStorage.setItem(PROTECTIONS_KEY, JSON.stringify(protections));
+  } catch {
+    // Stop lines are visual context; losing them must not break trading.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // UI preferences: OI pane visibility + collapsed cards. Pure UI, per browser.
 // ---------------------------------------------------------------------------
 
@@ -427,7 +515,7 @@ export interface SimState {
   clientId: number | null;
   symbol: string;
   exchange: ExchangeId;
-  timeframe: string;
+  timeframe: Timeframe;
   candles: CandleRow[];
   /** Bumped on every candle change; chart applies setData/update incrementally. */
   candlesVersion: number;
@@ -436,6 +524,8 @@ export interface SimState {
   lastPrice: number;
   account: AccountSnapshot | null;
   fills: FillLine[];
+  /** Planned stop/take per entry order id: chart risk zones for closed trades. */
+  entryProtections: Record<string, TradeProtection>;
   lastOrder: OrderLine | null;
   replay: ReplayState;
   replayWindow: ReplayWindow;
@@ -544,13 +634,14 @@ let state: SimState = {
   clientId: null,
   symbol: "BTC/USDT",
   exchange: loadExchange(),
-  timeframe: "5m",
+  timeframe: loadTimeframe(),
   candles: [],
   candlesVersion: 0,
   fullReset: false,
   lastPrice: 0,
   account: null,
   fills: loadFillHistory(),
+  entryProtections: loadProtections(),
   lastOrder: null,
   replay: initialReplay,
   replayWindow: loadReplayWindow(),
@@ -678,6 +769,12 @@ export const store = {
   setStatus(s: SimState["status"]): void {
     set({ status: s });
   },
+  /** Main-chart interval. Only 5m/1h/1d exist; anything else is ignored. */
+  setTimeframe(timeframe: Timeframe): void {
+    if (!isTimeframe(timeframe) || state.timeframe === timeframe) return;
+    set({ timeframe });
+    persistTimeframe(timeframe);
+  },
   setExchange(exchange: ExchangeId): void {
     if (!EXCHANGE_IDS.includes(exchange)) return;
     set({ exchange });
@@ -690,7 +787,7 @@ export const store = {
   applySnapshot(
     symbol: string,
     exchange: ExchangeId,
-    timeframe: string,
+    timeframe: Timeframe,
     candles: CandleRow[],
     account: AccountSnapshot,
     replay: ReplayState,
@@ -768,6 +865,22 @@ export const store = {
       feeRates: account.fees ?? state.feeRates,
     });
     if (fillsChanged) persistFillHistory(mergedFills);
+  },
+  /** Merge the engine's `entry_protections` (stop/take per entry order). */
+  mergeEntryProtections(raw: Record<string, Record<string, unknown>>): void {
+    const parsed: Record<string, TradeProtection> = {};
+    for (const [id, value] of Object.entries(raw)) {
+      const protection = parseEngineProtection(value);
+      if (protection) parsed[id] = protection;
+    }
+    if (Object.keys(parsed).length === 0) return;
+    const merged = { ...state.entryProtections, ...parsed };
+    const ids = Object.keys(merged);
+    if (ids.length > PROTECTIONS_LIMIT) {
+      for (const id of ids.slice(0, ids.length - PROTECTIONS_LIMIT)) delete merged[id];
+    }
+    set({ entryProtections: merged });
+    persistProtections(merged);
   },
   consumedReset(): void {
     if (state.fullReset) set({ fullReset: false });
@@ -978,6 +1091,30 @@ export const store = {
     set({ collapsedCriteria: v });
     persistUi({ ...currentUi(), collapsedCriteria: v });
   },
+  /** The persisted replay window, or null when this browser has none yet. */
+  replayWindowFromStorage(): ReplayWindow | null {
+    try {
+      const raw = window.localStorage.getItem(REPLAY_WINDOW_KEY);
+      if (!raw) return null;
+      const value = JSON.parse(raw) as Partial<ReplayWindow>;
+      if (
+        Number.isFinite(value.start_ms) &&
+        Number.isFinite(value.reveal_start_ms) &&
+        Number.isFinite(value.end_ms) &&
+        value.start_ms! < value.reveal_start_ms! &&
+        value.reveal_start_ms! <= value.end_ms!
+      ) {
+        return {
+          start_ms: value.start_ms!,
+          reveal_start_ms: value.reveal_start_ms!,
+          end_ms: value.end_ms!,
+        };
+      }
+    } catch {
+      // storage unavailable
+    }
+    return null;
+  },
   /** Add a coin (already-normalized symbol). Returns null if dup/invalid. */
   addCoin(raw: string): string | null {
     const sym = normalizeSymbol(raw);
@@ -1031,6 +1168,33 @@ export const store = {
     if (!state.drawings.length) return;
     set({ drawings: [] });
     persistDrawings({ ...state.drawingsBySymbol, [state.symbol]: [] });
+  },
+  /**
+   * Forget everything this coin accumulated: its drawings, its closed trades
+   * and the stops/targets that came with them. Used by the trash button so the
+   * chart looks like a coin that was just added to the watchlist — the replay
+   * clock and the account balance are global and stay untouched.
+   */
+  resetSymbolData(): void {
+    const symbol = state.symbol;
+    const dropped = state.fills.filter((fill) => fill.symbol === symbol);
+    if (!dropped.length && !state.drawings.length) return;
+    const fills = state.fills.filter((fill) => fill.symbol !== symbol);
+    const protections: Record<string, TradeProtection> = {};
+    for (const [key, value] of Object.entries(state.entryProtections)) {
+      // Keys are `engine|symbol|orderId|timestamp` (see `protectionKey`).
+      if (protectionSymbol(key) !== symbol) protections[key] = value;
+    }
+    set({
+      drawings: [],
+      selectedId: null,
+      fills,
+      entryProtections: protections,
+      lastOrder: state.lastOrder?.symbol === symbol ? null : state.lastOrder,
+    });
+    persistDrawings({ ...state.drawingsBySymbol, [symbol]: [] });
+    if (dropped.length) persistFillHistory(fills);
+    persistProtections(protections);
   },
 };
 

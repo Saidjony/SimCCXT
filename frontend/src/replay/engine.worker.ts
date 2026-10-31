@@ -5,6 +5,7 @@ interface InitMessage {
   start_ms: number;
   step_ms: number;
   market_kind: "spot" | "linear";
+  engine_id: string;
   candles: number[][];
   exchange: string;
   speed: number;
@@ -29,6 +30,7 @@ type EngineCommand =
       step_ms: number;
       speed: number;
       market_kind: "spot" | "linear";
+      engine_id: string;
       reveal_reset_ms: number;
       range_end_ms: number;
       oi: Array<[number, number]>;
@@ -152,7 +154,10 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
       return;
     }
     if (message.type === "snapshot") {
-      publish({ type: "snapshot" });
+      // Forward `include_fills`: the wasm engine only re-sends the whole fill
+      // history when asked for it, and a reconnecting session needs exactly
+      // that to rebuild the diary after a server restart.
+      publish({ type: "snapshot", include_fills: message.include_fills === true });
       return;
     }
     const { command } = message;

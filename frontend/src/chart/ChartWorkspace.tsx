@@ -2,11 +2,12 @@ import { useRef, useState } from "react";
 import { Chart } from "./Chart";
 import { ChartCriteriaPicker } from "./ChartCriteriaPicker";
 import { CHART_TIMEFRAMES, MiniChart } from "./MiniChart";
-import { useSim } from "../state/store";
+import { store, useSim } from "../state/store";
 import { subscribeSim } from "../websocket/connection";
+import { timeframeOr, type Timeframe } from "../market/timeframes";
 
 type PanelId = "top" | "hour" | "day";
-type Timeframes = Record<Exclude<PanelId, "top">, string>;
+type Timeframes = Record<Exclude<PanelId, "top">, Timeframe>;
 const TIMEFRAME_KEY = "simccxt.chart-timeframes.v1";
 const LAYOUT_KEY = "simccxt.chart-layout.v1";
 
@@ -31,6 +32,16 @@ function loadLayout(): Layout {
   return { upper: 50, lowerLeft: 50 };
 }
 
+/** A stored pane interval, but only if the terminal still has it (no 1m/15m/4h). */
+function hourTimeframe(value: unknown): Timeframe {
+  return value === "5m" || value === "1h" || value === "1d" ? value : "1h";
+}
+
+/** The lower-right pane defaults to the daily chart. */
+function dayTimeframe(value: unknown): Timeframe {
+  return value === "5m" || value === "1h" || value === "1d" ? value : "1d";
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -43,8 +54,8 @@ function loadMiniTimeframes(): Timeframes {
       if (value && typeof value === "object") {
         const saved = value as Record<string, unknown>;
         return {
-          hour: CHART_TIMEFRAMES.includes(String(saved.hour)) ? String(saved.hour) : "1h",
-          day: CHART_TIMEFRAMES.includes(String(saved.day)) ? String(saved.day) : "1d",
+          hour: hourTimeframe(saved.hour),
+          day: dayTimeframe(saved.day),
         };
       }
     }
@@ -65,7 +76,9 @@ export function ChartWorkspace(): JSX.Element {
   const [maximized, setMaximized] = useState<PanelId | null>(null);
 
   const setMainTimeframe = (next: string): void => {
-    subscribeSim(symbol, next, exchange);
+    const timeframe = timeframeOr(next, "5m");
+    store.setTimeframe(timeframe);
+    subscribeSim(symbol, timeframe, exchange);
   };
   const setMiniTimeframe = (panel: Exclude<PanelId, "top">, next: string): void => {
     const value = { ...miniTimeframes, [panel]: next };

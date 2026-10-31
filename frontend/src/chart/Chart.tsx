@@ -25,7 +25,9 @@ import type { Drawing, Tool } from "../state/store";
 import { criterionLabel } from "../trade/criteria";
 import { SPEED_DOWN_CODES, SPEED_UP_CODES, nextSpeed } from "../replay/speed";
 import {
+  fillChronology,
   formatCompactUsdt,
+  formatPriceValue,
   invertTime,
   nearestCandleTime,
   positionDirection,
@@ -184,9 +186,16 @@ export function Chart(): JSX.Element {
   const drawings = useSim((s) => s.drawings);
   const tool = useSim((s) => s.tool);
   const fills = useSim((s) => s.fills);
+  const entryProtections = useSim((s) => s.entryProtections);
   const account = useSim((s) => s.account);
   const fullReset = useSim((s) => s.fullReset);
   const symbol = useSim((s) => s.symbol);
+  // Identity of the execution layer: re-runs the primitive sync only when a
+  // position/order/entry actually changes, not on every account tick.
+  const executionKey = JSON.stringify({
+    positions: (account?.positions ?? []).map((p) => [p.symbol, p.side, p.entryPrice, p.entryTimeMs]),
+    orders: (account?.open ?? []).map((o) => [o.symbol, o.side, o.triggerPrice, o.remaining]),
+  });
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
   const criteria = useSim((s) => s.chartCriteria[chartCriteriaKey(s.symbol, s.timeframe)] ?? []);
@@ -204,8 +213,15 @@ export function Chart(): JSX.Element {
     ? "OI · нет данных"
     : "OI · " + (oiPeriod || "история");
 
-  // Magnet: exact cursor coordinates when on (see core.ts magnetEnabled).
-  useEffect(() => setMagnetMode(magnet), [magnet]);
+  // Magnet: switch the crosshair itself between free and magnet snapping
+  // (lightweight-charts does the bar/time snap natively), plus our flag for
+  // the price→OHLC snap in the handlers below.
+  useEffect(() => {
+    setMagnetMode(magnet);
+    chartRef.current?.applyOptions({
+      crosshair: { mode: magnet ? CrosshairMode.Magnet : CrosshairMode.Normal },
+    });
+  }, [magnet]);
 
   // Brush: freeze pan/zoom while the tool is armed so the chart stays still
   // during a freehand stroke. The frozen state follows the TOOL, not mouse
@@ -354,6 +370,7 @@ export function Chart(): JSX.Element {
       positions: state0.account?.positions ?? [],
       orders: state0.account?.open ?? [],
       symbol: state0.symbol,
+      protections: state0.entryProtections,
     });
     const crosshairListener = subscribeCrosshair(onSharedCrosshair);
 
@@ -577,15 +594,16 @@ export function Chart(): JSX.Element {
     engineRef.current?.setContext({ positionSizeUsdt, symbol });
   }, [positionSizeUsdt, symbol]);
 
-  // Execution layer: closed-trade legs, entry line + anchor, resting stops.
+  // Execution layer: closed-trade boxes, entry line + anchor, resting stops.
   useEffect(() => {
     engineRef.current?.setExecution({
       fills,
       positions: account?.positions ?? [],
       orders: account?.open ?? [],
       symbol,
+      protections: entryProtections,
     });
-  }, [fills, executionKey, symbol]);
+  }, [fills, executionKey, symbol, entryProtections]);
 
   // Incremental data: full snapshot -> setData(), tick -> update().
   useEffect(() => {
@@ -642,8 +660,7 @@ export function Chart(): JSX.Element {
     const chronological = fills
       .filter((fill) => fill.symbol === symbol)
       .slice()
-      .reverse()
-      .sort((a, b) => a.timestamp - b.timestamp);
+      .sort(fillChronology);
     for (const f of chronological) {
       const signedFill = f.side === "buy" ? f.amount : -f.amount;
       const priorQty = signedQty;
@@ -1363,6 +1380,10 @@ function countAtOrBefore(samples: Array<[number, number]>, target: number): numb
   return lo;
 }
 
+function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[], cvd: number[]): void {
+  line.setData(rows.map((r, i) => ({ time: toTime(r[0]), value: cvd[i] })));
+}
+
 /**
  * Incremental CVD: a full rebuild on reset, otherwise only the forming bar's
  * value changes or the new tail bars are appended. Recomputing all 10k points
@@ -1439,36 +1460,6 @@ function updateCvd(
   cache.len = n;
   cache.lastTime = last[0];
   cache.lastDelta = barDelta(last);
-}
-
-function updateCvd(
-  line: ISeriesApi<"Line">,
-  rows: CandleRow[],
-  previousRows: CandleRow[],
-  values: number[],
-): void {
-  if (
-    rows.length === 0
-    || previousRows.length === 0
-    || rows.length < previousRows.length
-    || rows[0] !== previousRows[0]
-  ) {
-    const full = cumulativeDelta(rows);
-    pushCvd(line, rows, full);
-    values.length = 0;
-    for (const value of full) values.push(value);
-    return;
-  }
-
-  const firstChanged = Math.max(0, previousRows.length - 1);
-  for (let index = firstChanged; index < rows.length; index += 1) {
-    const row = rows[index];
-    const base = index > 0 ? values[index - 1] : 0;
-    const next = base + (row[4] >= row[1] ? row[5] : -row[5]);
-    if (index === values.length) values.push(next);
-    else values[index] = next;
-    line.update({ time: toTime(row[0]), value: next });
-  }
 }
 
 function pushBars(

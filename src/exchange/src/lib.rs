@@ -87,11 +87,20 @@ impl Default for Exchange {
 
 impl Exchange {
     /// Create an exchange with the given configuration.
+    ///
+    /// The venue fee schedule comes from `config.fee_tiers`, so a fee-free
+    /// simulation (`maker = taker = 0`) sizes positions and books PnL exactly
+    /// at the price move. Engines created later by `add_market` inherit it.
     pub fn new(config: Config) -> Self {
+        let mut broker = Broker::new();
+        broker.set_fees(simccxt_order_engine::FeeSchedule {
+            maker: config.fee_tiers.maker,
+            taker: config.fee_tiers.taker,
+        });
         Self {
             clock: Clock::new(&config),
             bus: EventBus::new(),
-            broker: Broker::new(),
+            broker,
             candles: HashMap::new(),
             trades: HashMap::new(),
             tickers: HashMap::new(),
@@ -120,6 +129,21 @@ impl Exchange {
     /// Load historical OHLCV candles into the exchange.
     pub fn load_candles(&mut self, symbol: &str, timeframe: &str, candles: Vec<OHLCV>) {
         self.candles.insert((symbol.to_string(), timeframe.to_string()), candles);
+    }
+
+    /// Keep only the `symbol@timeframe` candle series and forget the replay
+    /// cursors of every other series.
+    ///
+    /// `feed_due` advances ALL loaded series, so a client that switches coins
+    /// (or intervals) while leaving the previous series loaded would replay it
+    /// in the background: its stops/TPs fire and its positions move even though
+    /// its chart is not on screen. A single-series replay (the browser engine)
+    /// calls this right after loading the new series.
+    pub fn retain_candles(&mut self, symbol: &str, timeframe: &str) {
+        self.candles
+            .retain(|(sym, tf), _| sym == symbol && tf == timeframe);
+        self.replayed
+            .retain(|(sym, tf), _| sym == symbol && tf == timeframe);
     }
 
     /// Load historical trades into the exchange.
@@ -524,7 +548,7 @@ impl Exchange {
     /// Number of fills in the account's execution log without materializing
     /// the CCXT-shaped rows returned by `fetch_fills`.
     pub fn fill_count(&self) -> usize {
-        self.broker.fill_count()
+        self.broker.fills_len()
     }
 
     /// Total account equity: quote free + marked-to-market positions + spot value.
@@ -1449,7 +1473,10 @@ mod tests {
         );
         ex.reset(DateTime::from_timestamp_millis(2_000).unwrap());
 
-        assert_eq!(ex.ohlcv_counts("BTC/USDT", "1s"), (2, 3));
+        assert_eq!(
+            (ex.live_len("BTC/USDT", "1s"), ex.total_len("BTC/USDT", "1s")),
+            (2, 3)
+        );
         let all = ex.fetch_ohlcv_live("BTC/USDT", "1s");
         let remainder = ex.fetch_ohlcv_live_from("BTC/USDT", "1s", 1);
         assert_eq!(remainder, all[1..]);

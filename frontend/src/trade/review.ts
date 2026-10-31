@@ -10,6 +10,7 @@
 // before it hit me?" (MFE/MAE) and "did I follow my own rules?" (verdict).
 
 import type { CandleRow, DiaryTrade } from "../types/protocol";
+import { tradeRef } from "./diary.ts";
 
 /** How the trade ended, judged against the trader's own protective levels. */
 export type ExitKind =
@@ -155,7 +156,7 @@ export function buildReview(
   const rows: ReviewRow[] = [];
 
   for (const trade of ordered) {
-    const ref = `${trade.entry_order_id}-${trade.exit_order_id}`;
+    const ref = tradeRef(trade);
     // Levels come from the caller when it tracked them, otherwise from the trade
     // itself (the server records the stop/TP the trader planned).
     const level = levels[ref] ?? {
@@ -176,13 +177,26 @@ export function buildReview(
     // not. An unprotected trade therefore still shows "how far it went" — in
     // percent — instead of a blank cell.
     if (kind !== "open" && trade.entry_price > 0) {
-      const { mfe, mae } = excursion(
+      let { mfe, mae } = excursion(
         candlesFor(trade),
         trade.entry_time_ms,
         trade.exit_time_ms,
         trade.side === "short" ? "short" : "long",
         trade.entry_price,
       );
+      // A protective order closes the position AT its level: the bar it fired
+      // on can trade far past it, but the trader never lived through that
+      // move. Without the cap a stop-out on a wide bar reads "было в −4.7R"
+      // next to its actual −1R, and a take-profit looks like it ran much
+      // further than the target it was closed at.
+      const stopLevel = typeof level.stop === "number" ? level.stop : null;
+      const targetLevel = typeof level.target === "number" ? level.target : null;
+      if (kind === "stop" && stopLevel !== null) {
+        mae = Math.min(mae, Math.abs(trade.entry_price - stopLevel));
+      }
+      if (kind === "target" && targetLevel !== null) {
+        mfe = Math.min(mfe, Math.abs(targetLevel - trade.entry_price));
+      }
       if (mfe > 0 || mae > 0) {
         mfePct = Number(((mfe / trade.entry_price) * 100).toFixed(3));
         maePct = Number(((mae / trade.entry_price) * 100).toFixed(3));
@@ -190,14 +204,24 @@ export function buildReview(
       const hasStop = typeof level.stop === "number" && Number.isFinite(level.stop);
       if (hasStop) {
         const riskPerUnit = Math.abs(trade.entry_price - level.stop!);
-        mfeR = toR(mfe, riskPerUnit);
-        maeR = toR(mae, riskPerUnit);
-        if (mfeR !== null) {
-          // Realized R uses the SAME unit as the excursion (the planned stop
-          // distance × size), so the two are comparable even when the session
-          // has no fixed risk budget configured (the server's `r` is then 0).
-          const realizedR = toR(trade.pnl, riskPerUnit * trade.qty);
-          gaveBackR = realizedR !== null ? Number((mfeR - realizedR).toFixed(6)) : null;
+        // One R everywhere: the trader's MONEY risk, not the bare stop
+        // distance. Sizing is `risk_usdt / (stop distance + fees)`, so a stop
+        // costs the whole budget and 1R is `risk_usdt` — the same denominator
+        // as the R column and the challenge board. Using the stop distance
+        // alone made the excursion a different unit: a take-profit exit showed
+        // "было в +1.2R" next to "+0.47R" for the very same trade, the gap
+        // being the round-trip fees (0.32R on a tight stop).
+        //
+        // Without a configured budget the per-trade stop distance × size is
+        // the only available R, which keeps the panel usable on its own.
+        const budget = options.riskUsdt;
+        const moneyPerR =
+          typeof budget === "number" && budget > 0 ? budget : riskPerUnit * trade.qty;
+        if (moneyPerR > 0) {
+          mfeR = Number(((mfe * trade.qty) / moneyPerR).toFixed(6));
+          maeR = Number(((mae * trade.qty) / moneyPerR).toFixed(6));
+          const realizedR = trade.pnl / moneyPerR;
+          gaveBackR = Number((mfeR - realizedR).toFixed(6));
         }
       }
     }

@@ -56,8 +56,25 @@ export function fmtChartTime(ms: number): string {
 /** Signed money with thousands separators (empty for non-finite). */
 export function fmtPnl(n: number): string {
   if (!Number.isFinite(n)) return "—";
-  const v = n.toLocaleString("en-US", { maximumFractionDigits: 2 });
-  return (n > 0 ? "+" : "") + v;
+  // `-Math.abs(0)` is `-0`, which would render as "-0" (e.g. the fee column of
+  // a fee-free session).
+  const value = Object.is(n, -0) ? 0 : n;
+  const v = value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  return (value > 0 ? "+" : "") + v;
+}
+
+/**
+ * Stable identity of one reconstructed trade inside a trader's history.
+ *
+ * Order ids restart at 1 on every page load, so `entry-exit` alone collides
+ * between replay sessions (two different trades of the same symbol would share
+ * a key and inherit each other's review row). The engine instance is part of
+ * the ref; older server payloads without one still produce a usable key.
+ */
+export function tradeRef(trade: Pick<DiaryTrade, "engine_id" | "entry_order_id" | "exit_order_id">): string {
+  const engine = trade.engine_id ?? "";
+  const pair = `${trade.entry_order_id}-${trade.exit_order_id}`;
+  return engine === "" ? pair : `${engine}-${pair}`;
 }
 
 /**
@@ -74,7 +91,7 @@ export function diaryMarkers(
   const out: DiaryMarker[] = [];
   for (const t of trades) {
     if (t.symbol !== symbol) continue;
-    const ref = `${t.entry_order_id}-${t.exit_order_id}`;
+    const ref = tradeRef(t);
     out.push({
       time_ms: t.entry_time_ms,
       side: t.side,

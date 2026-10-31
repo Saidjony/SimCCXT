@@ -160,6 +160,67 @@ describe("buildReview", () => {
     assert.equal(row.gaveBackR, 7, "6R of favourable move, and it ended −1R");
   });
 
+  it("keeps the excursion in the same R as the PnL column", () => {
+    // Real trade: SOL short 119.76, stop 121.00, TP 118.30, risk budget 10
+    // USDT. The stop distance is 1.24, but sizing adds the round-trip fees, so
+    // 1R of MONEY is 10 USDT, not 1.24 × 5.429. The excursion must use the
+    // same denominator, otherwise "было в +1.2R" sits next to "+0.47R" for the
+    // very same take-profit exit (the gap is the 0.32R of fees).
+    const rows = buildReview(
+      [
+        trade({
+          side: "short",
+          direction: "sell→buy",
+          qty: 5.429176393941054,
+          entry_price: 119.76,
+          exit_price: 118.3,
+          pnl: 4.695423204299964,
+          r: 0.46954232042999644,
+          entry_order_id: "1",
+          exit_order_id: "2",
+        }),
+      ],
+      () => [bar(T0, 119.76, 120.628, 118.272, 118.3)],
+      { levels: { "1-2": { stop: 121, target: 118.3 } }, riskUsdt: 10 },
+    );
+    const row = rows[0];
+    // The take-profit closed the position AT 118.30, so the favourable move
+    // stops there even though the exit bar wicked 0.028 lower.
+    assert.ok(Math.abs((row.mfeR ?? 0) - 0.79266) < 1e-5, `mfeR ${row.mfeR}`);
+    assert.ok(Math.abs((row.maeR ?? 0) - 0.471253) < 1e-5, `maeR ${row.maeR}`);
+    assert.ok(
+      Math.abs((row.gaveBackR ?? 0) - 0.32312) < 1e-4,
+      `gave back ${row.gaveBackR}`,
+    );
+    // Sanity: a full stop-out is exactly −1R of money, by construction.
+    assert.ok(row.mfeR !== null && row.mfeR < 1, "TP inside 1R must read < 1R");
+  });
+
+  it("caps a stop-out's excursion at the level that closed it", () => {
+    // The stop fired on a wide bar (low 80), but the position was closed at
+    // 95: the trader never lived through the rest of that move, so "было в −"
+    // must read −1R, not −4R. Money R is the 10 USDT budget (2 × 5 points).
+    const rows = buildReview(
+      [trade({ qty: 2, exit_price: 95, pnl: -10, r: -1, exit_reason: "stop" })],
+      () => [bar(T0, 100, 101, 80, 95)],
+      { levels: { "e1-x1": { stop: 95 } }, riskUsdt: 10 },
+    );
+    assert.equal(rows[0].kind, "stop");
+    assert.equal(rows[0].maeR, 1, "the stop distance, not the bar's full wick");
+  });
+
+  it("caps a take-profit's excursion at the target", () => {
+    // The TP filled at 110 while the bar ran to 130. The trade made 1R, so
+    // "было в +" cannot claim +3R of profit it never booked.
+    const rows = buildReview(
+      [trade({ exit_price: 110, pnl: 10, r: 1, exit_reason: "take" })],
+      () => [bar(T0, 100, 130, 99, 110)],
+      { levels: { "e1-x1": { stop: 95, target: 110 } }, riskUsdt: 10 },
+    );
+    assert.equal(rows[0].kind, "target");
+    assert.equal(rows[0].mfeR, 1, "the target distance, not the bar's full range");
+  });
+
   it("flags a trade that had no stop", () => {
     const rows = buildReview([trade()], () => [], {});
     assert.ok(rows[0].flags.includes("без стопа — риск не определён"));

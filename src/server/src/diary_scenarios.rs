@@ -11,7 +11,6 @@
 //! shows. Every run is offline and deterministic (synthetic bars, no cache),
 //! and no test hardcodes a price — the synthetic series is walked instead.
 
-use std::path::Path;
 
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot};
@@ -25,10 +24,6 @@ const CAPITAL: f64 = 1000.0;
 const DAY_MS: i64 = 86_400_000;
 
 /// No cache here: every series is deterministic synthetic data, so these tests
-/// never reach the network.
-fn test_data_dir() -> &'static Path {
-    Path::new("/nonexistent-simccxt-diary-scenario")
-}
 
 fn engine() -> (Engine, broadcast::Receiver<String>) {
     let (tx, rx) = broadcast::channel::<String>(1024);
@@ -39,7 +34,7 @@ fn engine() -> (Engine, broadcast::Receiver<String>) {
 /// browser puts on the wire.
 fn send(eng: &mut Engine, client_id: u64, msg: Value) {
     let cmd: ClientCmd = serde_json::from_value(msg).expect("client message parses");
-    eng.handle_command(client_id, cmd, test_data_dir());
+    eng.handle_command(client_id, cmd);
 }
 
 /// A trader opening their terminal: pick a series, step a couple of bars so
@@ -50,6 +45,13 @@ fn open_trader(eng: &mut Engine, client_id: u64, timeframe: &str, nick: &str, ri
         client_id,
         json!({"type": "subscribe", "symbol": SYM, "timeframe": timeframe, "exchange": "binance"}),
     );
+    // Market data is the browser's job now, so the session starts without a
+    // series: seed one (as the browser would) and step a couple of bars so the
+    // trader has a live price to trade.
+    let step: i64 = if timeframe == "1d" { 86_400_000 } else { 300_000 };
+    // 400 bars of history, with the reveal boundary here and plenty of bars
+    // still AHEAD of the clock: these scenarios walk the replay forward.
+    eng.seed_series(client_id, SYM, timeframe, 4_000_000, 400, 4_000_000, 4_000_000, 4_000_000 + 400 * step);
     send(eng, client_id, json!({"type": "replay", "action": "step", "steps": 2}));
     send(eng, client_id, json!({"type": "login", "name": nick}));
     send(
@@ -132,7 +134,7 @@ fn traders(eng: &Engine) -> Value {
 
 /// The trader hangs up (browser tab closed).
 fn disconnect(eng: &mut Engine, client_id: u64) {
-    eng.handle_job(EngineJob::Disconnect { client_id }, test_data_dir());
+    eng.handle_job(EngineJob::Disconnect { client_id });
 }
 
 fn array<'a>(value: &'a Value, key: &str) -> &'a Vec<Value> {
@@ -388,7 +390,7 @@ fn stats_math_is_self_consistent() {
     open_trader(&mut eng, 1, "5m", NICK, RISK);
 
     // Trade 1 exits at the highest close still ahead in the window: the series
-    // is scanned instead of hardcoding a price, and it must clear the fees.
+    // is scanned instead of hardcoding a price.
     let rows = series(&eng, 1, "5m");
     let start = bar_index(&eng, 1, "5m") as usize;
     let (peak_i, peak) = rows[start + 1..]
@@ -402,15 +404,22 @@ fn stats_math_is_self_consistent() {
     let entry = last_price(&eng, 1);
     assert!(
         peak > entry * 1.02,
-        "the synthetic window must contain a move worth more than the fees: peak {peak} vs entry {entry}"
+        "the synthetic window must contain a move worth trading: peak {peak} vs entry {entry}"
     );
     let distance = peak_i as i64 - bar_index(&eng, 1, "5m");
     jump_bars(&mut eng, 1, distance);
     market(&mut eng, 1, "sell", 0.2, None); // winner
 
-    // Trade 2 exits on the very next bar: a single 5m bar never covers the
-    // round-trip fees, so this one is a guaranteed loser.
-    jump_bars(&mut eng, 1, 1);
+    // Trade 2 buys on a bar whose NEXT bar closes lower, so the exit is a
+    // guaranteed loser now that no commission is charged: the direction of the
+    // price is the whole PnL.
+    let rows = series(&eng, 1, "5m");
+    let now = bar_index(&eng, 1, "5m") as usize;
+    let down = (now + 1..rows.len().saturating_sub(1))
+        .find(|i| rows[i + 1][4] < rows[*i][4])
+        .expect("a down bar ahead");
+    let distance = down as i64 - bar_index(&eng, 1, "5m");
+    jump_bars(&mut eng, 1, distance);
     market(&mut eng, 1, "buy", 0.2, None);
     jump_bars(&mut eng, 1, 1);
     market(&mut eng, 1, "sell", 0.2, None);
@@ -442,7 +451,7 @@ fn stats_math_is_self_consistent() {
     assert!((num(stats, "avg_loss") - losses[0]).abs() < 1e-9);
     assert!((num(stats, "best") - wins[0]).abs() < 1e-9);
     assert!((num(stats, "worst") - losses[0]).abs() < 1e-9);
-    assert!(num(stats, "fees") > 0.0, "both legs of both trades paid a fee");
+    assert_eq!(num(stats, "fees"), 0.0, "the simulator charges no commission");
     assert!((num(stats, "fees") - sum_by(trades, "fee")).abs() < 1e-12);
     assert!(
         (num(stats, "realized_pnl") - num(stats, "fees") - num(stats, "total_pnl")).abs() < 1e-9,
@@ -866,4 +875,75 @@ fn traders_board_drops_a_departed_trader() {
     );
     assert_eq!(diary(&eng, "Первый")["error"], "trader not found");
     assert!(diary(&eng, "Второй").get("error").is_none(), "the other trader is untouched");
+}
+
+/// Mirror one browser engine's fills the way `local_sync` does.
+fn local_sync(eng: &mut Engine, client_id: u64, engine_id: &str, fills: Value, realized: f64) {
+    send(
+        eng,
+        client_id,
+        json!({
+            "type": "local_sync",
+            "account": {
+                "equity": CAPITAL + realized,
+                "pnl": { "realized": realized, "unrealized": 0.0, "fees": 0.0 },
+                "positions": []
+            },
+            "fills": fills,
+            "replace_fills": false,
+            "engine_id": engine_id,
+            "entry_protections": {},
+            "exit_reasons": {},
+            "symbol": SYM,
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": { "start_ms": 0, "reveal_start_ms": 0, "end_ms": 0 }
+        }),
+    );
+}
+
+/// A page reload builds a NEW browser engine, and order ids start over at 1.
+/// The reloaded tab replays from the same bar, so its entry fill is identical
+/// to the old page's entry (same id, time, price, amount) while its exit is a
+/// different execution. FIFO over the merged bag paired the new entry with the
+/// OLD exit and the old entry with the new exit, inventing a trade that never
+/// happened (and reversing a side).
+#[test]
+fn a_reload_does_not_pair_fills_across_engine_instances() {
+    let (mut eng, _rx) = engine();
+    open_trader(&mut eng, 1, "5m", NICK, RISK);
+
+    // Page 1: long 1.0 at 100, closed at 110.
+    local_sync(
+        &mut eng,
+        1,
+        "page-1",
+        json!([
+            {"id":"1_0","symbol":SYM,"timestamp":1_000,"price":100.0,"amount":1.0,"orderId":"1","side":"buy","fee":0.0},
+            {"id":"2_0","symbol":SYM,"timestamp":2_000,"price":110.0,"amount":1.0,"orderId":"2","side":"sell","fee":0.0}
+        ]),
+        10.0,
+    );
+    // Page 2 (reload): the same entry, a different exit at 105.
+    local_sync(
+        &mut eng,
+        1,
+        "page-2",
+        json!([
+            {"id":"1_0","symbol":SYM,"timestamp":1_000,"price":100.0,"amount":1.0,"orderId":"1","side":"buy","fee":0.0},
+            {"id":"2_0","symbol":SYM,"timestamp":3_000,"price":105.0,"amount":1.0,"orderId":"2","side":"sell","fee":0.0}
+        ]),
+        15.0,
+    );
+
+    let d = diary(&eng, NICK);
+    let trades = array(&d, "trades");
+    assert_eq!(trades.len(), 2, "two real round trips, no phantom: {d}");
+    assert!(
+        trades.iter().all(|t| t["side"] == "long"),
+        "both page loads were longs: {d}"
+    );
+    let exits: Vec<f64> = trades.iter().map(|t| num(t, "exit_price")).collect();
+    assert_eq!(exits, vec![110.0, 105.0], "each exit belongs to its own entry");
+    assert_eq!(num(&trades[1], "pnl"), 5.0);
 }
