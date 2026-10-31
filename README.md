@@ -49,7 +49,6 @@ ticket with a mandatory stop, a shared challenge board and a post-trade diary.
 One process, one port: the terminal, the WebSocket and the diary API.
 
 ```bash
-rustup target add wasm32-unknown-unknown        # once — the browser engine target
 cargo build --release -p simccxt-server
 cd frontend && npm install && npm run build && cd ..
 
@@ -62,9 +61,12 @@ authentication yet). `--web-dir` points at another build output if needed.
 
 Pick a coin, press ▶, click BUY. Candles go from the venue straight to the
 browser; the order, position and PnL are computed by the tab's Rust/WASM
-engine. `npm run build` compiles that engine itself (hence the
-`wasm32-unknown-unknown` target) — a fresh clone has no `simccxt_wasm.wasm`
-until then, and the build fails loudly instead of shipping a broken page.
+engine. `npm run build` compiles that engine itself — a fresh clone has no
+`simccxt_wasm.wasm` until then, and the build fails loudly instead of shipping
+a broken page. The `wasm32-unknown-unknown` target is installed by the build
+(`rustup target add`) the first time it is needed; set `SIMCCXT_SKIP_RUSTUP=1`
+to disable that in CI, and add the wasm standard library manually if your Rust
+did not come from rustup.
 
 ### Development
 
@@ -167,6 +169,7 @@ npm test                    # pure protocol/math tests
 |---|---|
 | `Address already in use` | stale server — find the exact PID and kill it (avoid `pkill -f`) |
 | `expected magic word 00 61 73 6d, found 3c 21 64 6f 63` | `simccxt_wasm.wasm` was not built (the server answered with index.html). Run `cd frontend && npm run build:wasm` and reload |
+| `can't find crate for core` / `std` | the `wasm32-unknown-unknown` target is missing; `rustup target add wasm32-unknown-unknown` (the build does this itself when rustup is present) |
 | `connecting…` forever | `simccxt-server` is not running, or the page is on vite dev without :9001; override with `VITE_WS_URL` |
 | `data Ns ago` keeps growing | silent link past the 10 s heartbeat; the watchdog reconnects |
 | chart stays at one bar | the clock is paused after reset — press ▶ |

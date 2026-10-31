@@ -20,6 +20,7 @@ const publicDir = resolve(frontendDir, "public");
 const wasmPublic = resolve(publicDir, "simccxt_wasm.wasm");
 const force = process.argv.includes("--force");
 
+const WASM_TARGET = "wasm32-unknown-unknown";
 const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d]; // "\0asm"
 
 /** Newest mtime of the Rust sources this artifact is built from. */
@@ -47,6 +48,62 @@ function mtime(path) {
   }
 }
 
+/** Installed rustup targets, or `null` when rustup itself is unavailable. */
+function installedTargets() {
+  try {
+    const out = execFileSync("rustup", ["target", "list", "--installed"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return new Set(out.split(/\s+/).filter(Boolean));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Make sure the browser target is installed.
+ *
+ * Without it cargo dies with pages of `can't find crate for core` after a few
+ * crates have already been built, which looks like a broken project. The fix is
+ * one `rustup target add` (a one-time download of a few megabytes), so the
+ * script does it; `SIMCCXT_SKIP_RUSTUP=1` opts out for offline/CI setups.
+ */
+function ensureWasmTarget() {
+  const targets = installedTargets();
+  if (targets === null || targets.has(WASM_TARGET)) return true;
+  if (process.env.SIMCCXT_SKIP_RUSTUP === "1") return false;
+  console.log(`[wasm] installing the ${WASM_TARGET} target (rustup target add)…`);
+  try {
+    execFileSync("rustup", ["target", "add", WASM_TARGET], { stdio: "inherit" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Short, actionable failure instead of a wall of compiler errors. */
+function fail(reason) {
+  console.error(
+    [
+      "",
+      `[wasm] не удалось собрать simccxt_wasm.wasm${reason ? `: ${reason}` : "."}`,
+      "",
+      "Нужны Rust и wasm-цель:",
+      "",
+      `    rustup target add ${WASM_TARGET}`,
+      `    cargo build -p simccxt-wasm --release --target ${WASM_TARGET}`,
+      "",
+      "Затем повторите: npm run build:wasm",
+      "",
+      "Если rustup нет (Rust из дистрибутива), поставьте стандартную библиотеку",
+      "для wasm или установите Rust через https://rustup.rs",
+      "",
+    ].join("\n"),
+  );
+  process.exit(1);
+}
+
 const sourceTime = Math.max(
   newestSourceTime(join(repositoryDir, "src")),
   mtime(join(repositoryDir, "Cargo.toml")),
@@ -62,27 +119,18 @@ if (upToDate) {
   process.exit(0);
 }
 
+if (!ensureWasmTarget()) {
+  fail(`не установлена цель ${WASM_TARGET}`);
+}
+
 try {
   execFileSync(
     "cargo",
-    ["build", "-p", "simccxt-wasm", "--release", "--target", "wasm32-unknown-unknown"],
+    ["build", "-p", "simccxt-wasm", "--release", "--target", WASM_TARGET],
     { cwd: repositoryDir, stdio: "inherit" },
   );
 } catch (error) {
-  console.error(
-    [
-      "",
-      "[wasm] не удалось собрать simccxt_wasm.wasm.",
-      "Проверьте, что установлены Rust и wasm-цель:",
-      "",
-      "    rustup target add wasm32-unknown-unknown",
-      "    cargo build -p simccxt-wasm --release --target wasm32-unknown-unknown",
-      "",
-      "Затем повторите: npm run build:wasm",
-      "",
-    ].join("\n"),
-  );
-  process.exit(1);
+  fail(error.code === "ENOENT" ? "cargo не найден в PATH" : undefined);
 }
 
 const bytes = readFileSync(wasmTarget);
