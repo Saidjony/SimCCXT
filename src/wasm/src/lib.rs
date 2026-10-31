@@ -127,6 +127,22 @@ fn init(message: &Value) -> Result<(), String> {
         .single()
         .ok_or_else(|| "start_ms is out of range".to_string())?;
     exchange.mark_history_played(&symbol_value, timeframe, start_time);
+    // Seed the reference price from the last bar at or before the reveal
+    // boundary. Without it the engine has no price until the first `step`, so
+    // a market entry on the freshly opened chart failed with "no reference
+    // price ... advance the clock" even though the price was right there on
+    // the screen. `apply_price` also seeds the synthetic book level that
+    // market orders fill against.
+    if let Some(last) = rows
+        .iter()
+        .filter(|row| row.first().is_some_and(|ts| *ts <= start_ms as f64))
+        .next_back()
+    {
+        if last[4] > 0.0 {
+            exchange.set_last_price(symbol, last[4]);
+            exchange.apply_price(&symbol_value, last[4], start_time);
+        }
+    }
 
     ENGINE.with(|engine| {
         *engine.borrow_mut() = Some(Engine {

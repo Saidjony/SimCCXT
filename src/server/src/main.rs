@@ -31,6 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -2359,26 +2360,40 @@ fn routing_target(text: &str) -> Option<u64> {
 #[derive(Debug)]
 struct Args {
     port: u16,
+    /// Interface to bind. `127.0.0.1` by default; `0.0.0.0` for a VPS.
+    host: String,
     symbol: String,
     timeframe: String,
+    /// Directory with the built frontend, served on the same port as the
+    /// WebSocket. `None` means "find frontend/dist automatically".
+    web_dir: Option<PathBuf>,
     /// `--offline`: no network at all (kept for tests and demos).
     offline: bool,
 }
 
 fn parse_args() -> Args {
     let mut port = 9001u16;
+    let mut host = "127.0.0.1".to_string();
     let mut symbol = "BTC/USDT".to_string();
     let mut timeframe = "5m".to_string();
+    let mut web_dir: Option<PathBuf> = None;
     let mut offline = false;
     let mut it = std::env::args().skip(1).peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--port" => port = it.next().and_then(|v| v.parse().ok()).unwrap_or(port),
+            "--host" => host = it.next().unwrap_or(host),
+            "--web-dir" => web_dir = it.next().map(PathBuf::from),
             "--symbol" => symbol = it.next().unwrap_or(symbol),
             "--timeframe" | "--tf" => timeframe = it.next().unwrap_or(timeframe),
             "--offline" => offline = true,
             "--help" | "-h" => {
-                println!("simccxt-server [--port 9001] [--symbol BTC/USDT] [--timeframe 5m] [--offline]");
+                println!(
+                    "simccxt-server [--port 9001] [--host 127.0.0.1] [--web-dir frontend/dist]\n\
+                     \x20                [--symbol BTC/USDT] [--timeframe 5m] [--offline]\n\n\
+                     Serves the terminal, the WebSocket API and the diary API on ONE port\n\
+                     when a built frontend is found (or --web-dir points at one)."
+                );
                 std::process::exit(0);
             }
             _ => log!("[args] ignoring unknown flag {a}"),
@@ -2386,8 +2401,10 @@ fn parse_args() -> Args {
     }
     Args {
         port,
+        host,
         symbol,
         timeframe,
+        web_dir,
         offline,
     }
 }
@@ -2439,6 +2456,10 @@ fn engine_main(
 async fn main() {
     let args = parse_args();
     let port = args.port;
+    let host = args.host.clone();
+    // The built terminal is served from the SAME port as the WebSocket, so
+    // `--port 19010` is the only address a user has to open.
+    let web_dir = find_web_dir(args.web_dir.clone());
     let (jobs_tx, jobs_rx) = mpsc::channel::<EngineJob>();
     let (out_tx, _) = broadcast::channel::<String>(1024);
     let out_for_engine = out_tx.clone();
@@ -2454,17 +2475,26 @@ async fn main() {
             )
         })
         .expect("spawn engine thread");
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    let listener = TcpListener::bind((host.as_str(), port))
         .await
         .expect("bind ws port");
-    log!("[ws] simccxt-server listening on ws://127.0.0.1:{port}/");
-    let http_port = port + 1;
+    log!("[ws] simccxt-server listening on ws://{host}:{port}/");
+    match &web_dir {
+        Some(dir) => log!("[web] terminal: http://{host}:{port}/ (from {})", dir.display()),
+        None => log!(
+            "[web] no built frontend found (frontend/dist) — serving API/WS only; \
+             run `cd frontend && npm run build`"
+        ),
+    }
+    let http_port = port.saturating_add(1);
     // The diary HTTP API is optional: if `ws_port + 1` is taken (another
     // tool's range), degrade to WebSocket-only instead of killing the server.
-    match TcpListener::bind(("127.0.0.1", http_port)).await {
-        Err(e) => log!("[http] diary API disabled (port {http_port} busy): {e}"),
+    // It is kept as an alias for the dev setup (vite :5173 -> ws :9001 ->
+    // api :9002); the same routes are also served on `port` itself.
+    match TcpListener::bind((host.as_str(), http_port)).await {
+        Err(e) => log!("[http] diary API alias disabled (port {http_port} busy): {e}"),
         Ok(http_listener) => {
-            log!("[http] simccxt diary API listening on http://127.0.0.1:{http_port}/");
+            log!("[http] simccxt diary API alias on http://{host}:{http_port}/");
             let jobs_tx_http = jobs_tx.clone();
 
             // HTTP: GET /api/traders, GET /api/trader/:nick. Market data is not
@@ -2480,7 +2510,7 @@ async fn main() {
                     };
                     let tx = jobs_tx_http.clone();
                     tokio::spawn(async move {
-                        handle_http_request(stream, tx).await;
+                        handle_http_request(stream, tx, None).await;
                     });
                 }
             });
@@ -2498,13 +2528,19 @@ async fn main() {
         };
         let id = next_id;
         next_id += 1;
-        tokio::spawn(handle_conn(
-            stream,
-            addr,
-            id,
-            jobs_tx.clone(),
-            out_tx.clone(),
-        ));
+        let jobs = jobs_tx.clone();
+        let out = out_tx.clone();
+        let web = web_dir.clone();
+        // One port, two protocols: a WebSocket handshake starts with the same
+        // "GET / HTTP/1.1" as a page request, so the first bytes are PEEKED
+        // (not consumed) and the socket is routed by the Upgrade header.
+        tokio::spawn(async move {
+            if is_websocket_request(&stream).await {
+                handle_conn(stream, addr, id, jobs, out).await;
+            } else {
+                handle_http_request(stream, jobs, web).await;
+            }
+        });
     }
 }
 
@@ -2526,6 +2562,9 @@ enum HttpRoute {
     Options,
     Traders,
     Trader(String),
+    /// Anything that is not `/api/*`: the built terminal (or a 404 for a
+    /// missing asset — never index.html, see `static_file`).
+    Static(String),
     NotFound,
     MethodNotAllowed,
 }
@@ -2535,7 +2574,7 @@ fn route_request(method: &str, target: &str) -> HttpRoute {
     if method == "OPTIONS" {
         return HttpRoute::Options;
     }
-    if method != "GET" {
+    if method != "GET" && method != "HEAD" {
         return HttpRoute::MethodNotAllowed;
     }
     // Split off the query string (no route reads it any more).
@@ -2553,7 +2592,11 @@ fn route_request(method: &str, target: &str) -> HttpRoute {
         }
         return HttpRoute::Trader(nick);
     }
-    HttpRoute::NotFound
+    // Unknown `/api/*` stays a JSON 404; everything else is a file request.
+    if path.starts_with("/api/") {
+        return HttpRoute::NotFound;
+    }
+    HttpRoute::Static(path.to_string())
 }
 
 
@@ -2573,6 +2616,179 @@ fn http_response(status: u16, reason: &str, body: &str) -> String {
          {body}",
         body.len()
     )
+}
+
+/// Response for a static file. Separate from `http_response` because the body
+/// is bytes (the wasm module) and the content type is not JSON.
+fn http_file_response(status: u16, reason: &str, content_type: &str, body: &[u8], cache: &str) -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: {cache}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+/// Directory with the built terminal, served on the WebSocket port.
+///
+/// `--web-dir` wins; otherwise the usual build outputs are probed relative to
+/// the working directory (the README runs the server from the repository
+/// root). `None` means there is no build yet, and the server explains that on
+/// `/` instead of pretending to have a page.
+fn find_web_dir(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(dir) = explicit {
+        return if dir.join("index.html").is_file() {
+            Some(dir)
+        } else {
+            log!("[web] --web-dir {} has no index.html", dir.display());
+            None
+        };
+    }
+    for candidate in ["frontend/dist", "dist", "web"] {
+        let dir = PathBuf::from(candidate);
+        if dir.join("index.html").is_file() {
+            return Some(dir);
+        }
+    }
+    // Also look next to the binary (`target/release/simccxt-server` ->
+    // `<repo>/frontend/dist`), so running it from another directory still
+    // serves the build instead of the "not built" page.
+    if let Ok(exe) = std::env::current_exe() {
+        // `.../target/release/simccxt-server` -> `.../` (the repository root)
+        if let Some(repo) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
+            let dir = repo.join("frontend/dist");
+            if dir.join("index.html").is_file() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Is the first request on this socket a WebSocket handshake?
+///
+/// `TcpStream::peek` reads without consuming, so tungstenite still receives the
+/// full handshake. A WebSocket upgrade and a plain page request both start with
+/// "GET / HTTP/1.1", so the discriminator is the `Upgrade: websocket` header.
+async fn is_websocket_request(stream: &TcpStream) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+    loop {
+        let mut buf = [0u8; 2048];
+        match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
+            Ok(Ok(0)) => return false, // closed
+            Ok(Ok(n)) => {
+                let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                if head.contains("\r\nupgrade: websocket") || head.starts_with("upgrade: websocket") {
+                    return true;
+                }
+                if head.contains("\r\n\r\n") {
+                    return false;
+                }
+                // Partial head: the rest has not arrived yet.
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// `Content-Type` for a built asset. Wrong types break ES modules (a `.js`
+/// served as text/plain is refused) and streaming compilation (`.wasm`).
+fn content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "wasm" => "application/wasm",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Map a URL path onto a file inside `root`.
+///
+/// Returns `None` for traversal attempts and for a missing *asset* (a path with
+/// an extension). Missing extension-less paths fall back to `index.html` so a
+/// client-side route still loads the app. The distinction matters: answering
+/// `/simccxt_wasm.wasm` with index.html is exactly what made the browser fail
+/// with "expected magic word 00 61 73 6d, found 3c 21 64 6f 63".
+fn static_file(root: &Path, raw_path: &str) -> Option<PathBuf> {
+    let decoded = percent_decode(raw_path);
+    let rel = decoded.trim_start_matches('/');
+    let mut path = root.to_path_buf();
+    for part in rel.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains('\\') || part.contains('\0') {
+            return None;
+        }
+        path.push(part);
+    }
+    if path.is_dir() {
+        path.push("index.html");
+    }
+    if path.is_file() {
+        return Some(path);
+    }
+    let last = rel.rsplit('/').next().unwrap_or("");
+    if last.contains('.') {
+        return None;
+    }
+    let index = root.join("index.html");
+    index.is_file().then_some(index)
+}
+
+/// Point the page at the origin that served it.
+///
+/// The same build runs in two setups: vite dev (page :5173, WebSocket :9001)
+/// and single-port (everything on one port, possibly behind a proxy). The
+/// injected value is the browser's own `Host`, so a proxy keeps working, and
+/// `wsUrl()`/`apiUrl()` prefer it over their dev heuristics.
+fn inject_origin(html: &str, origin: &str) -> String {
+    let tag = format!(
+        "<script>window.__SIMCCXT_ORIGIN__={};</script>",
+        serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".into())
+    );
+    match html.find("</head>") {
+        Some(at) => format!("{}{}{}", &html[..at], tag, &html[at..]),
+        None => format!("{tag}{html}"),
+    }
+}
+
+/// `Host` header of the request, restricted to characters that are safe to
+/// embed in an HTML script tag.
+fn request_host(head: &str) -> Option<String> {
+    let value = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("host").then(|| value.trim())
+    })?;
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    safe.then(|| value.to_string())
 }
 
 /// Read the request head (up to the blank line) with a size cap.
@@ -2599,6 +2815,7 @@ async fn read_request_head(stream: &mut tokio::net::TcpStream) -> Option<String>
 async fn handle_http_request(
     mut stream: tokio::net::TcpStream,
     jobs_tx: std::sync::mpsc::Sender<EngineJob>,
+    web: Option<PathBuf>,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -2610,6 +2827,21 @@ async fn handle_http_request(
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
+    // Origin the page should dial back: the browser's own Host (through a
+    // proxy too), plus X-Forwarded-Proto when a TLS terminator is in front.
+    let forwarded_proto = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("x-forwarded-proto")
+            .then(|| value.trim().to_ascii_lowercase())
+    });
+    let origin = request_host(&head).map(|host| {
+        let proto = match forwarded_proto.as_deref() {
+            Some("https") => "https",
+            _ => "http",
+        };
+        format!("{proto}://{host}")
+    });
 
     // Send one job to the engine and wait for its reply (bounded — the
     // engine may be busy warming caches).
@@ -2638,8 +2870,8 @@ async fn handle_http_request(
         )
     };
 
-    let response = match route_request(method, target) {
-        HttpRoute::Options => http_response(204, "No Content", ""),
+    let mut response: Vec<u8> = match route_request(method, target) {
+        HttpRoute::Options => http_response(204, "No Content", "").into_bytes(),
         HttpRoute::Traders => match ask(
             &jobs_tx,
             std::time::Duration::from_secs(10),
@@ -2647,8 +2879,10 @@ async fn handle_http_request(
         )
         .await
         {
-            Ok(v) => json_reply(&v),
-            Err(()) => http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}"),
+            Ok(v) => json_reply(&v).into_bytes(),
+            Err(()) => {
+                http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}").into_bytes()
+            }
         },
         HttpRoute::Trader(nick) => {
             match ask(
@@ -2658,19 +2892,99 @@ async fn handle_http_request(
             )
             .await
             {
-                Ok(v) => json_reply(&v),
-                Err(()) => http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}"),
+                Ok(v) => json_reply(&v).into_bytes(),
+                Err(()) => {
+                    http_response(503, "Service Unavailable", "{\"error\":\"engine busy\"}")
+                        .into_bytes()
+                }
             }
         }
-        HttpRoute::NotFound => http_response(404, "Not Found", "{\"error\":\"not found\"}"),
-        HttpRoute::MethodNotAllowed => http_response(
-            405,
-            "Method Not Allowed",
-            "{\"error\":\"method not allowed\"}",
-        ),
+        HttpRoute::NotFound => http_response(404, "Not Found", "{\"error\":\"not found\"}").into_bytes(),
+        HttpRoute::MethodNotAllowed => {
+            http_response(405, "Method Not Allowed", "{\"error\":\"method not allowed\"}")
+                .into_bytes()
+        }
+        HttpRoute::Static(path) => {
+            let file = web
+                .as_deref()
+                .and_then(|root| static_file(root, &path));
+            match (web.as_ref(), file) {
+                (Some(_), Some(file)) => match std::fs::read(&file) {
+                    Ok(mut body) => {
+                        let is_index = file
+                            .file_name()
+                            .map(|name| name == "index.html")
+                            .unwrap_or(false);
+                        if is_index {
+                            if let Some(origin) = origin.as_deref() {
+                                body =
+                                    inject_origin(&String::from_utf8_lossy(&body), origin).into_bytes();
+                            }
+                        }
+                        let cache = if is_index
+                            || file.extension().map(|ext| ext == "wasm").unwrap_or(false)
+                        {
+                            // A rebuilt wasm must be picked up on the next reload.
+                            "no-store"
+                        } else {
+                            "public, max-age=3600"
+                        };
+                        http_file_response(200, "OK", content_type(&file), &body, cache)
+                    }
+                    Err(e) => {
+                        log!("[web] cannot read {}: {e}", file.display());
+                        http_file_response(
+                            500,
+                            "Internal Server Error",
+                            "text/plain; charset=utf-8",
+                            b"cannot read file",
+                            "no-store",
+                        )
+                    }
+                },
+                (Some(_), None) => http_file_response(
+                    404,
+                    "Not Found",
+                    "text/plain; charset=utf-8",
+                    b"not found",
+                    "no-store",
+                ),
+                // No build: say so on the landing page instead of 404-ing the app.
+                (None, _) if path == "/" => {
+                    let body = NO_BUILD_PAGE.as_bytes();
+                    http_file_response(200, "OK", "text/html; charset=utf-8", body, "no-store")
+                }
+                (None, _) => http_file_response(
+                    404,
+                    "Not Found",
+                    "text/plain; charset=utf-8",
+                    b"frontend is not built",
+                    "no-store",
+                ),
+            }
+        }
     };
-    let _ = stream.write_all(response.as_bytes()).await;
+    // HEAD must not carry a body, but keeps the headers (and Content-Length).
+    if method == "HEAD" {
+        if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            response.truncate(end + 4);
+        }
+    }
+    let _ = stream.write_all(&response).await;
 }
+
+/// Shown on `/` when `frontend/dist` is missing, so the first run explains
+/// itself instead of returning a bare 404.
+const NO_BUILD_PAGE: &str = r#"<!doctype html>
+<html lang="ru"><meta charset="utf-8"><title>simccxt</title>
+<body style="font-family:system-ui,sans-serif;background:#0b0e13;color:#e8e8e8;padding:40px;line-height:1.6">
+<h1 style="margin:0 0 8px">simccxt</h1>
+<p>Сервер запущен, но терминал ещё не собран.</p>
+<pre style="background:#151a22;padding:16px;border-radius:8px">cd frontend
+npm install
+npm run build</pre>
+<p>Затем перезапустите сервер и обновите страницу.</p>
+</body></html>"#;
 
 /// Percent-decode a path/query component to a `String`.
 ///
@@ -3926,8 +4240,9 @@ mod tests {
 
     #[test]
     fn route_rejects_unknown_paths_and_methods() {
-        assert_eq!(route_request("GET", "/"), HttpRoute::NotFound);
-        assert_eq!(route_request("GET", "/api"), HttpRoute::NotFound);
+        // `/` is the terminal itself, not an API miss.
+        assert_eq!(route_request("GET", "/"), HttpRoute::Static("/".into()));
+        assert_eq!(route_request("GET", "/api"), HttpRoute::Static("/api".into()));
         assert_eq!(route_request("GET", "/api/trader/"), HttpRoute::NotFound);
         assert_eq!(
             route_request("POST", "/api/traders"),
@@ -3986,5 +4301,115 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(declared, cyr_body.len());
+    }
+
+    // -- single-port static serving ------------------------------------------
+
+    #[test]
+    fn api_routes_are_separated_from_static_files() {
+        assert_eq!(route_request("GET", "/api/traders"), HttpRoute::Traders);
+        assert_eq!(
+            route_request("GET", "/api/trader/%D0%9A%D0%B8%D1%82"),
+            HttpRoute::Trader("Кит".into())
+        );
+        // Unknown API paths stay JSON 404s instead of falling through to the
+        // SPA and returning index.html for an API call.
+        assert_eq!(route_request("GET", "/api/nope"), HttpRoute::NotFound);
+        assert_eq!(route_request("GET", "/api/trader/"), HttpRoute::NotFound);
+        // Everything else is a file request.
+        assert_eq!(
+            route_request("GET", "/simccxt_wasm.wasm"),
+            HttpRoute::Static("/simccxt_wasm.wasm".into())
+        );
+        assert_eq!(route_request("GET", "/"), HttpRoute::Static("/".into()));
+        assert_eq!(
+            route_request("HEAD", "/assets/app.js"),
+            HttpRoute::Static("/assets/app.js".into())
+        );
+        assert_eq!(
+            route_request("POST", "/api/traders"),
+            HttpRoute::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn missing_asset_is_a_404_not_index_html() {
+        // The exact bug from the screenshot: `/simccxt_wasm.wasm` was answered
+        // with index.html and WebAssembly failed on `3c 21 64 6f 63`.
+        let root = std::env::temp_dir().join(format!("simccxt-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("index.html"), "<!doctype html><head></head>").unwrap();
+        std::fs::write(root.join("assets/app.js"), "export {};").unwrap();
+
+        assert_eq!(
+            static_file(&root, "/").as_deref(),
+            Some(root.join("index.html").as_path())
+        );
+        assert_eq!(
+            static_file(&root, "/assets/app.js").as_deref(),
+            Some(root.join("assets/app.js").as_path())
+        );
+        // A missing asset must NOT fall back to index.html.
+        assert_eq!(static_file(&root, "/simccxt_wasm.wasm"), None);
+        assert_eq!(static_file(&root, "/assets/missing.js"), None);
+        // An extension-less client route still boots the app.
+        assert_eq!(
+            static_file(&root, "/some/route").as_deref(),
+            Some(root.join("index.html").as_path())
+        );
+        // Traversal is refused outright.
+        assert_eq!(static_file(&root, "/../Cargo.toml"), None);
+        assert_eq!(static_file(&root, "/assets/../../Cargo.toml"), None);
+        assert_eq!(static_file(&root, "/%2e%2e/Cargo.toml"), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn content_types_keep_modules_and_wasm_usable() {
+        assert_eq!(
+            content_type(Path::new("index.html")),
+            "text/html; charset=utf-8"
+        );
+        // A `.js` served as text/plain is refused as an ES module.
+        assert_eq!(
+            content_type(Path::new("assets/app.js")),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(content_type(Path::new("simccxt_wasm.wasm")), "application/wasm");
+        assert_eq!(content_type(Path::new("style.css")), "text/css; charset=utf-8");
+        assert_eq!(
+            content_type(Path::new("font.woff2")),
+            "font/woff2"
+        );
+        assert_eq!(
+            content_type(Path::new("no-extension")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn origin_is_injected_once_into_head() {
+        let html = "<!doctype html><html><head><title>x</title></head><body></body></html>";
+        let out = inject_origin(html, "http://130.49.178.95:19010");
+        assert!(out.contains("window.__SIMCCXT_ORIGIN__=\"http://130.49.178.95:19010\""));
+        assert_eq!(out.matches("__SIMCCXT_ORIGIN__").count(), 1);
+        assert!(out.find("__SIMCCXT_ORIGIN__").unwrap() < out.find("</head>").unwrap());
+        // No <head> at all: prepend, still valid.
+        let bare = inject_origin("<p>hi</p>", "http://localhost:19010");
+        assert!(bare.starts_with("<script>"));
+    }
+
+    #[test]
+    fn host_header_is_parsed_and_restricted() {
+        let head = "GET / HTTP/1.1\r\nHost: 127.0.0.1:19010\r\n\r\n";
+        assert_eq!(request_host(head).as_deref(), Some("127.0.0.1:19010"));
+        let v6 = "GET / HTTP/1.1\r\nhost: [::1]:19010\r\n\r\n";
+        assert_eq!(request_host(v6).as_deref(), Some("[::1]:19010"));
+        // Anything that could break out of the inline script is rejected.
+        let bad = "GET / HTTP/1.1\r\nHost: evil\"><script>alert(1)</script>\r\n\r\n";
+        assert_eq!(request_host(bad), None);
+        assert_eq!(request_host("GET / HTTP/1.1\r\n\r\n"), None);
     }
 }

@@ -46,17 +46,37 @@ ticket with a mandatory stop, a shared challenge board and a post-trade diary.
 
 ## Quick start
 
-```bash
-# 1. session server: WebSocket 9001 + diary HTTP 9002 (no market data)
-cargo run -p simccxt-server -- --symbol BTC/USDT --timeframe 5m
+One process, one port: the terminal, the WebSocket and the diary API.
 
-# 2. terminal
-cd frontend && bun install && bun run dev   # http://127.0.0.1:5173/
+```bash
+rustup target add wasm32-unknown-unknown        # once — the browser engine target
+cargo build --release -p simccxt-server
+cd frontend && npm install && npm run build && cd ..
+
+./target/release/simccxt-server --port 19010
+# open http://127.0.0.1:19010/
 ```
+
+On a VPS add `--host 0.0.0.0` (and keep TLS in front: the protocol has no
+authentication yet). `--web-dir` points at another build output if needed.
 
 Pick a coin, press ▶, click BUY. Candles go from the venue straight to the
 browser; the order, position and PnL are computed by the tab's Rust/WASM
-engine. The `wasm32-unknown-unknown` target is required for `npm run build`.
+engine. `npm run build` compiles that engine itself (hence the
+`wasm32-unknown-unknown` target) — a fresh clone has no `simccxt_wasm.wasm`
+until then, and the build fails loudly instead of shipping a broken page.
+
+### Development
+
+```bash
+cargo run -p simccxt-server -- --port 9001    # WS :9001 + diary API :9002
+cd frontend && npm install && npm run dev     # http://127.0.0.1:5173/
+```
+
+`npm run dev` builds the wasm first too. When the page is served by the Rust
+server it dials back to its own origin (`--port 19010` included); in the vite
+dev flow it falls back to `ws://127.0.0.1:9001`, and `VITE_WS_URL` overrides
+both.
 
 ## Architecture
 
@@ -125,8 +145,9 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   back to memory.
 - Open interest is context only, requested on the chart's grid where the venue
   exposes it.
-- The Rust listeners bind to `127.0.0.1` only. For remote access use reverse
-  SSH + TLS on a VPS; the protocol has no authentication yet.
+- The server binds to `127.0.0.1` by default. For remote access run it with
+  `--host 0.0.0.0` and put TLS in front; the protocol has no authentication
+  yet.
 
 ## Build & test
 
@@ -136,8 +157,8 @@ cargo clippy --workspace
 cargo build --release --workspace
 
 cd frontend
-bun run build               # wasm + tsc + vite
-bun test                    # pure protocol/math tests
+npm run build               # wasm + tsc + vite  (bun works too)
+npm test                    # pure protocol/math tests
 ```
 
 ## Troubleshooting
@@ -145,12 +166,14 @@ bun test                    # pure protocol/math tests
 | Symptom | Cause |
 |---|---|
 | `Address already in use` | stale server — find the exact PID and kill it (avoid `pkill -f`) |
-| `connecting…` forever | `simccxt-server` is not running; override with `VITE_WS_URL` |
+| `expected magic word 00 61 73 6d, found 3c 21 64 6f 63` | `simccxt_wasm.wasm` was not built (the server answered with index.html). Run `cd frontend && npm run build:wasm` and reload |
+| `connecting…` forever | `simccxt-server` is not running, or the page is on vite dev without :9001; override with `VITE_WS_URL` |
 | `data Ns ago` keeps growing | silent link past the 10 s heartbeat; the watchdog reconnects |
 | chart stays at one bar | the clock is paused after reset — press ▶ |
 | coin takes long to open | not cached yet; the topbar badge shows warm-up progress |
 | badge shows ⚠ | some pairs failed (unknown symbol or no venue data) |
 | download fails | errors are surfaced; synthetic bars are used only in offline mode |
+| page says «терминал ещё не собран» | `frontend/dist` is missing — `cd frontend && npm run build` |
 
 ## License
 
