@@ -2490,15 +2490,17 @@ async fn main() {
     // The diary HTTP API is optional: if `ws_port + 1` is taken (another
     // tool's range), degrade to WebSocket-only instead of killing the server.
     // It is kept as an alias for the dev setup (vite :5173 -> ws :9001 ->
-    // api :9002); the same routes are also served on `port` itself.
-    match TcpListener::bind((host.as_str(), http_port)).await {
+    // api :9002); the same routes are also served on `port` itself, so the
+    // built terminal and a remote deployment never touch this port.
+    let alias_host = alias_bind_host(&host);
+    match TcpListener::bind((alias_host, http_port)).await {
         Err(e) => log!("[http] diary API alias disabled (port {http_port} busy): {e}"),
         Ok(http_listener) => {
-            log!("[http] simccxt diary API alias on http://{host}:{http_port}/");
+            log!("[http] simccxt diary API alias on http://{alias_host}:{http_port}/");
             let jobs_tx_http = jobs_tx.clone();
 
-            // HTTP: GET /api/traders, GET /api/trader/:nick. Market data is not
-            // served over HTTP any more: every browser downloads its own bars.
+            // HTTP: GET /api/traders, GET /api/trader/:nick, plus the market
+            // fallback the browser uses when it cannot reach a venue itself.
             tokio::spawn(async move {
                 loop {
                     let (stream, _addr) = match http_listener.accept().await {
@@ -2883,6 +2885,17 @@ fn find_web_dir(explicit: Option<PathBuf>) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Interface for the `port + 1` dev alias. A wildcard bind (VPS, `--host
+/// 0.0.0.0`) would publish a second, unauthenticated port that the built
+/// terminal never uses, so the alias stays on loopback there.
+fn alias_bind_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        other => other,
+    }
 }
 
 /// Is the first request on this socket a WebSocket handshake?
@@ -4712,6 +4725,17 @@ mod tests {
         );
         // API paths that are not ours are still JSON 404s, not the SPA.
         assert_eq!(route_request("GET", "/api/market/nope"), HttpRoute::NotFound);
+    }
+
+    #[test]
+    fn dev_alias_stays_off_the_public_interface() {
+        // `--host 0.0.0.0` publishes the terminal; the port + 1 dev alias must
+        // not add a second public port.
+        assert_eq!(alias_bind_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(alias_bind_host("::"), "::1");
+        assert_eq!(alias_bind_host("[::]"), "::1");
+        assert_eq!(alias_bind_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(alias_bind_host("192.168.1.10"), "192.168.1.10");
     }
 
     #[test]

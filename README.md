@@ -46,7 +46,12 @@ ticket with a mandatory stop, a shared challenge board and a post-trade diary.
 
 ## Quick start
 
-One process, one port: the terminal, the WebSocket and the diary API.
+One process, one port for the browser: the terminal, the WebSocket and the
+diary API. (The server also opens `port + 1` as a local-only alias for the
+vite dev flow; the built terminal never uses it.)
+
+Needs Rust (a `rustup` toolchain — the wasm target is installed on demand) and
+Node 18+ (a current LTS release).
 
 ```bash
 cargo build --release -p simccxt-server
@@ -60,7 +65,8 @@ On a VPS add `--host 0.0.0.0` (and keep TLS in front: the protocol has no
 authentication yet). `--web-dir` points at another build output if needed.
 Open the server's own port (`http://<host>:19010/`), not the vite dev port:
 vite is a local development server and its WebSocket/API ports are not part of
-the built terminal.
+the built terminal. A reverse proxy in front of `:19010` works too, as long as
+it forwards WebSocket upgrades.
 
 Pick a coin, press ▶, click BUY. Candles go from the venue straight to the
 browser — or through the server if your network blocks the venue. The order,
@@ -80,8 +86,8 @@ cd frontend && npm install && npm run dev     # http://127.0.0.1:5173/
 
 `npm run dev` builds the wasm first too. When the page is served by the Rust
 server it dials back to its own origin (`--port 19010` included); in the vite
-dev flow it falls back to `ws://127.0.0.1:9001`, and `VITE_WS_URL` overrides
-both.
+dev flow it falls back to `ws://127.0.0.1:9001` and `http://127.0.0.1:9002`,
+and `VITE_WS_URL` / `VITE_API_URL` override them.
 
 ## Architecture
 
