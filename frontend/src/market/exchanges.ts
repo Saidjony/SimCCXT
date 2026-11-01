@@ -11,6 +11,7 @@
 // locally (./aggregate.ts).
 
 import type { CandleRow, ExchangeId } from "../types/protocol.ts";
+import { apiUrl } from "../websocket/origins.ts";
 
 /** Most rows one venue returns per request. */
 export const MAX_BARS_PER_REQUEST = 1000;
@@ -71,9 +72,19 @@ function row(ts: unknown, o: unknown, h: unknown, l: unknown, c: unknown, v: unk
 }
 
 async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
-  const response = await fetch(url, { signal, headers: { Accept: "application/json" } });
+  const host = new URL(url).hostname;
+  let response: Response;
+  try {
+    response = await fetch(url, { signal, headers: { Accept: "application/json" } });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    // "Failed to fetch" says nothing: name the host and the likely cause.
+    throw new Error(
+      `нет связи с ${host} (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status} from ${new URL(url).hostname}`);
+    throw new Error(`HTTP ${response.status} from ${host}`);
   }
   const body: unknown = await response.json();
   // Venue-level errors arrive with HTTP 200.
@@ -85,6 +96,28 @@ async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
     throw new Error(String(err.retMsg ?? `retCode ${err.retCode}`));
   }
   return body;
+}
+
+/**
+ * Same klines request, but fetched by our own server.
+ *
+ * A browser can be cut off from a venue by an IP/region block, a corporate
+ * proxy or CORS, while the machine that runs simccxt-server still reaches it.
+ * The server only forwards the page (it stores nothing), and the browser uses
+ * it only after its own direct request failed — see `downloadBars`.
+ */
+export function proxyKlineUrl(
+  base: string,
+  request: { exchange: ExchangeId; symbol: string; startMs: number; endMs: number; limit: number },
+): string {
+  const query = new URLSearchParams({
+    exchange: request.exchange,
+    symbol: request.symbol,
+    start_ms: String(request.startMs),
+    end_ms: String(request.endMs),
+    limit: String(request.limit),
+  });
+  return `${base.replace(/\/+$/, "")}/api/market/klines?${query.toString()}`;
 }
 
 function parseBinancePage(body: unknown): Page {
@@ -170,18 +203,43 @@ export async function downloadBars(
     if (requests > 0 && requests > 200) break; // hard stop: >200k bars one call
     const limit = MAX_BARS_PER_REQUEST;
     const url = klineUrl(exchange, symbol, cursor, endMs, limit);
-    let page: Page;
+    let body: unknown;
     try {
-      const body = await fetchJson(url, signal);
-      page = parsePage(exchange, body);
+      body = await fetchJson(url, signal);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") throw error;
       const message = error instanceof Error ? error.message : String(error);
+      // A rate limit is not an outage: back off, never reroute it (the
+      // server shares the same venue budget).
       if (message.includes("429") || message.includes("418")) {
         throw new RateLimitedError(`${exchange}: rate limited (${message})`);
       }
-      throw error;
+      // The venue is unreachable from THIS network (region block, proxy,
+      // CORS). Our server usually still sees it — ask it for this one page.
+      const proxied = proxyKlineUrl(apiUrl(), {
+        exchange,
+        symbol,
+        startMs: cursor,
+        endMs,
+        limit,
+      });
+      try {
+        body = await fetchJson(proxied, signal);
+        console.info(
+          `[market] ${exchange} недоступна напрямую (${message}) — страница через сервер`,
+        );
+      } catch (proxyError) {
+        if (proxyError instanceof DOMException && proxyError.name === "AbortError") {
+          throw proxyError;
+        }
+        throw new Error(
+          `${message}; через сервер тоже не вышло: ${
+            proxyError instanceof Error ? proxyError.message : String(proxyError)
+          }`,
+        );
+      }
     }
+    const page = parsePage(exchange, body);
     requests += 1;
     if (page.rows.length === 0) break;
     for (const candle of page.rows) {
@@ -209,6 +267,18 @@ export async function downloadBars(
   return rows;
 }
 
+/** Watchlist quote through our own server (see `downloadTicker`). */
+export function proxyTickerUrl(
+  base: string,
+  request: { exchange: ExchangeId; symbol: string },
+): string {
+  const query = new URLSearchParams({
+    exchange: request.exchange,
+    symbol: request.symbol,
+  });
+  return `${base.replace(/\/+$/, "")}/api/market/ticker?${query.toString()}`;
+}
+
 /** Current public price per symbol (watchlist quotes). */
 export async function downloadTicker(exchange: ExchangeId, symbol: string): Promise<number | null> {
   const { pair } = venueSymbol(symbol);
@@ -217,7 +287,15 @@ export async function downloadTicker(exchange: ExchangeId, symbol: string): Prom
     : exchange === "bybit"
       ? `https://api.bybit.com/v5/market/tickers?category=spot&symbol=${pair}`
       : `https://www.okx.com/api/v5/market/ticker?instId=${pair.replace(/([A-Z]+)$/, "-$1")}`;
-  const body = await fetchJson(url);
+  let body: unknown;
+  try {
+    body = await fetchJson(url);
+  } catch {
+    // Quotes are cosmetic, so a blocked venue must not blank the watchlist:
+    // the server usually still sees it.
+    const proxied = proxyTickerUrl(apiUrl(), { exchange, symbol });
+    body = await fetchJson(proxied);
+  }
   if (exchange === "binance") {
     return number((body as { price?: unknown }).price);
   }

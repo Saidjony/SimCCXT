@@ -1,74 +1,13 @@
 import type { ClientMessage, ExchangeId, ReplayWindow, ServerMessage } from "../types/protocol";
-import { apiBaseFrom, parseServerMessage } from "../types/protocol";
+import { parseServerMessage } from "../types/protocol";
 import { getState, store } from "../state/store";
 import { handleLocalCommand, initializeLocalEngine } from "../replay/localEngine";
 import { prefetchSeries } from "../market/provider";
 import { downloadTicker } from "../market/exchanges";
 import { BASE_TIMEFRAME, TIMEFRAMES, type Timeframe } from "../market/timeframes";
+import { apiUrl, wsUrl } from "./origins";
 
-declare global {
-  interface Window {
-    /** Origin injected by simccxt-server into index.html (single-port mode). */
-    __SIMCCXT_ORIGIN__?: string;
-  }
-}
-
-/**
- * Origin of the page when the server served it (single-port mode), else
- * `undefined` (vite dev, where the page lives on :5173 and Rust on :9001).
- */
-function injectedOrigin(): string | undefined {
-  const origin = window.__SIMCCXT_ORIGIN__;
-  return typeof origin === "string" && origin !== "" ? origin : undefined;
-}
-
-export function wsUrl(): string {
-  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
-  if (env && env["VITE_WS_URL"]) return env["VITE_WS_URL"] as string;
-  // The server that served this page also serves the WebSocket, so the page's
-  // own origin is the answer — whatever port it was started on (`--port
-  // 19010`), and behind a proxy too. This must be checked BEFORE the
-  // localhost heuristic: in single-port mode the page is often 127.0.0.1.
-  const injected = injectedOrigin();
-  if (injected) {
-    try {
-      const url = new URL(injected);
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      return url.origin;
-    } catch {
-      // fall through to the dev heuristics
-    }
-  }
-  // Local dev/preview (vite serves the page, Rust serves WS :9001):
-  // never point WS at the page's own port — handshake would fail forever.
-  const host = window.location.hostname;
-  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "") {
-    return "ws://127.0.0.1:9001";
-  }
-  const proto = window.location.protocol === "https:" ? "wss" : "ws";
-  return proto + "://" + window.location.host;
-}
-
-/**
- * Base URL of the read-only diary HTTP API. In single-port mode the API is on
- * the same origin as the page; in the vite dev flow it is `ws_port + 1` (see
- * `apiBaseFrom`). Market data does NOT come from here any more — it is
- * downloaded straight from the exchange by this browser (see
- * ../market/provider).
- */
-export function apiUrl(): string {
-  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
-  if (env && env["VITE_API_URL"]) return String(env["VITE_API_URL"]).replace(/\/+$/, "");
-  const injected = injectedOrigin();
-  if (injected) {
-    try {
-      return new URL(injected).origin;
-    } catch {
-      // fall through
-    }
-  }
-  return apiBaseFrom(wsUrl());
-}
+export { apiUrl, wsUrl };
 
 export type Route = (m: ServerMessage) => void;
 

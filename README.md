@@ -58,10 +58,13 @@ cd frontend && npm install && npm run build && cd ..
 
 On a VPS add `--host 0.0.0.0` (and keep TLS in front: the protocol has no
 authentication yet). `--web-dir` points at another build output if needed.
+Open the server's own port (`http://<host>:19010/`), not the vite dev port:
+vite is a local development server and its WebSocket/API ports are not part of
+the built terminal.
 
 Pick a coin, press ▶, click BUY. Candles go from the venue straight to the
-browser; the order, position and PnL are computed by the tab's Rust/WASM
-engine. `npm run build` compiles that engine itself — a fresh clone has no
+browser — or through the server if your network blocks the venue. The order,
+position and PnL are computed by the tab's Rust/WASM engine. `npm run build` compiles that engine itself — a fresh clone has no
 `simccxt_wasm.wasm` until then, and the build fails loudly instead of shipping
 a broken page. The `wasm32-unknown-unknown` target is installed by the build
 (`rustup target add`) the first time it is needed; set `SIMCCXT_SKIP_RUSTUP=1`
@@ -103,9 +106,10 @@ venue REST ──▶ browser cache (OPFS + IndexedDB) ──▶ Rust/WASM Exchan
 server (sessions, challenge, diary) ◀── throttled account/fill mirror
 ```
 
-- **The server holds no coin data.** Candles and open interest never pass
-  through it; every tab downloads 5m bars from the venue, caches them locally
-  and aggregates 1h/1d itself.
+- **The server holds no coin data.** Every tab downloads 5m bars from the
+  venue, caches them locally and aggregates 1h/1d itself. The server only
+  forwards a single page when a browser cannot reach the venue at all (see
+  [Market data](#market-data)); nothing is stored.
 - **One connection = one isolated session** (account, series, clock). Every
   event carries `to`, so users never see each other's state; disconnect
   destroys the session.
@@ -143,10 +147,18 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   window is never fetched twice; a stale window fetches only trailing bars.
 - The watchlist is warmed in the background one coin at a time to respect the
   venue's per-IP rate limit.
-- Removing a coin deletes only that coin's cache. Browsers without OPFS fall
-  back to memory.
 - Open interest is context only, requested on the chart's grid where the venue
   exposes it.
+- **Fallback when the venue is unreachable.** Some networks (region/IP blocks,
+  corporate proxies, CORS) cannot reach `api.binance.com` from the browser.
+  The direct request is always tried first; only if it fails, the page asks its
+  own server for that one page (`/api/market/klines`, `/api/market/ticker`) and
+  the server forwards it to the venue. The server stores nothing, and the venue
+  is an enum — a request can never point it at an arbitrary URL. Rate limits
+  (429/418) are never rerouted, because the server shares the same venue
+  budget.
+- Removing a coin deletes only that coin's cache. Browsers without OPFS fall
+  back to memory.
 - The server binds to `127.0.0.1` by default. For remote access run it with
   `--host 0.0.0.0` and put TLS in front; the protocol has no authentication
   yet.
@@ -175,6 +187,7 @@ npm test                    # pure protocol/math tests
 | chart stays at one bar | the clock is paused after reset — press ▶ |
 | coin takes long to open | not cached yet; the topbar badge shows warm-up progress |
 | badge shows ⚠ | some pairs failed (unknown symbol or no venue data) |
+| `не удалось загрузить данные с биржи` / `нет связи с …` | this network cannot reach the venue (region/IP block, proxy, CORS). The page retries the same data through its server; if that also fails, check the server's outbound access to the venue |
 | download fails | errors are surfaced; synthetic bars are used only in offline mode |
 | page says «терминал ещё не собран» | `frontend/dist` is missing — `cd frontend && npm run build` |
 

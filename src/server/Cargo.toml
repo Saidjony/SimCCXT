@@ -21,3 +21,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1.3"
+# Fallback market-data proxy: the browser fetches venues directly, but when its
+# network blocks them (region/IP, corporate proxy) the server forwards the page.
+ureq = "3"

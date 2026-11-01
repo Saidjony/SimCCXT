@@ -2562,6 +2562,11 @@ enum HttpRoute {
     Options,
     Traders,
     Trader(String),
+    /// `/api/market/klines?...` — the raw query string of a venue request the
+    /// browser could not make itself (see `KlineQuery`).
+    Klines(String),
+    /// `/api/market/ticker?...` — same idea for the watchlist quotes.
+    Ticker(String),
     /// Anything that is not `/api/*`: the built terminal (or a 404 for a
     /// missing asset — never index.html, see `static_file`).
     Static(String),
@@ -2577,13 +2582,18 @@ fn route_request(method: &str, target: &str) -> HttpRoute {
     if method != "GET" && method != "HEAD" {
         return HttpRoute::MethodNotAllowed;
     }
-    // Split off the query string (no route reads it any more).
-    let (path, _query) = match target.split_once('?') {
+    let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p, q),
         None => (target, ""),
     };
     if path == "/api/traders" {
         return HttpRoute::Traders;
+    }
+    if path == "/api/market/klines" {
+        return HttpRoute::Klines(query.to_string());
+    }
+    if path == "/api/market/ticker" {
+        return HttpRoute::Ticker(query.to_string());
     }
     if let Some(raw) = path.strip_prefix("/api/trader/") {
         let nick = percent_decode(raw);
@@ -2597,6 +2607,186 @@ fn route_request(method: &str, target: &str) -> HttpRoute {
         return HttpRoute::NotFound;
     }
     HttpRoute::Static(path.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Market-data fallback (browser -> venue blocked -> server fetches the page)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Venue {
+    Binance,
+    Bybit,
+    Okx,
+}
+
+/// One klines page, validated so the server can never be pointed at an
+/// arbitrary URL (no SSRF): the venue is an enum, the symbol a pair.
+#[derive(Debug, PartialEq)]
+struct KlineQuery {
+    venue: Venue,
+    symbol: String,
+    start_ms: i64,
+    end_ms: i64,
+    limit: u32,
+}
+
+/// `BTC/USDT` -> `(BTC, USDT)`. Uppercase alphanumerics only, so the value can
+/// be embedded in a URL unchanged.
+fn parse_pair(symbol: &str) -> Option<(&str, &str)> {
+    let (base, quote) = symbol.split_once('/')?;
+    let ok = |part: &str| {
+        (2..=12).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    (ok(base) && ok(quote)).then_some((base, quote))
+}
+
+/// `k=v&k=v` -> decoded pairs (`+` is a space, `%2F` is `/`). Last key wins.
+fn parse_params(query: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for pair in query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        out.insert(key.to_string(), percent_decode(&value.replace('+', " ")));
+    }
+    out
+}
+
+fn parse_venue(value: &str) -> Result<Venue, String> {
+    match value {
+        "binance" => Ok(Venue::Binance),
+        "bybit" => Ok(Venue::Bybit),
+        "okx" => Ok(Venue::Okx),
+        other => Err(format!("unknown exchange: {other}")),
+    }
+}
+
+fn parse_kline_query(query: &str) -> Result<KlineQuery, String> {
+    let params = parse_params(query);
+    let venue = params
+        .get("exchange")
+        .ok_or_else(|| "exchange is required".to_string())
+        .and_then(|value| parse_venue(value))?;
+    let symbol = params
+        .get("symbol")
+        .ok_or_else(|| "symbol is required".to_string())?
+        .clone();
+    if parse_pair(&symbol).is_none() {
+        return Err("symbol must look like BTC/USDT".to_string());
+    }
+    let start_ms = params
+        .get("start_ms")
+        .ok_or_else(|| "start_ms is required".to_string())?
+        .parse::<i64>()
+        .map_err(|_| "start_ms must be an integer".to_string())?;
+    let end_ms = params
+        .get("end_ms")
+        .ok_or_else(|| "end_ms is required".to_string())?
+        .parse::<i64>()
+        .map_err(|_| "end_ms must be an integer".to_string())?;
+    if start_ms >= end_ms {
+        return Err("start_ms must be before end_ms".to_string());
+    }
+    let limit = match params.get("limit") {
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| "limit must be an integer".to_string())?
+            .clamp(1, 1000),
+        None => 1000,
+    };
+    Ok(KlineQuery { venue, symbol, start_ms, end_ms, limit })
+}
+
+/// One watchlist quote (the last price) — same validation, no time range.
+#[derive(Debug, PartialEq)]
+struct TickerQuery {
+    venue: Venue,
+    symbol: String,
+}
+
+fn parse_ticker_query(query: &str) -> Result<TickerQuery, String> {
+    let params = parse_params(query);
+    let venue = params
+        .get("exchange")
+        .ok_or_else(|| "exchange is required".to_string())
+        .and_then(|value| parse_venue(value))?;
+    let symbol = params
+        .get("symbol")
+        .ok_or_else(|| "symbol is required".to_string())?
+        .clone();
+    if parse_pair(&symbol).is_none() {
+        return Err("symbol must look like BTC/USDT".to_string());
+    }
+    Ok(TickerQuery { venue, symbol })
+}
+
+/// Same URL the browser would call directly (`downloadTicker` in
+/// `frontend/src/market/exchanges.ts`).
+fn ticker_url(query: &TickerQuery) -> String {
+    let (base, quote) = parse_pair(&query.symbol).expect("validated pair");
+    match query.venue {
+        Venue::Binance => {
+            format!("https://api.binance.com/api/v3/ticker/price?symbol={base}{quote}")
+        }
+        Venue::Bybit => format!(
+            "https://api.bybit.com/v5/market/tickers?category=spot&symbol={base}{quote}"
+        ),
+        Venue::Okx => {
+            format!("https://www.okx.com/api/v5/market/ticker?instId={base}-{quote}")
+        }
+    }
+}
+
+/// The same URL the browser would call directly (see
+/// `frontend/src/market/exchanges.ts`, `klineUrl`).
+fn kline_url(query: &KlineQuery) -> String {
+    let (base, quote) = parse_pair(&query.symbol).expect("validated pair");
+    let pair = format!("{base}{quote}");
+    match query.venue {
+        Venue::Binance => format!(
+            "https://api.binance.com/api/v3/klines?symbol={pair}&interval=5m&limit={}&startTime={}&endTime={}",
+            query.limit, query.start_ms, query.end_ms
+        ),
+        Venue::Bybit => format!(
+            "https://api.bybit.com/v5/market/kline?category=spot&symbol={pair}&interval=5&limit={}&start={}&end={}",
+            query.limit, query.start_ms, query.end_ms
+        ),
+        Venue::Okx => format!(
+            "https://www.okx.com/api/v5/market/history-candles?instId={base}-{quote}&bar=5m&limit={}&after={}",
+            query.limit.min(100),
+            query.start_ms
+        ),
+    }
+}
+
+/// Fetch one klines page from the venue. Blocking `ureq` runs on a blocking
+/// thread so the async accept loop never stalls.
+async fn fetch_klines(query: KlineQuery) -> Result<String, String> {
+    fetch_venue_json(kline_url(&query)).await
+}
+
+async fn fetch_ticker(query: TickerQuery) -> Result<String, String> {
+    fetch_venue_json(ticker_url(&query)).await
+}
+
+/// GET a venue URL on a blocking thread so the async accept loop never stalls.
+/// The body is passed through untouched.
+async fn fetch_venue_json(url: String) -> Result<String, String> {
+    let task = tokio::task::spawn_blocking(move || {
+        let mut response = ureq::get(&url)
+            .config()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .build()
+            .call()
+            .map_err(|error| error.to_string())?;
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| error.to_string())
+    });
+    match task.await {
+        Ok(result) => result,
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 
@@ -2636,8 +2826,31 @@ fn http_file_response(status: u16, reason: &str, content_type: &str, body: &[u8]
     out
 }
 
-/// Directory with the built terminal, served on the WebSocket port.
-///
+/// 400 with the validation message the browser will show.
+fn bad_request(message: &str) -> Vec<u8> {
+    let body = serde_json::to_string(&json!({ "error": message })).unwrap_or_default();
+    http_response(400, "Bad Request", &body).into_bytes()
+}
+
+/// Venue payload passed through untouched (the browser parses it with the same
+/// code as a direct response) or a 502 naming the venue error.
+fn venue_reply(result: Result<String, String>) -> Vec<u8> {
+    match result {
+        Ok(body) => http_file_response(
+            200,
+            "OK",
+            "application/json; charset=utf-8",
+            body.as_bytes(),
+            "no-store",
+        ),
+        Err(message) => {
+            let body = serde_json::to_string(&json!({ "error": message })).unwrap_or_default();
+            http_response(502, "Bad Gateway", &body).into_bytes()
+        }
+    }
+}
+
+/// Directory with the built terminal, served on the WebSocket port.///
 /// `--web-dir` wins; otherwise the usual build outputs are probed relative to
 /// the working directory (the README runs the server from the repository
 /// root). `None` means there is no build yet, and the server explains that on
@@ -2900,6 +3113,14 @@ async fn handle_http_request(
             }
         }
         HttpRoute::NotFound => http_response(404, "Not Found", "{\"error\":\"not found\"}").into_bytes(),
+        HttpRoute::Klines(query) => match parse_kline_query(&query) {
+            Ok(query) => venue_reply(fetch_klines(query).await),
+            Err(message) => bad_request(&message),
+        },
+        HttpRoute::Ticker(query) => match parse_ticker_query(&query) {
+            Ok(query) => venue_reply(fetch_ticker(query).await),
+            Err(message) => bad_request(&message),
+        },
         HttpRoute::MethodNotAllowed => {
             http_response(405, "Method Not Allowed", "{\"error\":\"method not allowed\"}")
                 .into_bytes()
@@ -4411,5 +4632,103 @@ mod tests {
         let bad = "GET / HTTP/1.1\r\nHost: evil\"><script>alert(1)</script>\r\n\r\n";
         assert_eq!(request_host(bad), None);
         assert_eq!(request_host("GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    // -- market-data fallback proxy ------------------------------------------
+
+    #[test]
+    fn kline_query_accepts_the_frontend_request() {
+        let query = parse_kline_query(
+            "exchange=binance&symbol=BTC%2FUSDT&start_ms=1000&end_ms=2000&limit=1000",
+        )
+        .unwrap();
+        assert_eq!(
+            query,
+            KlineQuery {
+                venue: Venue::Binance,
+                symbol: "BTC/USDT".into(),
+                start_ms: 1000,
+                end_ms: 2000,
+                limit: 1000,
+            }
+        );
+        assert_eq!(
+            kline_url(&query),
+            "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=1000&startTime=1000&endTime=2000"
+        );
+    }
+
+    #[test]
+    fn kline_urls_match_the_browser_builders() {
+        let bybit = KlineQuery {
+            venue: Venue::Bybit,
+            symbol: "ETH/USDT".into(),
+            start_ms: 5,
+            end_ms: 9,
+            limit: 7,
+        };
+        assert_eq!(
+            kline_url(&bybit),
+            "https://api.bybit.com/v5/market/kline?category=spot&symbol=ETHUSDT&interval=5&limit=7&start=5&end=9"
+        );
+        let okx = KlineQuery {
+            venue: Venue::Okx,
+            symbol: "BTC/USDT".into(),
+            start_ms: 42,
+            end_ms: 99,
+            limit: 1000,
+        };
+        // OKX caps history-candles at 100 per page and pages by `after`.
+        assert_eq!(
+            kline_url(&okx),
+            "https://www.okx.com/api/v5/market/history-candles?instId=BTC-USDT&bar=5m&limit=100&after=42"
+        );
+    }
+
+    #[test]
+    fn kline_query_rejects_anything_that_is_not_a_pair() {
+        // No arbitrary URLs: the venue is an enum and the symbol a pair.
+        assert!(parse_kline_query("exchange=kraken&symbol=BTC/USDT&start_ms=1&end_ms=2").is_err());
+        assert!(parse_kline_query("exchange=binance&symbol=BTCUSDT&start_ms=1&end_ms=2").is_err());
+        assert!(parse_kline_query("exchange=binance&symbol=BTC/USDT;rm -rf&start_ms=1&end_ms=2").is_err());
+        assert!(parse_kline_query("exchange=binance&symbol=../../etc/passwd&start_ms=1&end_ms=2").is_err());
+        assert!(parse_kline_query("exchange=binance&symbol=btc/usdt&start_ms=1&end_ms=2").is_err());
+        // Range has to make sense and numbers have to parse.
+        assert!(parse_kline_query("exchange=binance&symbol=BTC/USDT&start_ms=2&end_ms=2").is_err());
+        assert!(parse_kline_query("exchange=binance&symbol=BTC/USDT&start_ms=x&end_ms=2").is_err());
+        assert!(parse_kline_query("symbol=BTC/USDT&start_ms=1&end_ms=2").is_err());
+        // Limit is clamped instead of trusted.
+        let clamped =
+            parse_kline_query("exchange=binance&symbol=BTC/USDT&start_ms=1&end_ms=2&limit=99999")
+                .unwrap();
+        assert_eq!(clamped.limit, 1000);
+    }
+
+    #[test]
+    fn market_route_is_served_on_the_same_port_as_the_page() {        let route = route_request("GET", "/api/market/klines?exchange=binance&symbol=BTC%2FUSDT");
+        assert_eq!(
+            route,
+            HttpRoute::Klines("exchange=binance&symbol=BTC%2FUSDT".into())
+        );
+        // API paths that are not ours are still JSON 404s, not the SPA.
+        assert_eq!(route_request("GET", "/api/market/nope"), HttpRoute::NotFound);
+    }
+
+    #[test]
+    fn ticker_query_builds_the_browser_url() {
+        let query = parse_ticker_query("exchange=bybit&symbol=ETH%2FUSDT").unwrap();
+        assert_eq!(
+            query,
+            TickerQuery { venue: Venue::Bybit, symbol: "ETH/USDT".into() }
+        );
+        assert_eq!(
+            ticker_url(&query),
+            "https://api.bybit.com/v5/market/tickers?category=spot&symbol=ETHUSDT"
+        );
+        assert_eq!(
+            route_request("GET", "/api/market/ticker?exchange=okx&symbol=BTC%2FUSDT"),
+            HttpRoute::Ticker("exchange=okx&symbol=BTC%2FUSDT".into())
+        );
+        assert!(parse_ticker_query("exchange=binance&symbol=btc/usdt").is_err());
     }
 }
