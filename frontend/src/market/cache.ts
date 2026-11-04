@@ -133,16 +133,31 @@ async function readFile(name: string): Promise<ArrayBuffer | null> {
   }
 }
 
-async function writeFile(name: string, buffer: ArrayBuffer): Promise<void> {
+/** Is a series file actually on disk? Manifest entries alone prove nothing. */
+async function hasFile(name: string): Promise<boolean> {
   const directory = await directoryHandle();
-  if (!directory) return;
+  if (!directory) return false;
+  try {
+    await directory.getFileHandle(name);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `false` when the bars were NOT persisted (no OPFS, quota, private mode). */
+async function writeFile(name: string, buffer: ArrayBuffer): Promise<boolean> {
+  const directory = await directoryHandle();
+  if (!directory) return false;
   try {
     const handle = await directory.getFileHandle(name, { create: true });
     const writable = await handle.createWritable();
     await writable.write(buffer);
     await writable.close();
+    return true;
   } catch {
     // Quota or private mode: the bars stay in memory for this page load.
+    return false;
   }
 }
 
@@ -204,30 +219,40 @@ export async function readCachedBars(exchange: string, symbol: string): Promise<
 /**
  * Store the full bar set of one series and record the window it was requested
  * for, plus when that window should be refreshed.
+ *
+ * Returns `false` when nothing was recorded: no OPFS (an insecure origin has
+ * `navigator.storage` undefined), a write failure, or `rows === null` with no
+ * file on disk. Recording a window without its bars is worse than recording
+ * nothing — the next page would trust the manifest, fetch only the tail, and
+ * fail with "no candles between the selected dates".
  */
 export async function writeCachedBars(
   exchange: string,
   symbol: string,
   rows: readonly CandleRow[] | null,
   window: Range,
-): Promise<void> {
+): Promise<boolean> {
   const key = seriesKey(exchange, symbol);
   // `rows === null`: the bars are already on disk, only record the window.
   if (rows !== null) {
-    if (rows.length === 0) return;
-    await writeFile(seriesFile(exchange, symbol), encode(rows));
+    if (rows.length === 0) return false;
+    if (!(await writeFile(seriesFile(exchange, symbol), encode(rows)))) return false;
+  } else if (!(await hasFile(seriesFile(exchange, symbol)))) {
+    return false;
   }
   const ranges = await readRanges(key);
   await writeRanges(key, mergeRanges(ranges, window));
+  return true;
 }
 
-/** Whether [startMs, endMs] is fully covered by cached ranges. */
+/** Whether [startMs, endMs] is covered by cached ranges AND the bars are on disk. */
 export async function isRangeCached(
   exchange: string,
   symbol: string,
   startMs: number,
   endMs: number,
 ): Promise<boolean> {
+  if (!(await hasFile(seriesFile(exchange, symbol)))) return false;
   const ranges = await readRanges(seriesKey(exchange, symbol));
   return ranges.some((range) => range.from <= startMs && range.to >= endMs);
 }

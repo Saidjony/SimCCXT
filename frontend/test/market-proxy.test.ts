@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { downloadBars, downloadTicker, proxyKlineUrl, proxyTickerUrl, RateLimitedError } from "../src/market/exchanges.ts";
+import { apiUrl, wsUrl } from "../src/websocket/origins.ts";
 
 const ORIGIN = "http://127.0.0.1:19010";
 const realFetch = globalThis.fetch;
@@ -135,5 +136,37 @@ describe("market fallback proxy", () => {
     assert.equal(await downloadTicker("binance", "BTC/USDT"), 123.45);
     assert.equal(calls.length, 2);
     assert.ok(calls[1].startsWith(`${ORIGIN}/api/market/ticker?`));
+  });
+});
+
+describe("api origin behind a proxy", () => {
+  const w = globalThis as unknown as { window?: unknown };
+
+  it("keeps the API on the page's own host when the socket shares it", () => {
+    // `ssh -R 5173:localhost:19010`: the page and the socket are both on
+    // :5173, so `/api/*` is on :5173 as well — NOT :5174.
+    w.window = {
+      location: {
+        hostname: "130.49.178.95",
+        host: "130.49.178.95:5173",
+        origin: "http://130.49.178.95:5173",
+        protocol: "http:",
+      },
+    };
+    assert.equal(wsUrl(), "ws://130.49.178.95:5173");
+    assert.equal(apiUrl(), "http://130.49.178.95:5173");
+  });
+
+  it("still points the API at ws_port + 1 in local vite dev", () => {
+    w.window = {
+      location: {
+        hostname: "localhost",
+        host: "localhost:5173",
+        origin: "http://localhost:5173",
+        protocol: "http:",
+      },
+    };
+    assert.equal(wsUrl(), "ws://127.0.0.1:9001");
+    assert.equal(apiUrl(), "http://127.0.0.1:9002");
   });
 });

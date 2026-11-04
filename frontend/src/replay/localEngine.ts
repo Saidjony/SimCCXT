@@ -42,6 +42,21 @@ interface WorkerResponse {
 }
 
 /**
+ * The engine keeps a large USDT buffer so a risk-sized order is never blocked
+ * by margin (a wide stop needs more notional than the challenge capital).
+ * That buffer must never be shown as the trader's equity: a board reading
+ * "капитал 1000 / equity 1,000,000" looks broken. Equity in the trader's
+ * terms is the challenge capital plus PnL.
+ */
+function displayAccount(account: AccountSnapshot): AccountSnapshot {
+  const capital = getState().initialCapitalUsdt;
+  if (!(capital > 0) || !Number.isFinite(capital)) return account;
+  const pnl = account.pnl.realized + account.pnl.unrealized;
+  if (!Number.isFinite(pnl)) return account;
+  return { ...account, equity: capital + pnl };
+}
+
+/**
  * Load the series for `symbol@timeframe` from THIS browser: the provider serves
  * 5m bars (memory → OPFS/IndexedDB → direct exchange download) and anything
  * coarser is aggregated locally. The returned window always starts at the start
@@ -177,6 +192,7 @@ function persistedProtections(): Record<string, Record<string, unknown>> {
 }
 
 function applyLocalSnapshot(snapshot: LocalSnapshot): void {
+  const account = displayAccount(snapshot.account);
   if (snapshot.full_reset) {
     // A worker restart (reload, or a fresh engine after a failure) has no
     // series of its own: this page's loaded base bars are the full history and
@@ -205,7 +221,7 @@ function applyLocalSnapshot(snapshot: LocalSnapshot): void {
       snapshot.exchange,
       timeframe,
       aggregateCandles(base, timeframe).slice(0, snapshot.replay.fed),
-      snapshot.account,
+      account,
       snapshot.replay,
       snapshot.oi ?? [],
       snapshot.oi_period ?? "",
@@ -214,7 +230,7 @@ function applyLocalSnapshot(snapshot: LocalSnapshot): void {
   } else {
     store.applyLocalUpdate(
       snapshot.candles_delta ?? [],
-      snapshot.account,
+      account,
       snapshot.replay,
       snapshot.fills,
     );
@@ -233,7 +249,7 @@ function flushLocalSync(): void {
   const replaceFills = replaceFillsOnNextSync && snapshot.fills.length > 0;
   syncLocal({
     type: "local_sync",
-    account: snapshot.account,
+    account: displayAccount(snapshot.account),
     fills: replaceFills ? snapshot.fills.slice().reverse() : pendingSyncFills,
     replace_fills: replaceFills,
     engine_id: engineId,

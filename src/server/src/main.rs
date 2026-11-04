@@ -1208,6 +1208,18 @@ impl Engine {
                 // union is always correct.
                 s.local_entry_protections.extend(entry_protections);
                 s.local_exit_reasons.extend(exit_reasons);
+                // The board's "Сделки" column counts distinct orders. A
+                // server-side engine feeds it from `fresh_fill_events`, but in
+                // the local-engine mode the fills only arrive here — without
+                // this the column stayed 0 for the whole round trip even
+                // though the diary and PnL were correct.
+                s.seen_orders = s
+                    .local_fills
+                    .iter()
+                    .filter_map(|fill| fill["orderId"].as_str())
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 s.symbol = symbol;
                 s.timeframe = timeframe;
                 s.exchange = exchange;
@@ -4373,6 +4385,52 @@ mod tests {
             "risk cannot be changed after a round starts"
         );
         assert_eq!(eng.sessions[&1].risk_usdt, 10.0);
+    }
+
+    /// A `local_sync` as the browser sends it (the local-engine mode).
+    fn local_sync_cmd(fills: serde_json::Value, replace: bool) -> ClientCmd {
+        serde_json::from_value(json!({
+            "type": "local_sync",
+            "account": {"equity": 990, "pnl": {"realized": -10, "unrealized": 0}},
+            "fills": fills,
+            "replace_fills": replace,
+            "engine_id": "e1",
+            "entry_protections": {},
+            "exit_reasons": {},
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": {"start_ms": 0, "reveal_start_ms": 0, "end_ms": 1}
+        }))
+        .expect("local sync command")
+    }
+
+    #[test]
+    fn board_counts_orders_mirrored_from_the_local_engine() {
+        let (tx, _rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        eng.handle_command(1, login_cmd("A"));
+        eng.handle_command(1, challenge_cmd(true, Some(10.0)));
+        let fills = json!([
+            {"id": "1_0", "orderId": "1", "timestamp": 1, "symbol": "BTC/USDT",
+             "side": "buy", "amount": 0.01, "price": 100.0},
+            {"id": "2_0", "orderId": "2", "timestamp": 2, "symbol": "BTC/USDT",
+             "side": "sell", "amount": 0.01, "price": 90.0}
+        ]);
+        eng.handle_command(1, local_sync_cmd(fills, true));
+        let board = challenge_board_json(&eng.sessions);
+        let row = &board["board"][0];
+        assert_eq!(row["trades"], 2, "entry and exit orders are counted");
+        assert_eq!(row["pnl"], -10.0);
+        // Re-sending a fill must not inflate the column.
+        eng.handle_command(
+            1,
+            local_sync_cmd(
+                json!([{"id": "2_0", "orderId": "2", "timestamp": 2, "symbol": "BTC/USDT"}]),
+                false,
+            ),
+        );
+        assert_eq!(challenge_board_json(&eng.sessions)["board"][0]["trades"], 2);
     }
 
     #[test]

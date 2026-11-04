@@ -68,5 +68,16 @@ export function apiUrl(): string {
       // fall through
     }
   }
-  return apiBaseFrom(wsUrl());
+  const socket = wsUrl();
+  // No injected origin and the socket sits on THIS page's host: the page is
+  // behind a proxy that forwards the whole host to simccxt-server (typical
+  // `ssh -R 5173:localhost:19010`), so the HTTP API is there too. Deriving
+  // `host + 1` here sent the diary to a port nobody forwards — the page showed
+  // "дневник недоступен" while the terminal itself worked.
+  try {
+    if (new URL(socket).host === window.location.host) return window.location.origin;
+  } catch {
+    // fall through to the dev heuristic
+  }
+  return apiBaseFrom(socket);
 }

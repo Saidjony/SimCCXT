@@ -67,9 +67,9 @@ interface SortState {
  * Read-only diary of one ONLINE trader, addressed by `?trader=<nick>`.
  *
  * Deliberately isolated from the terminal: it opens NO WebSocket (the session
- * belongs to the original tab), only fetches the HTTP API on `ws_port + 1`, and
- * renders the engine's FIFO-reconstructed round trips with entry/exit markers
- * on a bar chart.
+ * belongs to the original tab), only fetches the page's own HTTP API (see
+ * `apiUrl`), and renders the engine's FIFO-reconstructed round trips with
+ * entry/exit markers on a bar chart.
  */
 export function TraderDiary({ nick }: { nick: string }): JSX.Element {
   const [diary, setDiary] = useState<DiaryData | null>(null);
