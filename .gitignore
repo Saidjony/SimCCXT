@@ -9,3 +9,7 @@
 
 # Playwright MCP artifacts (local browser snapshots/logs)
 /.playwright-mcp/
+
+# VPS tunnel config (host, user, ports — machine-local) and its pid/log files
+/.vps-tunnel.env
+/.run/

@@ -68,6 +68,35 @@ vite is a local development server and its WebSocket/API ports are not part of
 the built terminal. A reverse proxy in front of `:19010` works too, as long as
 it forwards WebSocket upgrades.
 
+### Publish through a VPS (reverse tunnel)
+
+A reverse SSH tunnel makes a terminal running on your machine reachable on a
+VPS without opening an inbound port, running the server there, or changing
+anything on the VPS. No address is built into the repo: it comes from the
+environment or from `.vps-tunnel.env`, which is gitignored.
+
+```bash
+cp scripts/vps-tunnel.env.example .vps-tunnel.env
+$EDITOR .vps-tunnel.env              # VPS_HOST=<host or ~/.ssh alias>
+ssh-copy-id root@<vps-host>          # once — the script runs in BatchMode
+
+scripts/vps-tunnel.sh                # builds if needed, serves, opens the tunnel
+# → http://<VPS_HOST>:<REMOTE_PORT>/
+
+scripts/vps-tunnel.sh --status
+scripts/vps-tunnel.sh --stop
+```
+
+`VPS_HOST` may be an `~/.ssh/config` alias, so the real address never has to
+appear in a command; set `PUBLIC_HOST` to the address you actually open when
+the alias differs from it. CLI flags (`--host`, `--user`, `--public-host`,
+`--remote-port`, …) override the file. `BIND=0.0.0.0` needs
+`GatewayPorts yes` in the VPS `sshd_config` and an open `REMOTE_PORT` in its
+firewall. Without it the port binds to the VPS loopback only: set
+`BIND=127.0.0.1` and open it through an SSH local forward, which the script
+prints. The only thing created on the VPS is the forwarded port — nothing
+there is edited.
+
 Pick a coin, press ▶, click BUY. Candles go from the venue straight to the
 browser — or through the server if your network blocks the venue. The order,
 position and PnL are computed by the tab's Rust/WASM engine. `npm run build` compiles that engine itself — a fresh clone has no
@@ -196,6 +225,8 @@ npm test                    # pure protocol/math tests
 | `не удалось загрузить данные с биржи` / `нет связи с …` | this network cannot reach the venue (region/IP block, proxy, CORS). The page retries the same data through its server; if that also fails, check the server's outbound access to the venue |
 | download fails | errors are surfaced; synthetic bars are used only in offline mode |
 | page says «терминал ещё не собран» | `frontend/dist` is missing — `cd frontend && npm run build` |
+| tunnel opens but `http://<host>:<port>/` times out | sshd bound the `-R` port to loopback (`GatewayPorts no`) or a firewall blocks it — set `BIND=127.0.0.1` and use `ssh -L`, or enable `GatewayPorts yes` |
+| `scripts/vps-tunnel.sh` asks for nothing and exits with `Permission denied (publickey)` | key auth is not set up — `ssh-copy-id "$VPS_USER@$VPS_HOST"`, or export `SSH_ASKPASS` (the script honours it) |
 
 ## License
 
