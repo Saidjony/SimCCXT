@@ -421,6 +421,12 @@ struct Session {
     /// Browser-owned Rust/WASM engine state mirrored for the online board and diary.
     local_account: Option<Value>,
     local_fills: Vec<Value>,
+    /// Realized PnL of the mirrored fill ledger. The board must NOT trust the
+    /// account snapshot for this: a page reload rebuilds the browser engine
+    /// with an empty account while the fills (and the diary) survive, so the
+    /// challenge lost its PnL and disagreed with the diary. Recomputed only
+    /// when the ledger changes (see `ledger_realized`).
+    local_realized: f64,
     /// Engine instance that produced the newest fills. Order ids restart at 1
     /// every page load, so trades are reconstructed per engine instance.
     local_engine_id: String,
@@ -607,6 +613,33 @@ fn r_of(pnl: f64, risk: f64) -> Option<f64> {
     }
 }
 
+/// Realized PnL of a mirrored fill ledger: closed round trips, FIFO per engine
+/// instance (order ids restart at 1 on every page load, so groups must not be
+/// paired with each other), fees included — exactly what the diary shows.
+fn ledger_realized(fills: &[Value], risk: f64) -> f64 {
+    let mut groups: Vec<Vec<Value>> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for fill in fills {
+        let engine = fill["engine_id"].as_str().unwrap_or_default();
+        let at = match index.get(engine) {
+            Some(at) => *at,
+            None => {
+                groups.push(Vec::new());
+                index.insert(engine.to_string(), groups.len() - 1);
+                groups.len() - 1
+            }
+        };
+        groups[at].push(fill.clone());
+    }
+    groups
+        .into_iter()
+        .map(|group| {
+            let (trades, _) = diary::reconstruct_trades(group, risk, HashMap::new());
+            trades.iter().map(|trade| trade.pnl).sum::<f64>()
+        })
+        .sum()
+}
+
 /// Leaderboard JSON over challenge participants, sorted by R desc.
 /// Deliberately NO `to`: the per-socket writer forwards it to everyone.
 fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
@@ -619,9 +652,22 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
             .local_account
             .clone()
             .unwrap_or_else(|| s.ex.account_snapshot());
-        let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
+        // Local-engine sessions: realized comes from the mirrored ledger, not
+        // from the browser's account (a reload empties the account, never the
+        // fills). Equity is then the trader's capital plus PnL, never the
+        // engine's internal margin buffer.
+        let local = s.local_account.is_some();
+        let realized = if local {
+            s.local_realized
+        } else {
+            snap["pnl"]["realized"].as_f64().unwrap_or(0.0)
+        };
         let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
-        let equity = snap["equity"].as_f64().unwrap_or(0.0);
+        let equity = if local {
+            s.capital_usdt + realized + unrealized
+        } else {
+            snap["equity"].as_f64().unwrap_or(0.0)
+        };
         let pnl = realized + unrealized;
         // Distinct entry/exit orders, maintained incrementally when fresh
         // fills are seen. Re-serializing the whole fill log here was the
@@ -1005,6 +1051,7 @@ fn new_session(nick: String) -> Session {
         range_end_ms: 0,
         local_account: None,
         local_fills: Vec::new(),
+        local_realized: 0.0,
         local_engine_id: String::new(),
         local_entry_protections: HashMap::new(),
         local_exit_reasons: HashMap::new(),
@@ -1181,10 +1228,11 @@ impl Engine {
                         fill
                     })
                     .collect();
+                let ledger_changed;
                 if replace_fills {
                     s.local_fills = fills;
-                } else {
-                    // Dedupe by the WHOLE fill, not by `id` alone: the id is
+                    ledger_changed = true;
+                } else {                    // Dedupe by the WHOLE fill, not by `id` alone: the id is
                     // `orderId_fillIndex`, and order ids restart at 1 for every
                     // symbol engine. BTC's fill #1 and ETH's fill #1 share the
                     // bare id, so dropping the second one left the diary with a
@@ -1198,7 +1246,9 @@ impl Engine {
                         let key = fill_identity(fill);
                         !key.is_empty() && known.insert(key)
                     });
+                    let added = !fills.is_empty();
                     s.local_fills.append(&mut fills);
+                    ledger_changed = added;
                 }
                 // Merge, never replace: a page reload starts the browser with
                 // empty maps, and replacing would wipe the levels and exit
@@ -1220,6 +1270,13 @@ impl Engine {
                     .filter(|id| !id.is_empty())
                     .map(str::to_string)
                     .collect();
+                // Realized PnL for the board/diary comes from this same ledger:
+                // the browser account is empty after a reload while the fills
+                // are not, and a challenge that forgot its PnL mid-round read
+                // as broken. Recompute only when the ledger actually changed.
+                if ledger_changed {
+                    s.local_realized = ledger_realized(&s.local_fills, s.risk_usdt);
+                }
                 s.symbol = symbol;
                 s.timeframe = timeframe;
                 s.exchange = exchange;
@@ -1840,8 +1897,8 @@ impl Engine {
                 .local_account
                 .clone()
                 .unwrap_or_else(|| s.ex.account_snapshot());
-            let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
-            let equity = snap["equity"].as_f64().unwrap_or(0.0);
+            let account_realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
+            let account_equity = snap["equity"].as_f64().unwrap_or(0.0);
 
             // Mark prices from open positions (for unrealized PnL).
             let mut mark_prices = HashMap::new();
@@ -1907,6 +1964,16 @@ impl Engine {
                 .map(|(_, t)| t.pnl)
                 .collect();
             let total_pnl: f64 = paired.iter().map(|(_, t)| t.pnl).sum();
+            // The diary must be self-consistent: its PnL is the ledger's, so
+            // its equity is capital + that PnL — even right after a reload
+            // rebuilt an empty browser account while the fills stayed.
+            let unrealized: f64 = positions.iter().map(|p| p.unrealized).sum();
+            let realized = if local { total_pnl } else { account_realized };
+            let equity = if local {
+                s.capital_usdt + total_pnl + unrealized
+            } else {
+                account_equity
+            };
 
             result = json!({
                 "type": "diary",
@@ -2136,9 +2203,18 @@ impl Engine {
                     .local_account
                     .clone()
                     .unwrap_or_else(|| s.ex.account_snapshot());
-                let realized = snap["pnl"]["realized"].as_f64().unwrap_or(0.0);
+                let local = s.local_account.is_some();
+                let realized = if local {
+                    s.local_realized
+                } else {
+                    snap["pnl"]["realized"].as_f64().unwrap_or(0.0)
+                };
                 let unrealized = snap["pnl"]["unrealized"].as_f64().unwrap_or(0.0);
-                let equity = snap["equity"].as_f64().unwrap_or(0.0);
+                let equity = if local {
+                    s.capital_usdt + realized + unrealized
+                } else {
+                    snap["equity"].as_f64().unwrap_or(0.0)
+                };
                 let pnl = realized + unrealized;
                 let trades = s.seen_orders.len();
                 let r = r_of(pnl, s.risk_usdt);
@@ -4413,15 +4489,19 @@ mod tests {
         eng.handle_command(1, challenge_cmd(true, Some(10.0)));
         let fills = json!([
             {"id": "1_0", "orderId": "1", "timestamp": 1, "symbol": "BTC/USDT",
-             "side": "buy", "amount": 0.01, "price": 100.0},
+             "side": "buy", "amount": 1.0, "price": 100.0},
             {"id": "2_0", "orderId": "2", "timestamp": 2, "symbol": "BTC/USDT",
-             "side": "sell", "amount": 0.01, "price": 90.0}
+             "side": "sell", "amount": 1.0, "price": 90.0}
         ]);
         eng.handle_command(1, local_sync_cmd(fills, true));
         let board = challenge_board_json(&eng.sessions);
         let row = &board["board"][0];
         assert_eq!(row["trades"], 2, "entry and exit orders are counted");
+        // PnL comes from the ledger (1 x (90 - 100)), not from the account
+        // snapshot the browser sent.
         assert_eq!(row["pnl"], -10.0);
+        assert_eq!(row["r"], -1.0);
+        assert_eq!(row["equity"], 990.0, "capital + realized, not the buffer");
         // Re-sending a fill must not inflate the column.
         eng.handle_command(
             1,
@@ -4431,6 +4511,49 @@ mod tests {
             ),
         );
         assert_eq!(challenge_board_json(&eng.sessions)["board"][0]["trades"], 2);
+    }
+
+    /// A page reload rebuilds the browser engine: the account is pristine while
+    /// the fills live on in the server's mirror. The board must keep the round's
+    /// PnL (and agree with the diary) instead of dropping to 0.
+    #[test]
+    fn board_keeps_pnl_after_a_reload_empties_the_browser_account() {
+        let (tx, _rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        eng.handle_command(1, login_cmd("A"));
+        eng.handle_command(1, challenge_cmd(true, Some(10.0)));
+        eng.handle_command(
+            1,
+            local_sync_cmd(
+                json!([
+                    {"id": "1_0", "orderId": "1", "timestamp": 1, "symbol": "BTC/USDT",
+                     "side": "buy", "amount": 1.0, "price": 100.0},
+                    {"id": "2_0", "orderId": "2", "timestamp": 2, "symbol": "BTC/USDT",
+                     "side": "sell", "amount": 1.0, "price": 90.0}
+                ]),
+                true,
+            ),
+        );
+        // The reloaded engine knows nothing: no fills, fresh 1000 USDT account.
+        let reload: ClientCmd = serde_json::from_value(json!({
+            "type": "local_sync",
+            "account": {"equity": 1000, "pnl": {"realized": 0, "unrealized": 0}},
+            "fills": [],
+            "replace_fills": false,
+            "engine_id": "e2",
+            "entry_protections": {},
+            "exit_reasons": {},
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": {"start_ms": 0, "reveal_start_ms": 0, "end_ms": 1}
+        }))
+        .expect("reload sync");
+        eng.handle_command(1, reload);
+        let row = &challenge_board_json(&eng.sessions)["board"][0];
+        assert_eq!(row["pnl"], -10.0, "PnL survives the reload");
+        assert_eq!(row["equity"], 990.0);
+        assert_eq!(row["trades"], 2);
     }
 
     #[test]
