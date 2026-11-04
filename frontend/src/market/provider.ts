@@ -20,7 +20,6 @@
 import type { CandleRow, ExchangeId } from "../types/protocol.ts";
 import {
   clearCachedBars,
-  isRangeCached,
   loadAllWindows,
   readCachedBars,
   writeCachedBars,
@@ -36,10 +35,13 @@ const DAY_MS = 86_400_000;
 /** Slack at the START of a window: the venue may have no bar exactly on the
  *  boundary (a listing, a short outage), so one bar of tolerance is fine. */
 const COVERAGE_SLACK_MS = BAR_MS;
-/** Slack at the END of a window: the venue never returns a bar later than the
- *  requested end, so demanding "the last bar is at the end" made every cached
- *  series look partial and silently re-download it in full. */
-const END_SLACK_MS = 3 * DAY_MS;
+/** Slack at the END of a window: the venue returns the bar that is still
+ *  forming, so the last held bar sits at most a bar behind the requested end.
+ *  Deliberately NOT days: a window is not a tolerance, and the diary asks for
+ *  several DISJOINT windows (one around each trade). A three-day slack made
+ *  the first window's bars "cover" a window a day later, so the later trades
+ *  never downloaded and their chart stayed empty. */
+const END_SLACK_MS = 2 * BAR_MS;
 /** A saved window is recorded one bar wider on each side (see `loadBaseBars`). */
 const PAD_MS = BAR_MS;
 /** A saved window still counts as "the same window" within this margin. */
@@ -77,20 +79,31 @@ export function downloadStats(): Record<string, number> {
 }
 /** Per-series serialization of downloads. */
 const queues = new Map<string, Promise<unknown>>();
-const covered = new Map<string, CachedRange>();
+/**
+ * Windows already downloaded for a series. A series can hold several DISJOINT
+ * ones — the diary asks for one window around each trade and never for the
+ * days between them — so this must stay a list, not "the newest window".
+ */
+const covered = new Map<string, CachedRange[]>();
+
+/** Record one window, keeping the newer expiry for an identical one. */
+function rememberWindow(key: string, range: CachedRange): void {
+  const ranges = covered.get(key) ?? [];
+  const at = ranges.findIndex((r) => r.from === range.from && r.to === range.to);
+  if (at < 0) ranges.push(range);
+  else if (range.freshUntil > ranges[at].freshUntil) ranges[at] = range;
+  ranges.sort((a, b) => a.from - b.from);
+  covered.set(key, ranges);
+}
 
 /** Manifest windows are read once per page and then kept in step locally. */
 let windowsLoaded: Promise<void> | null = null;
 function ensureWindowsLoaded(): Promise<void> {
   windowsLoaded ??= loadAllWindows().then((byKey) => {
     for (const [key, ranges] of byKey) {
-      if (covered.has(key)) continue;
-      // Newest expiry wins: it describes the most recent download of this coin.
-      const best = ranges.reduce<CachedRange | undefined>(
-        (top, range) => (!top || range.freshUntil > top.freshUntil ? range : top),
-        undefined,
-      );
-      if (best) covered.set(key, best);
+      // Merge rather than replace: a download may already have completed while
+      // the manifest was being read, and its window is just as real.
+      for (const range of ranges) rememberWindow(key, range);
     }
   });
   return windowsLoaded;
@@ -197,9 +210,16 @@ function memoryCovers(entry: MemoryEntry | undefined, from: number, to: number):
   if (!entry || entry.rows.length === 0) return false;
   const first = entry.rows[0][0];
   const last = entry.rows[entry.rows.length - 1][0];
-  if (first > from + COVERAGE_SLACK_MS) return false;
+  // `from = 0` means "from the very first held bar" (see `peekBaseBars`).
+  if (from > 0 && first > from + COVERAGE_SLACK_MS) return false;
   // `to = 0` means "no upper bound" (a worker restart wants everything).
-  return to === 0 || last >= to - END_SLACK_MS;
+  if (to === 0) return true;
+  // A window that begins after the bars we hold is a DIFFERENT window, not a
+  // partial hit: the diary loads one window per trade, and treating it as
+  // covered returned an empty slice while the chart still showed the first
+  // window — the trade looked like it never happened.
+  if (from > last + COVERAGE_SLACK_MS) return false;
+  return last >= to - END_SLACK_MS;
 }
 
 /**
@@ -209,7 +229,7 @@ function memoryCovers(entry: MemoryEntry | undefined, from: number, to: number):
 async function recordWindow(key: string, exchange: ExchangeId, symbol: string, range: CachedRange): Promise<void> {
   // Synchronously first: a second caller for the same series must see the
   // record even before the manifest write commits.
-  covered.set(key, range);
+  rememberWindow(key, range);
   await writeCachedBars(exchange, symbol, null, range);
 }
 
@@ -262,17 +282,13 @@ export async function loadBaseBars(
     // What this series already has: after a reload the in-memory record is
     // gone, so the manifest is read once and consulted here.
     await ensureWindowsLoaded();
-    const known = covered.get(key);
-    const windows = known ? [known] : [];
+    const windows = covered.get(key) ?? [];
+    const covers = (window: CachedRange): boolean =>
+      window.from <= from + REFRESH_SLACK_MS && window.to >= to - REFRESH_SLACK_MS;
 
     // A window downloaded for this date range and not due for a refresh: read
     // it back and never touch the network.
-    const reusable = windows.find(
-      (window) =>
-        window.freshUntil > now
-        && window.from <= from + REFRESH_SLACK_MS
-        && window.to >= to - REFRESH_SLACK_MS,
-    );
+    const reusable = windows.find((window) => window.freshUntil > now && covers(window));
     if (!options.force && reusable) {
       const rows = mergeRows(memory.get(key)?.rows ?? [], await readCachedBars(exchange, symbol));
       // Trust the manifest, not the bars' timestamps: an exchange returns the
@@ -280,68 +296,82 @@ export async function loadBaseBars(
       // one bar late is still the same series. Demanding a non-empty slice
       // re-downloaded everything whenever the last bar sat just outside.
       if (rows.length > 0) {
-        covered.set(key, reusable);
         memory.set(key, { exchange, symbol, rows });
         return windowOf(rows, startMs, endMs);
       }
     }
 
-    // Same series, a WIDENED window (the user picked an earlier start): fetch
-    // only the part before it. Picking a different end date means different
-    // data and takes the full-download path below.
-    if (!options.force && known && from < known.from && to <= known.to + REFRESH_SLACK_MS) {
-      try {
-        const older = await downloadBars({
-          exchange,
-          symbol,
-          startMs: from,
-          endMs: known.from - BAR_MS,
-          signal: options.signal,
-        });
-        const rows = mergeRows(memory.get(key)?.rows ?? (await readCachedBars(exchange, symbol)), older);
-        const record: CachedRange = { from, to: known.to, freshUntil: known.freshUntil };
-        covered.set(key, record);
-        await writeCachedBars(exchange, symbol, rows, record);
+    // The request is inside a window we already downloaded, but that window is
+    // due for a refresh: keep its bars, re-record it (and fetch only whatever
+    // lies past its end). Re-downloading a day of bars for a page reload is the
+    // behaviour this cache exists to avoid.
+    const coveredWindow = windows.find(covers);
+    // Otherwise extend the closest known window on one side instead of
+    // downloading the whole request again — but only when the request actually
+    // touches it. A window with a gap before it (the diary's next trade hours
+    // later) is downloaded on its own, so the gap is never fetched.
+    const head = windows
+      .filter(
+        (window) =>
+          window.from > from + REFRESH_SLACK_MS &&
+          window.to >= to - REFRESH_SLACK_MS &&
+          window.from <= to + REFRESH_SLACK_MS,
+      )
+      .sort((a, b) => a.from - b.from)[0];
+    const tail = windows
+      .filter(
+        (window) =>
+          window.from <= from + REFRESH_SLACK_MS &&
+          window.to < to - REFRESH_SLACK_MS &&
+          window.to >= from - REFRESH_SLACK_MS,
+      )
+      .sort((a, b) => b.to - a.to)[0];
+    const batch = coveredWindow
+      ? ({ side: "tail", base: coveredWindow } as const)
+      : head && (!tail || head.from - from < to - tail.to)
+        ? ({ side: "head", base: head } as const)
+        : tail
+          ? ({ side: "tail", base: tail } as const)
+          : null;
+    if (!options.force && batch) {
+      const { side, base } = batch;
+      const missingFrom = side === "head" ? from : base.to + BAR_MS;
+      const missingTo = side === "head" ? base.from - BAR_MS : to;
+      let failed: unknown = null;
+      let missing: CandleRow[] = [];
+      if (missingFrom < missingTo) {
+        try {
+          missing = await downloadBars({
+            exchange,
+            symbol,
+            startMs: missingFrom,
+            endMs: missingTo,
+            signal: options.signal,
+          });
+        } catch (error) {
+          failed = error;
+          if (options.signal?.aborted) throw error;
+        }
+      }
+      const rows = mergeRows(memory.get(key)?.rows ?? (await readCachedBars(exchange, symbol)), missing);
+      if (rows.length > 0) {
+        if (failed) {
+          // Refresh failed (offline, rate limit): serve what is on disk and
+          // retry on the next load instead of failing the chart.
+          rememberWindow(key, base);
+        } else {
+          rememberEnd(endMs);
+          const record: CachedRange =
+            side === "head"
+              ? { from, to: base.to, freshUntil: base.freshUntil }
+              : { from: base.from, to: to + PAD_MS, freshUntil: endMs + DAY_MS };
+          rememberWindow(key, record);
+          await writeCachedBars(exchange, symbol, rows, record);
+        }
         memory.set(key, { exchange, symbol, rows });
         return windowOf(rows, startMs, endMs);
-      } catch {
-        // Fall through: a full download is the safe answer.
       }
-    }
-
-    // The saved window expired but the bars are still on disk: fetch only what
-    // comes AFTER it (usually a handful of bars), never the whole range again.
-    // Any other gap (the user moved the dates) falls through to a full download.
-    if (!options.force && known && known.from <= from + REFRESH_SLACK_MS) {
-      const onDisk = await isRangeCached(exchange, symbol, known.from, known.to);
-      if (onDisk) {
-        const tailFrom = known.to + BAR_MS;
-        let fresh: CandleRow[] = [];
-        let failed: unknown = null;
-        if (tailFrom < to) {
-          try {
-            fresh = await downloadBars({ exchange, symbol, startMs: tailFrom, endMs: to, signal: options.signal });
-          } catch (error) {
-            failed = error;
-          }
-        }
-        const rows = mergeRows(memory.get(key)?.rows ?? (await readCachedBars(exchange, symbol)), fresh);
-        if (rows.length > 0) {
-          if (failed) {
-            // Refresh failed (offline, rate limit): serve what is on disk and
-            // retry on the next load instead of failing the chart.
-            covered.set(key, known);
-          } else {
-            rememberEnd(endMs);
-            const record: CachedRange = { from: known.from, to: to + PAD_MS, freshUntil: endMs + DAY_MS };
-            covered.set(key, record);
-            await writeCachedBars(exchange, symbol, rows, record);
-          }
-          memory.set(key, { exchange, symbol, rows });
-          return windowOf(rows, startMs, endMs);
-        }
-        if (failed) throw failed;
-      }
+      if (failed) throw failed;
     }
 
     downloadsBySeries.set(key, (downloadsBySeries.get(key) ?? 0) + 1);
@@ -465,7 +495,11 @@ export async function cacheState(
   symbol: string,
 ): Promise<{ known: CachedRange | null; bars: number; fresh: boolean }> {
   await ensureWindowsLoaded();
-  const known = covered.get(keyOf(exchange, symbol)) ?? null;
+  const ranges = covered.get(keyOf(exchange, symbol)) ?? [];
+  const known = ranges.reduce<CachedRange | null>(
+    (best, range) => (!best || range.freshUntil > best.freshUntil ? range : best),
+    null,
+  );
   const entry = memory.get(keyOf(exchange, symbol));
   return {
     known,

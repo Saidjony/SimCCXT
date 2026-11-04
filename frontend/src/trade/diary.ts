@@ -71,10 +71,22 @@ export function fmtPnl(n: number): string {
  * a key and inherit each other's review row). The engine instance is part of
  * the ref; older server payloads without one still produce a usable key.
  */
-export function tradeRef(trade: Pick<DiaryTrade, "engine_id" | "entry_order_id" | "exit_order_id">): string {
+/**
+ * Stable key of one trade: ties a table row to its chart markers and to its
+ * post-mortem row.
+ *
+ * The SYMBOL is part of the key. In local-engine mode every symbol has its own
+ * order counter — SOL and XRP both start at 1 — so `engine-1-2` named two
+ * different trades. Clicking XRP's first row then found SOL's first trade and
+ * zoomed the chart to a time with no XRP candles: the trade "did not show".
+ */
+export function tradeRef(
+  trade: Pick<DiaryTrade, "symbol" | "engine_id" | "entry_order_id" | "exit_order_id">,
+): string {
   const engine = trade.engine_id ?? "";
   const pair = `${trade.entry_order_id}-${trade.exit_order_id}`;
-  return engine === "" ? pair : `${engine}-${pair}`;
+  const base = engine === "" ? pair : `${engine}-${pair}`;
+  return `${trade.symbol}|${base}`;
 }
 
 /**

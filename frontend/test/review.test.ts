@@ -131,9 +131,9 @@ describe("classifyExit", () => {
 
 describe("buildReview", () => {
   const levels = {
-    "e1-x1": { stop: 95 },
-    "e2-x2": { stop: 95 },
-    "e3-x3": { stop: 95 },
+    "BTC/USDT|e1-x1": { stop: 95 },
+    "BTC/USDT|e2-x2": { stop: 95 },
+    "BTC/USDT|e3-x3": { stop: 95 },
   };
 
   function candlesFor(peak: number, dip: number) {
@@ -181,7 +181,7 @@ describe("buildReview", () => {
         }),
       ],
       () => [bar(T0, 119.76, 120.628, 118.272, 118.3)],
-      { levels: { "1-2": { stop: 121, target: 118.3 } }, riskUsdt: 10 },
+      { levels: { "BTC/USDT|1-2": { stop: 121, target: 118.3 } }, riskUsdt: 10 },
     );
     const row = rows[0];
     // The take-profit closed the position AT 118.30, so the favourable move
@@ -203,7 +203,7 @@ describe("buildReview", () => {
     const rows = buildReview(
       [trade({ qty: 2, exit_price: 95, pnl: -10, r: -1, exit_reason: "stop" })],
       () => [bar(T0, 100, 101, 80, 95)],
-      { levels: { "e1-x1": { stop: 95 } }, riskUsdt: 10 },
+      { levels: { "BTC/USDT|e1-x1": { stop: 95 } }, riskUsdt: 10 },
     );
     assert.equal(rows[0].kind, "stop");
     assert.equal(rows[0].maeR, 1, "the stop distance, not the bar's full wick");
@@ -215,7 +215,7 @@ describe("buildReview", () => {
     const rows = buildReview(
       [trade({ exit_price: 110, pnl: 10, r: 1, exit_reason: "take" })],
       () => [bar(T0, 100, 130, 99, 110)],
-      { levels: { "e1-x1": { stop: 95, target: 110 } }, riskUsdt: 10 },
+      { levels: { "BTC/USDT|e1-x1": { stop: 95, target: 110 } }, riskUsdt: 10 },
     );
     assert.equal(rows[0].kind, "target");
     assert.equal(rows[0].mfeR, 1, "the target distance, not the bar's full range");
@@ -258,7 +258,7 @@ describe("buildReview", () => {
     const rows = buildReview(
       [trade({ exit_price: 91, pnl: -9, r: -1, exit_reason: "stop" })],
       () => [bar(T0, 100, 101, 90, 92)],
-      { levels: { "e1-x1": { stop: 95 } } },
+      { levels: { "BTC/USDT|e1-x1": { stop: 95 } } },
     );
     assert.equal(rows[0].kind, "stop", "the reason from the fill decides");
     assert.ok(
@@ -291,7 +291,7 @@ describe("buildReview", () => {
         stopped("d"),
       ],
       () => [bar(T0, 100, 101, 99, 100)],
-      { levels: { ...levels, "a-xa": { stop: 95 }, "b-xb": { stop: 95 }, "c-xc": { stop: 95 }, "d-xd": { stop: 95 } } },
+      { levels: { ...levels, "BTC/USDT|a-xa": { stop: 95 }, "BTC/USDT|b-xb": { stop: 95 }, "BTC/USDT|c-xc": { stop: 95 }, "BTC/USDT|d-xd": { stop: 95 } } },
     );
     assert.deepEqual(rows.map((r) => r.priorStopStreak), [0, 1, 2, 0]);
   });
@@ -312,7 +312,7 @@ describe("summarize", () => {
         trade({ pnl: -5, r: -1, fee: 0.2, exit_price: 95, entry_order_id: "b", exit_order_id: "xb" }),
       ],
       () => [bar(T0, 100, 101, 99, 100)],
-      { levels: { "a-xa": { stop: 95 }, "b-xb": { stop: 95 } } },
+      { levels: { "BTC/USDT|a-xa": { stop: 95 }, "BTC/USDT|b-xb": { stop: 95 } } },
     );
     const sum = summarize(rows);
     assert.equal(sum.trades, 2);
@@ -338,7 +338,7 @@ describe("summarize", () => {
     const rows = buildReview(
       [trade({ exit_price: 95, pnl: -5, r: -1 })],
       () => [bar(T0, 100, 130, 99, 100)],
-      { levels: { "e1-x1": { stop: 95 } } },
+      { levels: { "BTC/USDT|e1-x1": { stop: 95 } } },
     );
     assert.equal(summarize(rows).gaveBack, 1);
   });

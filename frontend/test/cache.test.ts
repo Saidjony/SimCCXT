@@ -206,6 +206,60 @@ describe("provider: download once", () => {
   });
 });
 
+describe("provider: disjoint windows (one per trade)", () => {
+  // The diary asks for one small window around each trade, not for the days
+  // between them. Each window must be downloaded and returned; treating the
+  // first one as "covering" the rest left later trades with no candles.
+  const SPAN = 100 * BAR;
+  const first = { start: 30_000 * BAR, end: 30_000 * BAR + SPAN };
+  const second = { start: 30_000 * BAR + 500 * BAR, end: 30_000 * BAR + 600 * BAR };
+
+  it("downloads a window far after the first instead of reusing its bars", async () => {
+    const a = await provider.loadBaseBars("binance", "BTC/USDT", first.start, first.end);
+    assert.ok(a.length > 0, "the first window loads");
+    const before = harness.fetches.length;
+
+    const b = await provider.loadBaseBars("binance", "BTC/USDT", second.start, second.end);
+    assert.ok(harness.fetches.length > before, "the later window must reach the venue");
+    assert.ok(b.length > 0, "and must not come back empty");
+    assert.equal(b[0][0], second.start);
+    assert.ok(b[b.length - 1][0] > first.end, "its bars lie past the first window");
+  });
+
+  it("does not download the gap between the windows", async () => {
+    await provider.loadBaseBars("binance", "BTC/USDT", first.start, first.end);
+    await provider.loadBaseBars("binance", "BTC/USDT", second.start, second.end);
+    for (const call of harness.fetches) {
+      const insideFirst = call.start >= first.start && call.end <= first.end + BAR;
+      const insideSecond = call.start >= second.start && call.end <= second.end + BAR;
+      assert.ok(
+        insideFirst || insideSecond,
+        `fetch ${call.start}..${call.end} must stay inside a trade window`,
+      );
+    }
+  });
+
+  it("extends a window that overlaps the loaded bars", async () => {
+    await provider.loadBaseBars("binance", "BTC/USDT", first.start, first.end);
+    const before = harness.fetches.length;
+    const overlap = { start: first.end - 50 * BAR, end: first.end + 50 * BAR };
+    const rows = await provider.loadBaseBars("binance", "BTC/USDT", overlap.start, overlap.end);
+    assert.ok(harness.fetches.length > before, "the missing tail is fetched");
+    assert.ok(rows.some((row) => row[0] >= first.end), "bars past the first window are returned");
+  });
+
+  it("serves both windows after a reload without fetching", async () => {
+    await provider.loadBaseBars("binance", "BTC/USDT", first.start, first.end);
+    await provider.loadBaseBars("binance", "BTC/USDT", second.start, second.end);
+    const before = harness.fetches.length;
+    const fresh = await import(`../src/market/provider.ts?windows=${Date.now()}`);
+    const a = await fresh.loadBaseBars("binance", "BTC/USDT", first.start, first.end);
+    const b = await fresh.loadBaseBars("binance", "BTC/USDT", second.start, second.end);
+    assert.equal(harness.fetches.length, before, "both windows survive the reload");
+    assert.ok(a.length > 0 && b.length > 0);
+  });
+});
+
 describe("provider: eviction", () => {
   it("removing a coin deletes only its cache and leaves the others intact", async () => {
     await provider.loadBaseBars("binance", "BTC/USDT", WINDOW.start, WINDOW.end);

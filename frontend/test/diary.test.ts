@@ -345,14 +345,23 @@ describe("formatters", () => {
     assert.equal(fmtPnl(-Math.abs(0)), "0");
   });
 
-  it("tradeRef keeps page loads apart, order ids restart at 1", () => {
+  it("tradeRef keeps symbols and page loads apart", () => {
     // Two different trades, same symbol, same order ids (a reloaded tab
     // replays from the same bar). The engine instance must distinguish them,
     // otherwise the diary gives both the same review row and one "Итог".
-    const first = { engine_id: "page-1", entry_order_id: "1", exit_order_id: "2" };
-    const second = { engine_id: "page-2", entry_order_id: "1", exit_order_id: "2" };
+    const first = { symbol: "BTC/USDT", engine_id: "page-1", entry_order_id: "1", exit_order_id: "2" };
+    const second = { symbol: "BTC/USDT", engine_id: "page-2", entry_order_id: "1", exit_order_id: "2" };
     assert.notEqual(tradeRef(first), tradeRef(second));
-    // Legacy payloads without an engine id still produce the old key.
-    assert.equal(tradeRef({ entry_order_id: "1", exit_order_id: "2" }), "1-2");
+    // And so must the symbol: the local engine restarts order ids at 1 for
+    // EVERY symbol, so SOL's first trade and XRP's first trade shared a ref and
+    // a click on one zoomed the chart to the other.
+    const btc = { symbol: "BTC/USDT", engine_id: "e1", entry_order_id: "1", exit_order_id: "2" };
+    const eth = { symbol: "ETH/USDT", engine_id: "e1", entry_order_id: "1", exit_order_id: "2" };
+    assert.notEqual(tradeRef(btc), tradeRef(eth));
+    // Legacy payloads without an engine id still get a unique key.
+    assert.equal(
+      tradeRef({ symbol: "BTC/USDT", entry_order_id: "1", exit_order_id: "2" }),
+      "BTC/USDT|1-2",
+    );
   });
 });
