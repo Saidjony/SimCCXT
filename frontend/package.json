@@ -5,8 +5,9 @@
   "description": "Minimal TypeScript + React terminal for the simccxt Rust trading simulator",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run build:wasm && vite",
     "build:wasm": "node scripts/build-wasm.mjs",
+    "build:wasm:force": "node scripts/build-wasm.mjs --force",
     "build": "npm run build:wasm && tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "node --test test/"

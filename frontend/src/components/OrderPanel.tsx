@@ -109,12 +109,12 @@ export function OrderPanel(): JSX.Element {
   const validShortStop = kind === "market"
     ? lastPrice > 0 && sl !== null && sl > lastPrice
     : entry !== null && sl !== null && sl > entry;
-  // Worst case if the stop is hit: the trader's whole budget, commission
-  // included (sizing divides by price distance + fees, so this equals it).
+  // Worst case if the stop is hit: the trader's whole budget. With no
+  // commission configured (the default) that is just the price distance.
   const preview =
     qty !== null && worst !== null
-      ? `≈ ${qty.toPrecision(4)} ${base} · по стопу −$${worst.toFixed(2)} ` +
-        `(${(taker * 100).toFixed(2)}% комиссия × 2 уже учтены)`
+      ? `≈ ${qty.toPrecision(4)} ${base} · по стопу −$${worst.toFixed(2)}` +
+        (taker > 0 ? ` (${(taker * 100).toFixed(2)}% комиссия × 2 уже учтены)` : "")
       : qty !== null
         ? `≈ ${qty.toPrecision(4)} ${base} · риск $${fixedRiskUsdt}`
         : "укажи стоп — без него вход запрещён";

@@ -9,7 +9,7 @@ import { ChallengeCard } from "../components/ChallengeCard";
 import { OrderPanel } from "../components/OrderPanel";
 import { BottomTerminal } from "../components/Panels";
 import type { ExchangeId } from "../types/protocol";
-import { subscribeSim, sendSim } from "../websocket/connection";
+import { subscribeSim, sendSim, warmMarketData } from "../websocket/connection";
 import { store } from "../state/store";
 
 /** Connection + data-age badge: "connected · data 2s ago" vs "connecting…". */
@@ -111,6 +111,15 @@ export function TradingTerminal(): JSX.Element {
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   };
+
+  // Warm this browser's cache for every watchlist coin in the background (5m
+  // only; 1h/1d are aggregated locally). No per-coin `subscribe` burst: the
+  // active chart is already loading, and each extra subscribe would rebuild
+  // the replay engine and fight the chart on screen.
+  useEffect(() => {
+    const state = getState();
+    warmMarketData(state.watchlist.map((coin) => coin.symbol));
+  }, []);
 
   return (
     <div className="app">

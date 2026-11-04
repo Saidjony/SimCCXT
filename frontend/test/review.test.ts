@@ -131,9 +131,9 @@ describe("classifyExit", () => {
 
 describe("buildReview", () => {
   const levels = {
-    "e1-x1": { stop: 95 },
-    "e2-x2": { stop: 95 },
-    "e3-x3": { stop: 95 },
+    "BTC/USDT|e1-x1": { stop: 95 },
+    "BTC/USDT|e2-x2": { stop: 95 },
+    "BTC/USDT|e3-x3": { stop: 95 },
   };
 
   function candlesFor(peak: number, dip: number) {
@@ -158,6 +158,67 @@ describe("buildReview", () => {
     // Realized R comes from pnl / (stop distance × qty) = −5 / (5 × 1) = −1R —
     // the same unit the excursion uses — so the whole swing was given back.
     assert.equal(row.gaveBackR, 7, "6R of favourable move, and it ended −1R");
+  });
+
+  it("keeps the excursion in the same R as the PnL column", () => {
+    // Real trade: SOL short 119.76, stop 121.00, TP 118.30, risk budget 10
+    // USDT. The stop distance is 1.24, but sizing adds the round-trip fees, so
+    // 1R of MONEY is 10 USDT, not 1.24 × 5.429. The excursion must use the
+    // same denominator, otherwise "было в +1.2R" sits next to "+0.47R" for the
+    // very same take-profit exit (the gap is the 0.32R of fees).
+    const rows = buildReview(
+      [
+        trade({
+          side: "short",
+          direction: "sell→buy",
+          qty: 5.429176393941054,
+          entry_price: 119.76,
+          exit_price: 118.3,
+          pnl: 4.695423204299964,
+          r: 0.46954232042999644,
+          entry_order_id: "1",
+          exit_order_id: "2",
+        }),
+      ],
+      () => [bar(T0, 119.76, 120.628, 118.272, 118.3)],
+      { levels: { "BTC/USDT|1-2": { stop: 121, target: 118.3 } }, riskUsdt: 10 },
+    );
+    const row = rows[0];
+    // The take-profit closed the position AT 118.30, so the favourable move
+    // stops there even though the exit bar wicked 0.028 lower.
+    assert.ok(Math.abs((row.mfeR ?? 0) - 0.79266) < 1e-5, `mfeR ${row.mfeR}`);
+    assert.ok(Math.abs((row.maeR ?? 0) - 0.471253) < 1e-5, `maeR ${row.maeR}`);
+    assert.ok(
+      Math.abs((row.gaveBackR ?? 0) - 0.32312) < 1e-4,
+      `gave back ${row.gaveBackR}`,
+    );
+    // Sanity: a full stop-out is exactly −1R of money, by construction.
+    assert.ok(row.mfeR !== null && row.mfeR < 1, "TP inside 1R must read < 1R");
+  });
+
+  it("caps a stop-out's excursion at the level that closed it", () => {
+    // The stop fired on a wide bar (low 80), but the position was closed at
+    // 95: the trader never lived through the rest of that move, so "было в −"
+    // must read −1R, not −4R. Money R is the 10 USDT budget (2 × 5 points).
+    const rows = buildReview(
+      [trade({ qty: 2, exit_price: 95, pnl: -10, r: -1, exit_reason: "stop" })],
+      () => [bar(T0, 100, 101, 80, 95)],
+      { levels: { "BTC/USDT|e1-x1": { stop: 95 } }, riskUsdt: 10 },
+    );
+    assert.equal(rows[0].kind, "stop");
+    assert.equal(rows[0].maeR, 1, "the stop distance, not the bar's full wick");
+  });
+
+  it("caps a take-profit's excursion at the target", () => {
+    // The TP filled at 110 while the bar ran to 130. The trade made 1R, so
+    // "было в +" cannot claim +3R of profit it never booked.
+    const rows = buildReview(
+      [trade({ exit_price: 110, pnl: 10, r: 1, exit_reason: "take" })],
+      () => [bar(T0, 100, 130, 99, 110)],
+      { levels: { "BTC/USDT|e1-x1": { stop: 95, target: 110 } }, riskUsdt: 10 },
+    );
+    assert.equal(rows[0].kind, "target");
+    assert.equal(rows[0].mfeR, 1, "the target distance, not the bar's full range");
   });
 
   it("flags a trade that had no stop", () => {
@@ -197,7 +258,7 @@ describe("buildReview", () => {
     const rows = buildReview(
       [trade({ exit_price: 91, pnl: -9, r: -1, exit_reason: "stop" })],
       () => [bar(T0, 100, 101, 90, 92)],
-      { levels: { "e1-x1": { stop: 95 } } },
+      { levels: { "BTC/USDT|e1-x1": { stop: 95 } } },
     );
     assert.equal(rows[0].kind, "stop", "the reason from the fill decides");
     assert.ok(
@@ -230,7 +291,7 @@ describe("buildReview", () => {
         stopped("d"),
       ],
       () => [bar(T0, 100, 101, 99, 100)],
-      { levels: { ...levels, "a-xa": { stop: 95 }, "b-xb": { stop: 95 }, "c-xc": { stop: 95 }, "d-xd": { stop: 95 } } },
+      { levels: { ...levels, "BTC/USDT|a-xa": { stop: 95 }, "BTC/USDT|b-xb": { stop: 95 }, "BTC/USDT|c-xc": { stop: 95 }, "BTC/USDT|d-xd": { stop: 95 } } },
     );
     assert.deepEqual(rows.map((r) => r.priorStopStreak), [0, 1, 2, 0]);
   });
@@ -251,7 +312,7 @@ describe("summarize", () => {
         trade({ pnl: -5, r: -1, fee: 0.2, exit_price: 95, entry_order_id: "b", exit_order_id: "xb" }),
       ],
       () => [bar(T0, 100, 101, 99, 100)],
-      { levels: { "a-xa": { stop: 95 }, "b-xb": { stop: 95 } } },
+      { levels: { "BTC/USDT|a-xa": { stop: 95 }, "BTC/USDT|b-xb": { stop: 95 } } },
     );
     const sum = summarize(rows);
     assert.equal(sum.trades, 2);
@@ -277,7 +338,7 @@ describe("summarize", () => {
     const rows = buildReview(
       [trade({ exit_price: 95, pnl: -5, r: -1 })],
       () => [bar(T0, 100, 130, 99, 100)],
-      { levels: { "e1-x1": { stop: 95 } } },
+      { levels: { "BTC/USDT|e1-x1": { stop: 95 } } },
     );
     assert.equal(summarize(rows).gaveBack, 1);
   });

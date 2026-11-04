@@ -1,6 +1,7 @@
-import { useSim } from "../state/store";
+import { store, useSim } from "../state/store";
 import { subscribeSim } from "../websocket/connection";
 import { CHART_TIMEFRAMES } from "../chart/MiniChart";
+import { timeframeOr } from "../market/timeframes";
 import { Popover } from "../components/Popover";
 
 /** Shortcut table shown by the ⌨ hint (kept in sync with Chart.tsx onKey). */
@@ -28,7 +29,12 @@ function TimeframePicker(): JSX.Element {
         className="tf-select"
         aria-label="Таймфрейм графика"
         value={timeframe}
-        onChange={(event) => subscribeSim(symbol, event.target.value, exchange)}
+        onChange={(event) => {
+          // Record the choice (persisted) and switch this tab's local series.
+          const next = timeframeOr(event.target.value, "5m");
+          store.setTimeframe(next);
+          subscribeSim(symbol, next, exchange);
+        }}
       >
         {CHART_TIMEFRAMES.map((item) => (
           <option key={item} value={item}>{item}</option>

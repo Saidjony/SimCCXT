@@ -23,6 +23,10 @@ import {
   rulerStats,
   snapTime,
   toBox,
+  tradeBoxShape,
+  tradeOutcome,
+  tradeVisible,
+  tradeZones,
   volumeProfile,
 } from "../src/chart/overlays.ts";
 import type { FillLine } from "../src/types/protocol.ts";
@@ -74,9 +78,38 @@ describe("position tool", () => {
         fill("buy", 1, 100, 1),
       ], "BTC/USDT");
       assert.deepEqual(links, [
-        { entryTimestamp: 1, entryPrice: 100, exitTimestamp: 2, exitPrice: 105, direction: "long" },
-        { entryTimestamp: 1, entryPrice: 100, exitTimestamp: 3, exitPrice: 110, direction: "long" },
+        {
+          entryTimestamp: 1,
+          entryPrice: 100,
+          exitTimestamp: 2,
+          exitPrice: 105,
+          direction: "long",
+          entryOrderId: "1",
+        },
+        {
+          entryTimestamp: 1,
+          entryPrice: 100,
+          exitTimestamp: 3,
+          exitPrice: 110,
+          direction: "long",
+          entryOrderId: "1",
+        },
       ]);
+    });
+
+    it("keeps a trade closed on the entry millisecond in the right direction", () => {
+      // A manual close inside the entry bar leaves both fills on one timestamp,
+      // so the stored array order is arbitrary. The engine sequence decides.
+      const entry: FillLine = { ...fill("buy", 1, 100, 5), id: "1_0", orderId: "1" };
+      const exit: FillLine = { ...fill("sell", 1, 100, 5), id: "2_0", orderId: "2" };
+      for (const fills of [[entry, exit], [exit, entry]]) {
+        const links = pairTradeFills(fills, "BTC/USDT");
+        assert.equal(links.length, 1);
+        assert.equal(links[0].direction, "long");
+        assert.equal(links[0].entryOrderId, "1");
+        assert.equal(links[0].entryPrice, 100);
+        assert.equal(links[0].exitPrice, 100);
+      }
     });
 
     it("starts a new opposite position after a reversal", () => {
@@ -86,8 +119,22 @@ describe("position tool", () => {
         fill("buy", 0.5, 80, 3),
       ], "BTC/USDT");
       assert.deepEqual(links, [
-        { entryTimestamp: 1, entryPrice: 100, exitTimestamp: 2, exitPrice: 90, direction: "long" },
-        { entryTimestamp: 2, entryPrice: 90, exitTimestamp: 3, exitPrice: 80, direction: "short" },
+        {
+          entryTimestamp: 1,
+          entryPrice: 100,
+          exitTimestamp: 2,
+          exitPrice: 90,
+          direction: "long",
+          entryOrderId: "1",
+        },
+        {
+          entryTimestamp: 2,
+          entryPrice: 90,
+          exitTimestamp: 3,
+          exitPrice: 80,
+          direction: "short",
+          entryOrderId: "2",
+        },
       ]);
     });
   });
@@ -95,6 +142,120 @@ describe("position tool", () => {
   it("computes reward/risk", () => {
     assert.equal(riskReward(100, 90, 120), 2);
     assert.equal(riskReward(100, 100, 120), null);
+  });
+
+  describe("closed-trade box", () => {
+    const link = (
+      direction: "long" | "short",
+      entryPrice: number,
+      exitPrice: number,
+    ) => ({
+      entryTimestamp: 1,
+      entryPrice,
+      exitTimestamp: 2,
+      exitPrice,
+      direction,
+      entryOrderId: "1",
+    });
+
+    it("measures a long's result and R against its stop", () => {
+      const outcome = tradeOutcome(link("long", 100, 120), 90);
+      assert.equal(outcome.move, 20);
+      assert.equal(outcome.pct, 20);
+      assert.equal(outcome.r, 2);
+      assert.equal(outcome.profitable, true);
+    });
+
+    it("measures a short symmetrically", () => {
+      const outcome = tradeOutcome(link("short", 100, 80), 110);
+      assert.equal(outcome.move, 20);
+      assert.equal(outcome.r, 2);
+      assert.equal(outcome.profitable, true);
+    });
+
+    it("reports a loss and no R when the stop is unknown", () => {
+      const outcome = tradeOutcome(link("long", 100, 95), null);
+      assert.equal(outcome.profitable, false);
+      assert.equal(outcome.r, null);
+      assert.equal(outcome.pct, -5);
+    });
+
+    it("spans entry, exit and stop, and keeps same-bar trades visible", () => {
+      const box = tradeBoxShape(10, 100, 50, 80, 120);
+      assert.equal(box.left, 10);
+      assert.equal(box.width, 40);
+      assert.equal(box.top, 80);
+      assert.equal(box.height, 40);
+      assert.equal(box.stopY, 120);
+      assert.equal(box.rewardY, null);
+      assert.equal(tradeBoxShape(10, 100, 10, 90, null).width, 3);
+    });
+
+    it("stretches the box up to the target when the trade had one", () => {
+      const box = tradeBoxShape(10, 100, 50, 120, 140, 60);
+      assert.equal(box.top, 60);
+      assert.equal(box.height, 80);
+      assert.equal(box.rewardY, 60);
+    });
+
+    describe("visibility", () => {
+      const times = [10, 20, 30, 40];
+
+      it("hides a trade whose bars the replay has not revealed yet", () => {
+        // After a reload the replay restarts: a persisted fill from later in
+        // the session must not pile up on the last visible candle.
+        assert.equal(tradeVisible({ entryTimestamp: 50, exitTimestamp: 60 }, times), false);
+        assert.equal(tradeVisible({ entryTimestamp: 30, exitTimestamp: 50 }, times), false);
+      });
+
+      it("shows a trade once both of its bars are on the chart", () => {
+        assert.equal(tradeVisible({ entryTimestamp: 20, exitTimestamp: 40 }, times), true);
+        assert.equal(tradeVisible({ entryTimestamp: 10, exitTimestamp: 10 }, times), true);
+      });
+
+      it("hides trades from before the loaded range", () => {
+        assert.equal(tradeVisible({ entryTimestamp: 5, exitTimestamp: 20 }, times), false);
+      });
+
+      it("shows nothing without candles", () => {
+        assert.equal(tradeVisible({ entryTimestamp: 1, exitTimestamp: 2 }, []), false);
+      });
+    });
+
+    describe("zones", () => {
+      it("shows the planned target even when the stop was hit", () => {
+        // Long stopped out: the green leg must still be the target, not nothing.
+        const zones = tradeZones(link("long", 100, 90), 90, 130);
+        assert.equal(zones.rewardPrice, 130);
+        assert.equal(zones.adversePrice, 90);
+      });
+
+      it("shows the planned target on a short stop-out too", () => {
+        const zones = tradeZones(link("short", 100, 110), 110, 70);
+        assert.equal(zones.rewardPrice, 70);
+        assert.equal(zones.adversePrice, 110);
+      });
+
+      it("falls back to the realized exit when there was no target", () => {
+        const win = tradeZones(link("long", 100, 120), 90, null);
+        assert.equal(win.rewardPrice, 120);
+        assert.equal(win.adversePrice, 90);
+        const loss = tradeZones(link("long", 100, 90), 90, null);
+        assert.equal(loss.rewardPrice, null);
+        assert.equal(loss.adversePrice, 90);
+      });
+
+      it("extends the risk leg to an exit that slipped past the stop", () => {
+        const zones = tradeZones(link("long", 100, 85), 90, null);
+        assert.equal(zones.adversePrice, 85);
+      });
+
+      it("ignores levels on the wrong side of the entry", () => {
+        const zones = tradeZones(link("long", 100, 100), 120, 80);
+        assert.equal(zones.rewardPrice, null);
+        assert.equal(zones.adversePrice, null);
+      });
+    });
   });
 
   it("splits long bands tp/entry/sl from top", () => {

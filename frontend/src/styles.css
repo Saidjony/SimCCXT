@@ -320,6 +320,11 @@ td, th { padding: 3px 4px; }
 .tool-btn:hover { background: #2a3342; color: var(--text); }
 .tool-btn.active { background: rgba(74, 158, 196, 0.2); color: var(--accent); border-color: var(--accent); }
 .tool-btn.danger:hover { background: rgba(212, 102, 102, 0.2); color: var(--red); }
+.tool-btn.danger.armed {
+  background: rgba(212, 102, 102, 0.28); color: var(--red);
+  border-color: var(--red); animation: danger-pulse 0.9s ease-in-out infinite;
+}
+@keyframes danger-pulse { 50% { opacity: 0.45; } }
 /* Setup-criteria chips in the chart's top-left overlay (clicks pass through). */
 .coin-chips {
   display: flex; flex-wrap: wrap; gap: 4px;

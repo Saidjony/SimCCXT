@@ -5,6 +5,7 @@ interface InitMessage {
   start_ms: number;
   step_ms: number;
   market_kind: "spot" | "linear";
+  engine_id: string;
   candles: number[][];
   exchange: string;
   speed: number;
@@ -29,6 +30,7 @@ type EngineCommand =
       step_ms: number;
       speed: number;
       market_kind: "spot" | "linear";
+      engine_id: string;
       reveal_reset_ms: number;
       range_end_ms: number;
       oi: Array<[number, number]>;
@@ -144,15 +146,42 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
       stopTimer();
       speed = message.speed;
       const { type: _type, ...input } = message;
-      const response = await fetch(new URL("/simccxt_wasm.wasm", self.location.origin));
-      if (!response.ok) throw new Error(`Failed to load simulator WebAssembly: ${response.status}`);
-      const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), {});
+      const response = await fetch(new URL("/simccxt_wasm.wasm", self.location.origin), {
+        cache: "no-cache",
+      });
+      if (!response.ok) {
+        throw new Error(
+          `Не удалось загрузить simccxt_wasm.wasm: HTTP ${response.status}. ` +
+            `Соберите движок: cd frontend && npm run build:wasm`,
+        );
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      // A missing artifact is usually answered with index.html by the static
+      // server, and WebAssembly then fails with "expected magic word ... found
+      // 3c 21 64 6f 63" (that is "<!doc"), which says nothing about the cause.
+      const isWasm =
+        bytes.length >= 4 &&
+        bytes[0] === 0x00 &&
+        bytes[1] === 0x61 &&
+        bytes[2] === 0x73 &&
+        bytes[3] === 0x6d;
+      if (!isWasm) {
+        const head = new TextDecoder().decode(bytes.slice(0, 40)).trim().slice(0, 30);
+        throw new Error(
+          `simccxt_wasm.wasm не собран: вместо WebAssembly пришёл ответ «${head}…». ` +
+            `Выполните: cd frontend && npm run build:wasm (и перезагрузите страницу).`,
+        );
+      }
+      const { instance } = await WebAssembly.instantiate(bytes, {});
       wasm = instance.exports as WasmExports;
       publish({ type: "init", ...input });
       return;
     }
     if (message.type === "snapshot") {
-      publish({ type: "snapshot" });
+      // Forward `include_fills`: the wasm engine only re-sends the whole fill
+      // history when asked for it, and a reconnecting session needs exactly
+      // that to rebuild the diary after a server restart.
+      publish({ type: "snapshot", include_fills: message.include_fills === true });
       return;
     }
     const { command } = message;

@@ -24,6 +24,10 @@ pub struct Trade {
     pub entry_price: f64,
     pub exit_price: f64,
     pub pnl: f64,
+    /// PnL over the CONFIGURED round risk. Only a baseline: the diary and the
+    /// board report `pnl / (qty x |entry - stop|)`, the risk the trade really
+    /// ran (the stop level is known to the caller, not here).
+    #[allow(dead_code)]
     pub r: f64,
     pub entry_time_ms: i64,
     pub exit_time_ms: i64,
@@ -104,7 +108,11 @@ pub fn reconstruct_trades(
             price: f["price"].as_f64().unwrap_or(0.0),
             amount: f["amount"].as_f64().unwrap_or(0.0),
             fee: f["fee"].as_f64().unwrap_or(0.0),
-            time_ms: f.get("time_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+            time_ms: f
+                .get("time_ms")
+                .and_then(|v| v.as_i64())
+                .or_else(|| f["timestamp"].as_i64())
+                .unwrap_or(0),
             fill_index: f.get("fill_index").and_then(|v| v.as_u64()).unwrap_or(0),
             order_id: f["orderId"].as_str().unwrap_or("").to_string(),
         };

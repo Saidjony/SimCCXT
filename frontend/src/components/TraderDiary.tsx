@@ -17,9 +17,10 @@ import type {
 } from "lightweight-charts";
 import type { CandleRow, DiaryData, DiaryPosition, DiaryTrade } from "../types/protocol";
 import { formatTs } from "../types/protocol";
+import type { ExchangeId } from "../types/protocol";
 import { apiUrl } from "../websocket/connection";
 import {
-  chartRange,
+  chartWindows,
   diaryMarkers,
   diarySymbols,
   fmtChartTime,
@@ -28,10 +29,14 @@ import {
   markersOutsideCandles,
   overallR,
   safeStats,
+  tradeRef,
 } from "../trade/diary";
 import { criterionLabel } from "../trade/criteria";
 import { priceAxisFormat } from "../chart/overlays";
 import { buildReview } from "../trade/review";
+import { aggregateCandles } from "../market/aggregate";
+import { loadBaseBars } from "../market/provider";
+import { TIMEFRAME_MS, timeframeOr } from "../market/timeframes";
 import type { ExitKind, ReviewRow } from "../trade/review";
 
 /** How a trade ended, in the trader's terms. */
@@ -62,9 +67,9 @@ interface SortState {
  * Read-only diary of one ONLINE trader, addressed by `?trader=<nick>`.
  *
  * Deliberately isolated from the terminal: it opens NO WebSocket (the session
- * belongs to the original tab), only fetches the HTTP API on `ws_port + 1`, and
- * renders the engine's FIFO-reconstructed round trips with entry/exit markers
- * on a bar chart.
+ * belongs to the original tab), only fetches the page's own HTTP API (see
+ * `apiUrl`), and renders the engine's FIFO-reconstructed round trips with
+ * entry/exit markers on a bar chart.
  */
 export function TraderDiary({ nick }: { nick: string }): JSX.Element {
   const [diary, setDiary] = useState<DiaryData | null>(null);
@@ -96,12 +101,17 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
 
   // Per-trade post-mortem for the charted symbol: how far price went the
   // trader's way before it hit them, and whether the exit followed their rule.
-  // Reuses the same logic as the review panel so both agree.
+  // Reuses the same logic as the review panel so both agree. `riskUsdt` keeps
+  // the excursion in the same R as the server's PnL/R columns.
   const reviewByRef = useMemo(() => {
     const map = new Map<string, ReviewRow>();
-    for (const row of buildReview(visibleTrades, () => candles)) map.set(row.ref, row);
+    for (const row of buildReview(visibleTrades, () => candles, {
+      riskUsdt: diary?.risk_usdt,
+    })) {
+      map.set(row.ref, row);
+    }
     return map;
-  }, [visibleTrades, candles]);
+  }, [visibleTrades, candles, diary?.risk_usdt]);
 
   // Diary JSON (404 ⇒ the trader disconnected while we were loading).
   useEffect(() => {
@@ -146,11 +156,16 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     };
   }, [nick]);
 
-  // Candles for the chart window of the active symbol.
-  const range = useMemo(
-    () => (diary ? chartRange(trades, positions, activeSymbol, diary.range) : null),
-    [diary, trades, positions, activeSymbol],
-  );
+  // Candles around the trades of the active symbol — not the whole replay
+  // window. The chart only has to explain what the trader did.
+  const windows = useMemo(() => {
+    if (!diary) return [];
+    const timeframe = timeframeOr(diary.timeframe, "5m");
+    const tfMs = TIMEFRAME_MS[timeframe] ?? 300_000;
+    // ~12 bars of context on each side, at least an hour, at most a week.
+    const pad = Math.min(Math.max(3_600_000, tfMs * 12), 7 * 86_400_000);
+    return chartWindows(trades, positions, activeSymbol, pad);
+  }, [diary, trades, positions, activeSymbol]);
 
   // The server may serve a window shorter than asked (its cache holds a recent
   // tail). Markers outside it cannot be drawn — say which ones, rather than
@@ -168,28 +183,45 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     let alive = true;
     setCandleError("");
     setCandles([]);
-    const params = new URLSearchParams({
-      symbol: activeSymbol,
-      timeframe: diary.timeframe || "5m",
-      exchange: diary.exchange || "binance",
-    });
-    if (range) {
-      params.set("start_ms", String(range.start_ms));
-      params.set("end_ms", String(range.end_ms));
-    }
-    fetch(`${apiUrl()}/api/candles?${params.toString()}`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return (await res.json()) as {
-          candles?: CandleRow[];
-          error?: string;
-          partial?: boolean;
-        };
-      })
-      .then((data) => {
+    // Candles for the diary chart come from THIS browser, not from our server:
+    // 5m from the venue, aggregated locally to the diary's timeframe. The
+    // server only told us which symbol/timeframe/range the trader replayed.
+    const timeframe = timeframeOr(diary.timeframe, "5m");
+    const venue = (diary.exchange ?? "binance") as ExchangeId;
+    const known: ExchangeId[] = ["binance", "bybit", "okx"];
+    const target = known.includes(venue) ? venue : "binance";
+    // No trades on this symbol: one small window at the reveal point instead
+    // of the session's whole history.
+    const anchor =
+      diary.range?.reveal_start_ms ?? diary.range?.start_ms ?? Date.now();
+    const plan =
+      windows.length > 0
+        ? windows
+        : [{ start_ms: anchor - 6 * 3_600_000, end_ms: anchor + 6 * 3_600_000 }];
+    const load = async (): Promise<CandleRow[]> => {
+      const groups = await Promise.allSettled(
+        plan.map((w) => loadBaseBars(target, activeSymbol, w.start_ms, w.end_ms)),
+      );
+      const byTime = new Map<number, CandleRow>();
+      for (const group of groups) {
+        if (group.status !== "fulfilled") continue;
+        for (const row of group.value) byTime.set(row[0], row);
+      }
+      const base = [...byTime.values()].sort((a, b) => a[0] - b[0]);
+      if (base.length === 0) {
+        const failed = groups.find((g) => g.status === "rejected");
+        if (failed && failed.status === "rejected" && failed.reason instanceof Error) {
+          throw failed.reason;
+        }
+        throw new Error(`нет свечей ${activeSymbol} за этот период`);
+      }
+      return aggregateCandles(base, timeframe);
+    };
+    void load()
+      .then((rows) => {
         if (!alive) return;
-        if (data.error) setCandleError(String(data.error));
-        else setCandles(data.candles ?? []);
+        if (rows.length === 0) setCandleError(`нет свечей ${activeSymbol} за этот период`);
+        else setCandles(rows);
       })
       .catch((e: unknown) => {
         if (alive) setCandleError(e instanceof Error ? e.message : "нет свечей");
@@ -197,7 +229,7 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     return () => {
       alive = false;
     };
-  }, [diary, activeSymbol, range]);
+  }, [diary, activeSymbol, windows]);
 
   if (loading) {
     return (
@@ -364,13 +396,13 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
                 </th>
                 <th
                   className="num"
-                  title="Насколько ход цены был в плюсе, пока сделка была открыта (в R)"
+                  title="Максимальный ход цены в вашу пользу, пока сделка была открыта, в R от вашего риска (без комиссии на выходе)"
                 >
                   Было в +
                 </th>
                 <th
                   className="num"
-                  title="Насколько ход цены был против трейдера до выхода (в R)"
+                  title="Максимальный ход цены против вас до выхода, в R от вашего риска (без комиссии на выходе)"
                 >
                   Было в −
                 </th>
@@ -380,7 +412,7 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
             </thead>
             <tbody>
               {sortedTrades.map((t) => {
-                const ref = `${t.entry_order_id}-${t.exit_order_id}`;
+                const ref = tradeRef(t);
                 const sel = ref === selectedRef;
                 // Only the charted symbol has bars loaded, so other symbols show
                 // "—" rather than a made-up excursion.
@@ -561,7 +593,7 @@ function DiaryChart({
 
     // A clicked row zooms to its own trade.
     const selected = selectedRef
-      ? trades.find((t) => `${t.entry_order_id}-${t.exit_order_id}` === selectedRef)
+      ? trades.find((t) => tradeRef(t) === selectedRef)
       : undefined;
 
     if (times.length > 0) {
@@ -586,7 +618,7 @@ function DiaryChart({
       ? trades.filter(
           (t) =>
             t.symbol === symbol &&
-            `${t.entry_order_id}-${t.exit_order_id}` === selectedRef &&
+            tradeRef(t) === selectedRef &&
             times.length > 0 &&
             t.entry_time_ms <= times[times.length - 1] &&
             t.exit_time_ms >= times[0],

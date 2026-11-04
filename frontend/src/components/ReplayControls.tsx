@@ -23,6 +23,14 @@ export function ReplayControls(): JSX.Element {
     end: toLocalInput(replayWindow.end_ms),
   });
   const [rangeError, setRangeError] = useState("");
+  // What the running replay actually uses: bars sit on fixed boundaries and
+  // history can be short, so the reveal lands on a BAR, not on the typed
+  // minute. Showing the effective value keeps the control honest.
+  const replayNow = useSim((s) => s.replay.now_ms);
+  const replayStep = useSim((s) => s.replay.step_ms) || 0;
+  const effective = replayNow > 0
+    ? " · по факту реплей с " + formatTs(replayNow + replayStep) + " UTC"
+    : "";
   const pct = replay.total > 0 ? Math.round((replay.fed / replay.total) * 100) : 0;
   // A speed the ladder does not list (server default, or an older client) must
   // still be selectable, or the dropdown would render blank and hide what is
@@ -110,6 +118,7 @@ export function ReplayControls(): JSX.Element {
       >
         <form onSubmit={applyWindow}>
           <strong>Даты истории · {timeframe}</strong>
+          {effective && <small className="lbl">сейчас использует{effective}</small>}
           <label>
             Начало видимой истории
             <input

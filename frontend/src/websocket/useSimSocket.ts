@@ -1,15 +1,8 @@
 import { useEffect } from "react";
 import type { ServerMessage } from "../types/protocol";
-import { getConnection, sendServer, sendSim, subscribeSim } from "./connection";
+import { getConnection, sendSim, subscribeSim } from "./connection";
 import { getState, store } from "../state/store";
-import { apiUrl } from "./connection";
-import {
-  initializeLocalEngine,
-  isLocalEngineActive,
-  isLocalEngineInitializing,
-  isLocalSnapshotCurrent,
-  requestLocalSync,
-} from "../replay/localEngine";
+import { isLocalEngineActive, requestLocalSync } from "../replay/localEngine";
 
 export { nextRequestId, sendSim } from "./connection";
 
@@ -26,6 +19,10 @@ function initSession(): void {
     capital_usdt: getState().initialCapitalUsdt,
   });
   subscribeSim(getState().symbol, getState().timeframe, getState().exchange);
+  // A fresh session (first visit, server restart, expired parked session) has
+  // no fills of its own, while this tab's engine still owns the whole history.
+  // Re-mirror it, otherwise the diary of a live trader goes blank mid-session.
+  requestLocalSync(true);
 }
 
 function route(m: ServerMessage): void {
@@ -52,39 +49,50 @@ function route(m: ServerMessage): void {
       );
       if (m.nick) store.applyLogin(m.nick);
       if (m.restored && m.has_series) {
-        // Adopt the running session's window (the snapshot that follows
-        // carries its candles and clock). Keep the local one when the server
-        // has no resolved range yet.
-        if (m.start_ms > 0 && m.reveal_start_ms > 0 && m.end_ms > m.start_ms) {
+        // Reload the series locally: the bars live in this browser (OPFS /
+        // IndexedDB), and the replay runs in this tab's engine.
+        //
+        // The DATE WINDOW is deliberately NOT adopted from the server: it is a
+        // browser preference (`simccxt.replay-window.v1`), and a session parked
+        // before the user picked their dates would otherwise hand back its
+        // default two-month window and move the replay. Only restore it when
+        // nothing is stored locally.
+        const stored = window.localStorage.getItem("simccxt.replay-window.v1");
+        if (!stored && m.start_ms > 0 && m.reveal_start_ms > 0 && m.end_ms > m.start_ms) {
           store.setReplayWindow({
             start_ms: m.start_ms,
             reveal_start_ms: m.reveal_start_ms,
             end_ms: m.end_ms,
           });
         }
+        subscribeSim(m.symbol, m.timeframe, m.exchange);
       } else {
         initSession();
       }
       break;
     case "loading":
-      store.setSeriesLoading(`${m.symbol} ${m.timeframe}: загрузка истории…`);
+      // The old server-side series loader is gone; market data is local now.
       break;
     case "snapshot":
-      store.setSeriesLoading(null);
-      store.applySnapshot(m.symbol, m.exchange, m.timeframe, m.candles, m.account, m.replay, m.oi, m.oi_period, m.fills);
+      // The server no longer serves market data: this tab downloads and
+      // aggregates its own bars (see market/provider.ts). A snapshot here
+      // would only re-introduce server-held coin data, so it is ignored.
       break;
+    case "series_ack":
+      // The server recorded which series this tab is on (for the diary and the
+      // board). No data rides along: the bars are local.
+      break;
+    // Market data and account state belong to this tab's local engine. The
+    // server no longer streams candles, OI, ticks, replay state or order
+    // updates: accepting them would overwrite local bars with whatever the
+    // server happened to have (or nothing at all).
     case "candle":
-      if (!isLocalEngineActive() && m.symbol === getState().symbol && (!m.exchange || m.exchange === getState().exchange)) {
-        store.applyCandle(m.candle);
-      }
-      break;
     case "oi_update":
-      store.applyOi(m.samples);
-      break;
     case "market_update":
-      if (!isLocalEngineActive()) store.applyMarket(m.last);
       break;
     case "account_update":
+      // Account events are accepted only as a fallback when the local engine is
+      // not up yet (first frames after a reconnect).
       if (!isLocalEngineActive()) store.applyAccount(m.account);
       break;
     case "order_update":
@@ -94,14 +102,14 @@ function route(m: ServerMessage): void {
       if (!isLocalEngineActive()) store.applyFill(m.fill);
       break;
     case "replay_state":
-      if (!isLocalEngineActive()) store.applyReplay(m);
+      // The clock is local: never let a server echo move it.
       break;
     case "heartbeat":
       // Liveness only (already timestamped by the connection); nothing to render.
       break;
     case "resync":
-      // We lagged and missed candles: full snapshot again, then deltas resume.
-      subscribeSim(getState().symbol, getState().timeframe, getState().exchange);
+      // Nothing to catch up on over the wire: re-mirror the local account.
+      requestLocalSync(true);
       break;
     case "login_ok":
       store.applyLogin(m.nick);
@@ -126,7 +134,7 @@ function route(m: ServerMessage): void {
       store.finishPreload(m.done, m.total, m.failed);
       break;
     case "market_lookup":
-      store.applyMarketLookup(m.quotes, m.failures);
+      // Quotes come straight from the venue now (connection.lookupMarketsSim).
       break;
     case "error":
       store.setSeriesLoading(null);

@@ -54,8 +54,10 @@ impl Default for Config {
             max_order_size: 1_000_000.0,
             min_order_size: 0.001,
             fee_tiers: FeeTiers {
-                maker: 0.001,
-                taker: 0.0025,
+                // Fee-free simulation: the trader's PnL is exactly the price
+                // move, and risk sizing has no commission term to add.
+                maker: 0.0,
+                taker: 0.0,
                 funding: 0.0001,
             },
             time_config: TimeConfig {
@@ -612,7 +614,9 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.default_seed, 42);
         assert_eq!(c.default_leverage, 1.0);
-        assert!(c.fee_tiers.taker > c.fee_tiers.maker);
+        // The simulator trades without commissions.
+        assert_eq!(c.fee_tiers.maker, 0.0);
+        assert_eq!(c.fee_tiers.taker, 0.0);
     }
 
     #[test]

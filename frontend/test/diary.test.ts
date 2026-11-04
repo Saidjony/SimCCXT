@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   chartRange,
+  chartWindows,
   diaryMarkers,
   diarySymbols,
   fmtChartTime,
@@ -12,6 +13,7 @@ import {
   markersOutsideCandles,
   overallR,
   safeStats,
+  tradeRef,
   traderFromSearch,
 } from "../src/trade/diary.ts";
 import type { CandleRow, DiaryData, DiaryPosition, DiaryTrade } from "../src/types/protocol.ts";
@@ -198,6 +200,57 @@ describe("markersOutsideCandles", () => {
   });
 });
 
+describe("chartWindows", () => {
+  const HOUR = 3_600_000;
+
+  it("returns nothing without trades of that symbol", () => {
+    assert.deepEqual(chartWindows([], [], "BTC/USDT"), []);
+    assert.deepEqual(chartWindows([trade({ symbol: "ETH/USDT" })], [], "BTC/USDT"), []);
+  });
+
+  it("covers each trade with context, not the whole session", () => {
+    const w = chartWindows(
+      [trade({ entry_time_ms: 10 * HOUR, exit_time_ms: 10 * HOUR + 60_000 })],
+      [],
+      "BTC/USDT",
+      HOUR,
+    );
+    assert.equal(w.length, 1);
+    assert.equal(w[0].start_ms, 9 * HOUR);
+    assert.equal(w[0].end_ms, 11 * HOUR + 60_000);
+  });
+
+  it("merges nearby trades and keeps far ones apart", () => {
+    const w = chartWindows(
+      [
+        trade({ entry_time_ms: 10 * HOUR, exit_time_ms: 10 * HOUR + 60_000 }),
+        trade({ entry_time_ms: 12 * HOUR, exit_time_ms: 12 * HOUR + 60_000 }),
+        trade({ entry_time_ms: 100 * HOUR, exit_time_ms: 100 * HOUR + 60_000 }),
+      ],
+      [],
+      "BTC/USDT",
+      HOUR,
+    );
+    assert.equal(w.length, 2, "the two morning trades share one window");
+    assert.equal(w[1].start_ms, 99 * HOUR);
+  });
+
+  it("includes an open position's entry", () => {
+    const w = chartWindows([], [pos({ entry_time_ms: 5 * HOUR })], "BTC/USDT", HOUR);
+    assert.equal(w.length, 1);
+    assert.equal(w[0].start_ms, 4 * HOUR);
+    assert.equal(w[0].end_ms, 6 * HOUR);
+  });
+
+  it("caps the request count by joining the closest windows", () => {
+    const trades = Array.from({ length: 12 }, (_, i) =>
+      trade({ entry_time_ms: i * 100 * HOUR, exit_time_ms: i * 100 * HOUR + 60_000 }),
+    );
+    const w = chartWindows(trades, [], "BTC/USDT", HOUR, 3);
+    assert.equal(w.length, 3, "never more than maxWindows downloads");
+  });
+});
+
 describe("chartRange", () => {
   it("spans entries..exits with at least 1h padding", () => {
     const r = chartRange([trade()], [], "BTC/USDT");
@@ -257,6 +310,18 @@ describe("stats guards", () => {
     assert.equal(overallR(d), 2.5);
     assert.equal(overallR(data({ risk_usdt: 0, stats: { ...safeStats(data()), total_pnl: 25 } })), 0);
   });
+
+  it("overallR sums the trades' own R, so a +6R trade is not diluted", () => {
+    // Planned risk 10 but the fill really risked 6.73: the trade is +6R.
+    const d = data({
+      risk_usdt: 10,
+      trades: [trade({ r: -1 }), trade({ r: 6.16, pnl: 41.45, entry_time_ms: 3000, exit_time_ms: 4000 })],
+      stats: { ...safeStats(data()), total_pnl: 31.45, avg_r: 2.58 },
+    });
+    assert.equal(overallR(d), 5.16);
+    // And the server's own sum wins when it is there.
+    assert.equal(overallR(data({ ...d, stats: { ...d.stats!, total_r: 5.16 } })), 5.16);
+  });
 });
 
 describe("formatters", () => {
@@ -276,5 +341,27 @@ describe("formatters", () => {
     assert.equal(fmtPnl(1234.5), "+1,234.5");
     assert.equal(fmtPnl(-12), "-12");
     assert.equal(fmtPnl(Number.NaN), "—");
+    // A fee-free session passes `-Math.abs(0)`; it must not read "-0".
+    assert.equal(fmtPnl(-Math.abs(0)), "0");
+  });
+
+  it("tradeRef keeps symbols and page loads apart", () => {
+    // Two different trades, same symbol, same order ids (a reloaded tab
+    // replays from the same bar). The engine instance must distinguish them,
+    // otherwise the diary gives both the same review row and one "Итог".
+    const first = { symbol: "BTC/USDT", engine_id: "page-1", entry_order_id: "1", exit_order_id: "2" };
+    const second = { symbol: "BTC/USDT", engine_id: "page-2", entry_order_id: "1", exit_order_id: "2" };
+    assert.notEqual(tradeRef(first), tradeRef(second));
+    // And so must the symbol: the local engine restarts order ids at 1 for
+    // EVERY symbol, so SOL's first trade and XRP's first trade shared a ref and
+    // a click on one zoomed the chart to the other.
+    const btc = { symbol: "BTC/USDT", engine_id: "e1", entry_order_id: "1", exit_order_id: "2" };
+    const eth = { symbol: "ETH/USDT", engine_id: "e1", entry_order_id: "1", exit_order_id: "2" };
+    assert.notEqual(tradeRef(btc), tradeRef(eth));
+    // Legacy payloads without an engine id still get a unique key.
+    assert.equal(
+      tradeRef({ symbol: "BTC/USDT", entry_order_id: "1", exit_order_id: "2" }),
+      "BTC/USDT|1-2",
+    );
   });
 });
