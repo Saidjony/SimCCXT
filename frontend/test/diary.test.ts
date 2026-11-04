@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   chartRange,
+  chartWindows,
   diaryMarkers,
   diarySymbols,
   fmtChartTime,
@@ -199,6 +200,57 @@ describe("markersOutsideCandles", () => {
   });
 });
 
+describe("chartWindows", () => {
+  const HOUR = 3_600_000;
+
+  it("returns nothing without trades of that symbol", () => {
+    assert.deepEqual(chartWindows([], [], "BTC/USDT"), []);
+    assert.deepEqual(chartWindows([trade({ symbol: "ETH/USDT" })], [], "BTC/USDT"), []);
+  });
+
+  it("covers each trade with context, not the whole session", () => {
+    const w = chartWindows(
+      [trade({ entry_time_ms: 10 * HOUR, exit_time_ms: 10 * HOUR + 60_000 })],
+      [],
+      "BTC/USDT",
+      HOUR,
+    );
+    assert.equal(w.length, 1);
+    assert.equal(w[0].start_ms, 9 * HOUR);
+    assert.equal(w[0].end_ms, 11 * HOUR + 60_000);
+  });
+
+  it("merges nearby trades and keeps far ones apart", () => {
+    const w = chartWindows(
+      [
+        trade({ entry_time_ms: 10 * HOUR, exit_time_ms: 10 * HOUR + 60_000 }),
+        trade({ entry_time_ms: 12 * HOUR, exit_time_ms: 12 * HOUR + 60_000 }),
+        trade({ entry_time_ms: 100 * HOUR, exit_time_ms: 100 * HOUR + 60_000 }),
+      ],
+      [],
+      "BTC/USDT",
+      HOUR,
+    );
+    assert.equal(w.length, 2, "the two morning trades share one window");
+    assert.equal(w[1].start_ms, 99 * HOUR);
+  });
+
+  it("includes an open position's entry", () => {
+    const w = chartWindows([], [pos({ entry_time_ms: 5 * HOUR })], "BTC/USDT", HOUR);
+    assert.equal(w.length, 1);
+    assert.equal(w[0].start_ms, 4 * HOUR);
+    assert.equal(w[0].end_ms, 6 * HOUR);
+  });
+
+  it("caps the request count by joining the closest windows", () => {
+    const trades = Array.from({ length: 12 }, (_, i) =>
+      trade({ entry_time_ms: i * 100 * HOUR, exit_time_ms: i * 100 * HOUR + 60_000 }),
+    );
+    const w = chartWindows(trades, [], "BTC/USDT", HOUR, 3);
+    assert.equal(w.length, 3, "never more than maxWindows downloads");
+  });
+});
+
 describe("chartRange", () => {
   it("spans entries..exits with at least 1h padding", () => {
     const r = chartRange([trade()], [], "BTC/USDT");
@@ -257,6 +309,18 @@ describe("stats guards", () => {
     const d = data({ risk_usdt: 10, stats: { ...safeStats(data()), total_pnl: 25 } });
     assert.equal(overallR(d), 2.5);
     assert.equal(overallR(data({ risk_usdt: 0, stats: { ...safeStats(data()), total_pnl: 25 } })), 0);
+  });
+
+  it("overallR sums the trades' own R, so a +6R trade is not diluted", () => {
+    // Planned risk 10 but the fill really risked 6.73: the trade is +6R.
+    const d = data({
+      risk_usdt: 10,
+      trades: [trade({ r: -1 }), trade({ r: 6.16, pnl: 41.45, entry_time_ms: 3000, exit_time_ms: 4000 })],
+      stats: { ...safeStats(data()), total_pnl: 31.45, avg_r: 2.58 },
+    });
+    assert.equal(overallR(d), 5.16);
+    // And the server's own sum wins when it is there.
+    assert.equal(overallR(data({ ...d, stats: { ...d.stats!, total_r: 5.16 } })), 5.16);
   });
 });
 

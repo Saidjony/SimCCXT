@@ -425,8 +425,11 @@ struct Session {
     /// account snapshot for this: a page reload rebuilds the browser engine
     /// with an empty account while the fills (and the diary) survive, so the
     /// challenge lost its PnL and disagreed with the diary. Recomputed only
-    /// when the ledger changes (see `ledger_realized`).
+    /// when the ledger changes (see `ledger_totals`).
     local_realized: f64,
+    /// Sum of the mirrored trades' R (each over the risk it actually ran), so
+    /// the board ranks by the same numbers the diary lists.
+    local_r: f64,
     /// Engine instance that produced the newest fills. Order ids restart at 1
     /// every page load, so trades are reconstructed per engine instance.
     local_engine_id: String,
@@ -613,31 +616,68 @@ fn r_of(pnl: f64, risk: f64) -> Option<f64> {
     }
 }
 
-/// Realized PnL of a mirrored fill ledger: closed round trips, FIFO per engine
-/// instance (order ids restart at 1 on every page load, so groups must not be
-/// paired with each other), fees included — exactly what the diary shows.
-fn ledger_realized(fills: &[Value], risk: f64) -> f64 {
-    let mut groups: Vec<Vec<Value>> = Vec::new();
+/// R of one trade: PnL over the risk it actually ran (qty x |entry - stop|).
+/// A limit entry filled better than planned risks less than the configured
+/// USDT, and the terminal's trade box reports exactly this — the diary and the
+/// challenge board must agree with it. Falls back to the configured risk when
+/// the entry had no stop.
+fn trade_r(pnl: f64, qty: f64, entry: f64, stop: Option<f64>, risk_usdt: f64) -> f64 {
+    if let Some(stop) = stop {
+        let risk = qty * (entry - stop).abs();
+        if risk.is_finite() && risk > 0.0 {
+            return pnl / risk;
+        }
+    }
+    if risk_usdt > 0.0 && risk_usdt.is_finite() {
+        pnl / risk_usdt
+    } else {
+        0.0
+    }
+}
+
+/// Totals of a mirrored fill ledger: `(realized PnL, sum of per-trade R)`.
+/// Closed round trips, FIFO per engine instance (order ids restart at 1 on
+/// every page load, so groups must not be paired with each other), fees
+/// included — exactly what the diary shows.
+fn ledger_totals(
+    fills: &[Value],
+    risk: f64,
+    protections: &HashMap<String, Value>,
+) -> (f64, f64) {
+    let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for fill in fills {
         let engine = fill["engine_id"].as_str().unwrap_or_default();
         let at = match index.get(engine) {
             Some(at) => *at,
             None => {
-                groups.push(Vec::new());
+                groups.push((engine.to_string(), Vec::new()));
                 index.insert(engine.to_string(), groups.len() - 1);
                 groups.len() - 1
             }
         };
-        groups[at].push(fill.clone());
+        groups[at].1.push(fill.clone());
     }
-    groups
-        .into_iter()
-        .map(|group| {
-            let (trades, _) = diary::reconstruct_trades(group, risk, HashMap::new());
-            trades.iter().map(|trade| trade.pnl).sum::<f64>()
-        })
-        .sum()
+    let mut pnl = 0.0;
+    let mut r_sum = 0.0;
+    for (engine, group) in groups {
+        let (trades, _) = diary::reconstruct_trades(group, risk, HashMap::new());
+        for trade in trades {
+            pnl += trade.pnl;
+            let key = local_protection_key(
+                &engine,
+                &trade.symbol,
+                &trade.entry_order_id,
+                trade.entry_time_ms,
+            );
+            let stop = protections
+                .get(&key)
+                .and_then(|p| p.get("stop_price"))
+                .and_then(|v| v.as_f64());
+            r_sum += trade_r(trade.pnl, trade.qty, trade.entry_price, stop, risk);
+        }
+    }
+    (pnl, r_sum)
 }
 
 /// Leaderboard JSON over challenge participants, sorted by R desc.
@@ -673,7 +713,13 @@ fn challenge_board_json(sessions: &HashMap<u64, Session>) -> Value {
         // fills are seen. Re-serializing the whole fill log here was the
         // hottest part of the board push (once per tick per participant).
         let trades = s.seen_orders.len();
-        let r = r_of(pnl, s.risk_usdt).unwrap_or(0.0);
+        // Local sessions rank by the sum of their trades' R, the same numbers
+        // the diary lists; the account engine has no per-trade breakdown.
+        let r = if local {
+            s.local_r
+        } else {
+            r_of(pnl, s.risk_usdt).unwrap_or(0.0)
+        };
         rows.push((
             r,
             json!({
@@ -1052,6 +1098,7 @@ fn new_session(nick: String) -> Session {
         local_account: None,
         local_fills: Vec::new(),
         local_realized: 0.0,
+        local_r: 0.0,
         local_engine_id: String::new(),
         local_entry_protections: HashMap::new(),
         local_exit_reasons: HashMap::new(),
@@ -1256,8 +1303,10 @@ impl Engine {
                 // diary then loses "было в ±R" and calls a take-profit exit
                 // "вручную". Entries are immutable (one per entry order), so a
                 // union is always correct.
+                let protections_before = s.local_entry_protections.len();
                 s.local_entry_protections.extend(entry_protections);
                 s.local_exit_reasons.extend(exit_reasons);
+                let protections_changed = s.local_entry_protections.len() != protections_before;
                 // The board's "Сделки" column counts distinct orders. A
                 // server-side engine feeds it from `fresh_fill_events`, but in
                 // the local-engine mode the fills only arrive here — without
@@ -1274,8 +1323,14 @@ impl Engine {
                 // the browser account is empty after a reload while the fills
                 // are not, and a challenge that forgot its PnL mid-round read
                 // as broken. Recompute only when the ledger actually changed.
-                if ledger_changed {
-                    s.local_realized = ledger_realized(&s.local_fills, s.risk_usdt);
+                if ledger_changed || protections_changed {
+                    let (realized, r_sum) = ledger_totals(
+                        &s.local_fills,
+                        s.risk_usdt,
+                        &s.local_entry_protections,
+                    );
+                    s.local_realized = realized;
+                    s.local_r = r_sum;
                 }
                 s.symbol = symbol;
                 s.timeframe = timeframe;
@@ -1975,63 +2030,67 @@ impl Engine {
                 account_equity
             };
 
+            // Per-trade R is measured against the risk the trade ACTUALLY ran:
+            // qty x |entry - stop|. A limit entry filled better than planned
+            // risks less than the configured USDT, and the terminal's trade box
+            // already reports that R — the diary must not disagree with it.
+            let mut rows: Vec<Value> = Vec::new();
+            let mut trade_rs: Vec<f64> = Vec::new();
+            for (engine, t) in &paired {
+                // The protective levels the trader planned for this entry, so
+                // the review can measure the outcome against the plan. Both
+                // maps are keyed by the fill that opened the trade.
+                let plan_key =
+                    local_protection_key(engine, &t.symbol, &t.entry_order_id, t.entry_time_ms);
+                let plan = if local {
+                    s.local_entry_protections.get(&plan_key)
+                } else {
+                    s.entry_protections.get(&plan_key)
+                };
+                let stop_price = plan.and_then(|p| p.get("stop_price"))
+                .and_then(|v| v.as_f64());
+                // Why it ended: the protective level that fired, if one did.
+                // Keyed by engine + `symbol|orderId|time` because ids restart
+                // at 1 for every symbol and session (a bare or symbol-scoped id
+                // mixed an old trade's level into a new trade and mislabelled
+                // the diary's "Итог" column).
+                let exit_key = exit_reason_key(engine, &t.symbol, &t.exit_order_id, t.exit_time_ms);
+                let reason = if local {
+                    s.local_exit_reasons.get(&exit_key).cloned()
+                } else {
+                    s.exit_reasons.get(&exit_key).map(|kind| kind.to_string())
+                }
+                .map(|kind| json!(kind));
+                let r = trade_r(t.pnl, t.qty, t.entry_price, stop_price, risk);
+                trade_rs.push(r);
+                rows.push(json!({
+                    "symbol": t.symbol,
+                    "side": t.side,
+                    "direction": t.direction,
+                    "qty": t.qty,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "pnl": t.pnl,
+                    "r": r,
+                    "entry_time_ms": t.entry_time_ms,
+                    "exit_time_ms": t.exit_time_ms,
+                    "entry_fee": t.entry_fee,
+                    "exit_fee": t.exit_fee,
+                    "fee": t.fee,
+                    "entry_order_id": t.entry_order_id,
+                    "exit_order_id": t.exit_order_id,
+                    "engine_id": engine,
+                    "stop_price": stop_price.map(|p| json!(p)).unwrap_or(Value::Null),
+                    "take_price": plan
+                        .and_then(|p| p.get("take_price").cloned())
+                        .unwrap_or(Value::Null),
+                    "exit_reason": reason.unwrap_or(Value::Null),
+                }));
+            }
             result = json!({
                 "type": "diary",
                 "nick": nick,
-                "trades": paired.iter().map(|(engine, t)| {
-                    // The protective levels the trader planned for this entry,
-                    // so the review can measure the outcome against the plan.
-                    // Both maps are keyed by the fill that opened the trade.
-                    let plan_key = local_protection_key(
-                        engine,
-                        &t.symbol,
-                        &t.entry_order_id,
-                        t.entry_time_ms,
-                    );
-                    let plan = if local {
-                        s.local_entry_protections.get(&plan_key)
-                    } else {
-                        s.entry_protections.get(&plan_key)
-                    };
-                    // Why it ended: the protective level that fired, if one did.
-                    // Keyed by engine + `symbol|orderId|time` because ids
-                    // restart at 1 for every symbol and session (a bare or
-                    // symbol-scoped id mixed an old trade's level into a new
-                    // trade and mislabelled the diary's "Итог" column).
-                    let exit_key =
-                        exit_reason_key(engine, &t.symbol, &t.exit_order_id, t.exit_time_ms);
-                    let reason = if local {
-                        s.local_exit_reasons.get(&exit_key).cloned()
-                    } else {
-                        s.exit_reasons.get(&exit_key).map(|kind| kind.to_string())
-                    }
-                    .map(|kind| json!(kind));
-                    json!({
-                        "symbol": t.symbol,
-                        "side": t.side,
-                        "direction": t.direction,
-                        "qty": t.qty,
-                        "entry_price": t.entry_price,
-                        "exit_price": t.exit_price,
-                        "pnl": t.pnl,
-                        "r": t.r,
-                        "entry_time_ms": t.entry_time_ms,
-                        "exit_time_ms": t.exit_time_ms,
-                        "entry_fee": t.entry_fee,
-                        "exit_fee": t.exit_fee,
-                        "fee": t.fee,
-                        "entry_order_id": t.entry_order_id,
-                        "exit_order_id": t.exit_order_id,
-                        "engine_id": engine,
-                        "stop_price": plan
-                            .and_then(|p| p.get("stop_price").cloned())
-                            .unwrap_or(Value::Null),
-                        "take_price": plan
-                            .and_then(|p| p.get("take_price").cloned())
-                            .unwrap_or(Value::Null),
-                        "exit_reason": reason.unwrap_or(Value::Null),
-                    })
-                }).collect::<Vec<_>>(),
+                "trades": rows,
                 "positions": positions.iter().map(|p| {
                     json!({
                         "symbol": p.symbol,
@@ -2054,11 +2113,12 @@ impl Engine {
                     "losses": losses.len(),
                     "realized_pnl": realized,
                     "total_pnl": total_pnl,
-                    "avg_r": if paired.is_empty() {
+                    "avg_r": if trade_rs.is_empty() {
                         0.0
                     } else {
-                        paired.iter().map(|(_, t)| t.r).sum::<f64>() / paired.len() as f64
+                        trade_rs.iter().sum::<f64>() / trade_rs.len() as f64
                     },
+                    "total_r": trade_rs.iter().sum::<f64>(),
                     "avg_win": if wins.is_empty() {
                         0.0
                     } else {
@@ -2217,7 +2277,11 @@ impl Engine {
                 };
                 let pnl = realized + unrealized;
                 let trades = s.seen_orders.len();
-                let r = r_of(pnl, s.risk_usdt);
+                let r = if local {
+                    s.local_r
+                } else {
+                    r_of(pnl, s.risk_usdt).unwrap_or(0.0)
+                };
                 let value = json!({
                     "nick": s.nick,
                     "in_challenge": s.in_challenge,
@@ -2232,7 +2296,7 @@ impl Engine {
                     "r": r,
                     "trades": trades,
                 });
-                (r.unwrap_or(f64::NEG_INFINITY), s.nick.clone(), value)
+                (r, s.nick.clone(), value)
             })
             .collect();
         // Deterministic order: most R first, ties broken by nick.
@@ -4511,6 +4575,57 @@ mod tests {
             ),
         );
         assert_eq!(challenge_board_json(&eng.sessions)["board"][0]["trades"], 2);
+    }
+
+    #[test]
+    fn trade_r_uses_the_risk_the_fill_really_ran() {
+        // The XRP short from the report: planned at 1.523 with the stop at
+        // 1.534 (909 XRP = 10 USDT of risk), filled at 1.5266. The fill really
+        // risked 6.73, so +41.45 is +6.16R — not +4.15R.
+        let r = trade_r(41.4545, 909.0909, 1.5266, Some(1.534), 10.0);
+        assert!((r - 6.1616).abs() < 0.01, "got {r}");
+        // No stop on the record: the configured risk is the only denominator.
+        let fallback = trade_r(41.4545, 909.0909, 1.5266, None, 10.0);
+        assert!((fallback - 4.1455).abs() < 0.01, "got {fallback}");
+    }
+
+    #[test]
+    fn board_r_sums_the_trades_own_risk() {
+        let (tx, _rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        eng.handle_command(1, login_cmd("A"));
+        eng.handle_command(1, challenge_cmd(true, Some(10.0)));
+        let key = local_protection_key("e1", "XRP/USDT", "1", 1000);
+        let mut prot = serde_json::Map::new();
+        prot.insert(
+            key,
+            json!({"stop_price": 1.534, "take_price": 1.481}),
+        );
+        let cmd: ClientCmd = serde_json::from_value(json!({
+            "type": "local_sync",
+            "account": {"equity": 1031.45, "pnl": {"realized": 31.45, "unrealized": 0}},
+            "fills": [
+                {"id": "1_0", "orderId": "1", "timestamp": 1000, "symbol": "XRP/USDT",
+                 "side": "sell", "amount": 909.0909090908992, "price": 1.5266},
+                {"id": "2_0", "orderId": "2", "timestamp": 2000, "symbol": "XRP/USDT",
+                 "side": "buy", "amount": 909.0909090908992, "price": 1.481}
+            ],
+            "replace_fills": true,
+            "engine_id": "e1",
+            "entry_protections": prot,
+            "exit_reasons": {},
+            "symbol": "XRP/USDT",
+            "timeframe": "1h",
+            "exchange": "binance",
+            "range": {"start_ms": 0, "reveal_start_ms": 1000, "end_ms": 2000}
+        }))
+        .expect("local sync with a plan");
+        eng.handle_command(1, cmd);
+        let row = &challenge_board_json(&eng.sessions)["board"][0];
+        let r = row["r"].as_f64().expect("r");
+        assert!((r - 6.16).abs() < 0.02, "board R over the actual risk, got {r}");
+        let pnl = row["pnl"].as_f64().expect("pnl");
+        assert!((pnl - 41.45).abs() < 0.02, "PnL unchanged, got {pnl}");
     }
 
     /// A page reload rebuilds the browser engine: the account is pristine while

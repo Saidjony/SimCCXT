@@ -20,7 +20,7 @@ import { formatTs } from "../types/protocol";
 import type { ExchangeId } from "../types/protocol";
 import { apiUrl } from "../websocket/connection";
 import {
-  chartRange,
+  chartWindows,
   diaryMarkers,
   diarySymbols,
   fmtChartTime,
@@ -36,7 +36,7 @@ import { priceAxisFormat } from "../chart/overlays";
 import { buildReview } from "../trade/review";
 import { aggregateCandles } from "../market/aggregate";
 import { loadBaseBars } from "../market/provider";
-import { timeframeOr } from "../market/timeframes";
+import { TIMEFRAME_MS, timeframeOr } from "../market/timeframes";
 import type { ExitKind, ReviewRow } from "../trade/review";
 
 /** How a trade ended, in the trader's terms. */
@@ -156,11 +156,16 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     };
   }, [nick]);
 
-  // Candles for the chart window of the active symbol.
-  const range = useMemo(
-    () => (diary ? chartRange(trades, positions, activeSymbol, diary.range) : null),
-    [diary, trades, positions, activeSymbol],
-  );
+  // Candles around the trades of the active symbol — not the whole replay
+  // window. The chart only has to explain what the trader did.
+  const windows = useMemo(() => {
+    if (!diary) return [];
+    const timeframe = timeframeOr(diary.timeframe, "5m");
+    const tfMs = TIMEFRAME_MS[timeframe] ?? 300_000;
+    // ~12 bars of context on each side, at least an hour, at most a week.
+    const pad = Math.min(Math.max(3_600_000, tfMs * 12), 7 * 86_400_000);
+    return chartWindows(trades, positions, activeSymbol, pad);
+  }, [diary, trades, positions, activeSymbol]);
 
   // The server may serve a window shorter than asked (its cache holds a recent
   // tail). Markers outside it cannot be drawn — say which ones, rather than
@@ -182,15 +187,39 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     // 5m from the venue, aggregated locally to the diary's timeframe. The
     // server only told us which symbol/timeframe/range the trader replayed.
     const timeframe = timeframeOr(diary.timeframe, "5m");
-    const from = range?.start_ms ?? diary.range?.start_ms ?? 0;
-    const to = range?.end_ms ?? diary.range?.end_ms ?? Date.now();
     const venue = (diary.exchange ?? "binance") as ExchangeId;
     const known: ExchangeId[] = ["binance", "bybit", "okx"];
     const target = known.includes(venue) ? venue : "binance";
-    void loadBaseBars(target, activeSymbol, from, to)
-      .then((base) => {
+    // No trades on this symbol: one small window at the reveal point instead
+    // of the session's whole history.
+    const anchor =
+      diary.range?.reveal_start_ms ?? diary.range?.start_ms ?? Date.now();
+    const plan =
+      windows.length > 0
+        ? windows
+        : [{ start_ms: anchor - 6 * 3_600_000, end_ms: anchor + 6 * 3_600_000 }];
+    const load = async (): Promise<CandleRow[]> => {
+      const groups = await Promise.allSettled(
+        plan.map((w) => loadBaseBars(target, activeSymbol, w.start_ms, w.end_ms)),
+      );
+      const byTime = new Map<number, CandleRow>();
+      for (const group of groups) {
+        if (group.status !== "fulfilled") continue;
+        for (const row of group.value) byTime.set(row[0], row);
+      }
+      const base = [...byTime.values()].sort((a, b) => a[0] - b[0]);
+      if (base.length === 0) {
+        const failed = groups.find((g) => g.status === "rejected");
+        if (failed && failed.status === "rejected" && failed.reason instanceof Error) {
+          throw failed.reason;
+        }
+        throw new Error(`нет свечей ${activeSymbol} за этот период`);
+      }
+      return aggregateCandles(base, timeframe);
+    };
+    void load()
+      .then((rows) => {
         if (!alive) return;
-        const rows = aggregateCandles(base, timeframe);
         if (rows.length === 0) setCandleError(`нет свечей ${activeSymbol} за этот период`);
         else setCandles(rows);
       })
@@ -200,7 +229,7 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     return () => {
       alive = false;
     };
-  }, [diary, activeSymbol, range]);
+  }, [diary, activeSymbol, windows]);
 
   if (loading) {
     return (

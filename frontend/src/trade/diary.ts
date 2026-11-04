@@ -200,8 +200,71 @@ export function chartRange(
   return { start_ms: lo - pad, end_ms: hi + pad };
 }
 
-/** Stats with safe defaults so the page never divides by zero or NaNs. */
-export function safeStats(diary: DiaryData): DiaryStats {
+/** One contiguous download window for the diary chart. */
+export interface ChartWindow {
+  start_ms: number;
+  end_ms: number;
+}
+
+/**
+ * Candle windows the diary chart actually needs: one around every trade of
+ * `symbol` (plus `padMs` of context), never the whole replay range. A diary
+ * with two trades costs two small kline requests instead of the session's full
+ * history — the difference between a fast page and 18 paginated downloads.
+ *
+ * Nearby trades are merged (a gap smaller than `padMs` would draw an empty
+ * stretch anyway) and the list is capped at `maxWindows`, joining the closest
+ * pairs first, so a busy trader cannot turn the page into a request storm.
+ */
+export function chartWindows(
+  trades: DiaryTrade[],
+  positions: DiaryPosition[],
+  symbol: string,
+  padMs = 3_600_000,
+  maxWindows = 8,
+): ChartWindow[] {
+  const spans: ChartWindow[] = [];
+  const add = (lo: number, hi: number): void => {
+    if (!Number.isFinite(lo) || !Number.isFinite(hi)) return;
+    if (lo <= 0 || hi < lo) return;
+    spans.push({ start_ms: lo - padMs, end_ms: hi + padMs });
+  };
+  for (const t of trades) {
+    if (t.symbol !== symbol) continue;
+    add(Math.min(t.entry_time_ms, t.exit_time_ms), Math.max(t.entry_time_ms, t.exit_time_ms));
+  }
+  for (const p of positions) {
+    if (p.symbol !== symbol) continue;
+    add(p.entry_time_ms, p.entry_time_ms);
+  }
+  if (spans.length === 0) return [];
+  spans.sort((a, b) => a.start_ms - b.start_ms);
+  const merged: ChartWindow[] = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && span.start_ms <= last.end_ms + padMs) {
+      last.end_ms = Math.max(last.end_ms, span.end_ms);
+    } else {
+      merged.push({ ...span });
+    }
+  }
+  while (merged.length > Math.max(1, maxWindows)) {
+    let at = 1;
+    let gap = Infinity;
+    for (let i = 1; i < merged.length; i += 1) {
+      const g = merged[i].start_ms - merged[i - 1].end_ms;
+      if (g < gap) {
+        gap = g;
+        at = i;
+      }
+    }
+    merged[at - 1].end_ms = Math.max(merged[at - 1].end_ms, merged[at].end_ms);
+    merged.splice(at, 1);
+  }
+  return merged;
+}
+
+/** Stats with safe defaults so the page never divides by zero or NaNs. */export function safeStats(diary: DiaryData): DiaryStats {
   return (
     diary.stats ?? {
       total_trades: 0,
@@ -222,6 +285,15 @@ export function safeStats(diary: DiaryData): DiaryStats {
 
 /** Overall R of the diary: total PnL over the fixed risk (0 if risk unknown). */
 export function overallR(diary: DiaryData): number {
+  // The server sums each trade's R, measured against the risk that trade
+  // actually ran (qty x |entry - stop|). A +6R trade must not be diluted into
+  // +4R by a planned-vs-filled entry difference.
+  const settled = diary.stats?.total_r;
+  if (typeof settled === "number" && Number.isFinite(settled)) return settled;
+  const trades = diary.trades ?? [];
+  if (trades.length > 0) {
+    return trades.reduce((sum, t) => sum + (Number.isFinite(t.r) ? t.r : 0), 0);
+  }
   const risk = diary.risk_usdt ?? 0;
   const pnl = safeStats(diary).total_pnl;
   if (!(risk > 0)) return 0;

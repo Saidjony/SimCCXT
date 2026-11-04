@@ -152,6 +152,8 @@ export interface DiaryStats {
   losses: number;
   realized_pnl: number;
   total_pnl: number;
+  /** Sum of the trades' R (each over the risk it actually ran). */
+  total_r?: number;
   avg_r: number;
   avg_win: number;
   avg_loss: number;
