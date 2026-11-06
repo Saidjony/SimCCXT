@@ -1,7 +1,7 @@
 //! Market data models for simccxt.
 //!
 //! This module provides the mutable market state that the simulator owns:
-//! order books, tickers, funding rates, open interest, and candle series.
+//! order books, tickers, funding rates, and candle series.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -251,24 +251,6 @@ impl FundingRate {
     }
 }
 
-/// Open interest for a derivatives contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenInterest {
-    /// Symbol
-    pub symbol: Symbol,
-    /// Open interest in base asset
-    pub open_interest: f64,
-    /// Timestamp
-    pub timestamp: DateTime<Utc>,
-}
-
-impl OpenInterest {
-    /// Create an open interest record.
-    pub fn new(symbol: Symbol, open_interest: f64, timestamp: DateTime<Utc>) -> Self {
-        Self { symbol, open_interest, timestamp }
-    }
-}
-
 /// A chronological series of OHLCV candles.
 #[derive(Debug, Clone, Default)]
 pub struct CandleSeries {
@@ -416,12 +398,6 @@ mod tests {
         let f = FundingRate::new(btc(), 0.0001, ts(), 8 * 60 * 60 * 1000);
         assert_eq!(f.funding_rate, 0.0001);
         assert_eq!(f.interval_ms, 28_800_000);
-    }
-
-    #[test]
-    fn test_open_interest() {
-        let oi = OpenInterest::new(btc(), 1234.5, ts());
-        assert_eq!(oi.open_interest, 1234.5);
     }
 
     #[test]

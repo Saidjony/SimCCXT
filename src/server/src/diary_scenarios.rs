@@ -608,7 +608,7 @@ fn diary_carries_the_context_the_chart_needs() {
         json!({
             "type": "diary_meta",
             "drawings": [{"kind": "hline", "price": 81234.5}],
-            "criteria": {"trend": ["ma200", "ema50"], "oi": []}
+            "criteria": {"trend": ["ma200", "ema50"], "hvol": []}
         }),
     );
 
@@ -627,7 +627,7 @@ fn diary_carries_the_context_the_chart_needs() {
     assert_eq!(d["drawings"][0]["kind"], "hline");
     assert_eq!(d["drawings"][0]["price"], json!(81234.5));
     assert_eq!(d["criteria"]["trend"], json!(["ma200", "ema50"]));
-    assert_eq!(d["criteria"]["oi"], json!([]));
+    assert_eq!(d["criteria"]["hvol"], json!([]));
 }
 
 // ---------------------------------------------------------------------------

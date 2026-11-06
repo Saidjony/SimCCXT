@@ -9,7 +9,6 @@ import {
   priceAxisFormat,
   priceTick,
   countBars,
-  cumulativeDelta,
   formatCompactUsdt,
   formatPriceValue,
   formatRuler,
@@ -464,22 +463,6 @@ describe("formatCompactUsdt", () => {
     assert.equal(formatCompactUsdt(12500), "12.5K");
     assert.equal(formatCompactUsdt(999), "999");
     assert.equal(formatCompactUsdt(Number.NaN), "—");
-  });
-});
-
-describe("cumulativeDelta", () => {
-  it("adds volume on up bars, subtracts on down bars", () => {
-    // [ts, o, h, l, c, v]
-    const rows = [
-      [1, 10, 11, 9, 11, 5],
-      [2, 11, 12, 10, 10, 3],
-      [3, 10, 10, 10, 10, 7],
-    ] as Array<[number, number, number, number, number, number]>;
-    assert.deepEqual(cumulativeDelta(rows), [5, 2, 9]);
-  });
-
-  it("is empty without bars", () => {
-    assert.deepEqual(cumulativeDelta([]), []);
   });
 });
 

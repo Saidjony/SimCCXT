@@ -417,9 +417,7 @@ export function invertTime(
 
 /**
  * Compact money for axis labels: 8813493358.81 -> "8.81B".
- * Keeps the OI price axis narrow (shorter than price labels) so the
- * width-equalizing sync always converges on the main chart's stable width
- * instead of chasing the OI axis as data arrives.
+ * Short labels keep the price axis narrow and stable as data arrives.
  */
 export function formatCompactUsdt(v: number): string {
   if (!Number.isFinite(v)) return "—";
@@ -527,22 +525,6 @@ export function profileBarLayout(
     const bottom = Math.min(maxY, y + height / 2);
     return bottom > top ? { top, height: bottom - top } : null;
   });
-}
-
-/**
- * Cumulative volume delta over the whole series: +volume on up bars
- * (close >= open), -volume on down bars. Used when a chart loads or resets;
- * live updates adjust only the final cumulative point.
- */
-export function cumulativeDelta(rows: OhlcRow[]): number[] {
-  const out: number[] = new Array(rows.length);
-  let acc = 0;
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    acc += r[4] >= r[1] ? r[5] : -r[5];
-    out[i] = acc;
-  }
-  return out;
 }
 
 export interface ProfileRow {

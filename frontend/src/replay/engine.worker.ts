@@ -11,8 +11,6 @@ interface InitMessage {
   speed: number;
   reveal_reset_ms: number;
   range_end_ms: number;
-  oi: Array<[number, number]>;
-  oi_period: string;
 }
 
 type EngineCommand =
@@ -33,8 +31,6 @@ type EngineCommand =
       engine_id: string;
       reveal_reset_ms: number;
       range_end_ms: number;
-      oi: Array<[number, number]>;
-      oi_period: string;
       preserve_clock: boolean;
       candles: number[][];
     }

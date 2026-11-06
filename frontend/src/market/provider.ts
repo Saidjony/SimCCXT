@@ -24,8 +24,7 @@ import {
   readCachedBars,
   writeCachedBars,
 } from "./cache.ts";
-import { downloadBars, downloadOi } from "./exchanges.ts";
-import type { OiSeries } from "./exchanges.ts";
+import { downloadBars } from "./exchanges.ts";
 import { BASE_TIMEFRAME } from "./timeframes.ts";
 
 /** Bars kept per series in memory (a 2-year 5m window is ~210k). */
@@ -420,16 +419,6 @@ export function peekBaseBars(
 /** Whether this series is already fully available without a download. */
 export function hasSeriesInMemory(exchange: ExchangeId, symbol: string): boolean {
   return memory.has(keyOf(exchange, symbol));
-}
-
-/** Open interest for the chart's timeframe (empty when the venue has none). */
-export async function loadOi(
-  exchange: ExchangeId,
-  symbol: string,
-  timeframe: "5m" | "1h" | "1d",
-  signal?: AbortSignal,
-): Promise<OiSeries> {
-  return downloadOi(exchange, symbol, timeframe, signal);
 }
 
 /**

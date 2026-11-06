@@ -26,8 +26,6 @@ ticket with a mandatory stop, a shared challenge board and a post-trade diary.
 - **Chart workspace** — main chart + two independent charts (5m/1h/1d by
   default), draggable split, per-chart timeframe, expand to full screen.
   Lightweight Charts primitives only: no HTML/SVG overlay.
-- **OI and CVD** as native sub-panes of the main chart (one clock, one
-  crosshair, one zoom), revealed with the replay clock.
 - **Volume profile** over the visible range, 64 levels, POC marked.
 - **Drawings** — ray, replay barrier, zone, long/short position, ruler.
 - **Replay** — `Space` play/pause, `→` one bar, `Home` reset, speed hotkeys;
@@ -123,7 +121,7 @@ and `VITE_WS_URL` / `VITE_API_URL` override them.
 ```
 src/core            Symbol, Order, Trade, Position, Balance, ...
 src/clock           controlled time (step/run/seek/pause/reset)
-src/market          order book, ticker, funding, open interest, candles
+src/market          order book, ticker, funding, candles
 src/storage         in-memory / CSV storage
 src/event-bus       synchronous pub/sub (deterministic)
 src/exchange        CCXT facade (fetch_*, create_order, cancel_order)
@@ -158,7 +156,7 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
 
 - `fetch_ohlcv`, `fetch_ticker`, `fetch_order_book`, `fetch_trades`
 - `fetch_balance`, `fetch_positions`, `fetch_open_orders`
-- `fetch_funding_rate`, `fetch_open_interest`
+- `fetch_funding_rate`
 - `create_order` — market, limit, stop, stop-limit, take-profit,
   take-profit-limit, trailing-stop, post-only, IOC, FOK, reduce-only
 - `cancel_order`
@@ -182,8 +180,6 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   window is never fetched twice; a stale window fetches only trailing bars.
 - The watchlist is warmed in the background one coin at a time to respect the
   venue's per-IP rate limit.
-- Open interest is context only, requested on the chart's grid where the venue
-  exposes it.
 - **Fallback when the venue is unreachable.** Some networks (region/IP blocks,
   corporate proxies, CORS) cannot reach `api.binance.com` from the browser.
   The direct request is always tried first; only if it fails, the page asks its

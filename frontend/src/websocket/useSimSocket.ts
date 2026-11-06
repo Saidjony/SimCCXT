@@ -83,11 +83,10 @@ function route(m: ServerMessage): void {
       // board). No data rides along: the bars are local.
       break;
     // Market data and account state belong to this tab's local engine. The
-    // server no longer streams candles, OI, ticks, replay state or order
+    // server no longer streams candles, ticks, replay state or order
     // updates: accepting them would overwrite local bars with whatever the
     // server happened to have (or nothing at all).
     case "candle":
-    case "oi_update":
     case "market_update":
       break;
     case "account_update":

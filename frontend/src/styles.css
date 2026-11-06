@@ -369,8 +369,8 @@ td, th { padding: 3px 4px; }
 .card-head.collapsible { cursor: pointer; user-select: none; }
 .card-head.collapsible:hover h4 { color: var(--text); }
 .chev { color: var(--accent); font-size: 12px; margin-right: 2px; }
-/* The chart owns its own panes (price / OI / CVD) inside one canvas stack —
-   separators, legends and resizing all come from lightweight-charts itself. */
+/* The chart owns its canvas stack — separators, legends and resizing all come
+   from lightweight-charts itself. */
 .chartwrap { display: flex; flex-direction: column; }
 .chart { flex: 1 1 auto; min-height: 0; height: auto; }
 .chart-workspace {

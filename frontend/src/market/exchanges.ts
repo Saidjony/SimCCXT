@@ -1,9 +1,9 @@
 // Direct exchange REST access from the browser.
 //
-// The terminal downloads its own market data: no candle or open-interest
-// request ever leaves the user's browser for our server, and our server keeps
-// no coin data at all. All three venues send permissive CORS headers on these
-// public endpoints (Binance `Access-Control-Allow-Origin: *`, Bybit and OKX echo
+// The terminal downloads its own market data: no candle request ever leaves
+// the user's browser for our server, and our server keeps no coin data at
+// all. All three venues send permissive CORS headers on these public
+// endpoints (Binance `Access-Control-Allow-Origin: *`, Bybit and OKX echo
 // the request Origin), so a plain `fetch` is enough — no proxy, no CORS
 // workaround, no keys.
 //
@@ -16,8 +16,8 @@ import { apiUrl } from "../websocket/origins.ts";
 /** Most rows one venue returns per request. */
 export const MAX_BARS_PER_REQUEST = 1000;
 /** Weight budget: Binance allows 6000/min per IP and a kline page costs 2
- *  (limit ≤ 1000). Staying under a third of it leaves room for the OI pane and
- *  for a few tabs sharing one NAT address. */
+ *  (limit ≤ 1000). Staying under a third of it leaves room for a few tabs
+ *  sharing one NAT address. */
 const REQUEST_BUDGET_PER_MINUTE = 2000;
 
 export interface SeriesRequest {
@@ -305,79 +305,4 @@ export async function downloadTicker(exchange: ExchangeId, symbol: string): Prom
   }
   const data = (body as { data?: Array<{ last?: unknown }> }).data;
   return number(data?.[0]?.last);
-}
-
-// ---------------------------------------------------------------------------
-// Open interest
-// ---------------------------------------------------------------------------
-
-export interface OiSeries {
-  samples: Array<[number, number]>;
-  /** Grid the venue served ("5m", "15m", "1h", ...), for the pane legend. */
-  period: string;
-}
-
-/** OI only exists on derivative books; these URLs are the swap endpoints. */
-export function oiUrl(exchange: ExchangeId, symbol: string, period: string, limit: number): string {
-  const { pair } = venueSymbol(symbol);
-  switch (exchange) {
-    case "binance":
-      return `https://fapi.binance.com/futures/data/openInterestHist?symbol=${pair}&period=${period}&limit=${limit}`;
-    case "bybit":
-      return `https://api.bybit.com/v5/market/open-interest?category=linear&symbol=${pair}`
-        + `&intervalTime=${period}&limit=${Math.min(limit, 200)}`;
-    case "okx":
-      return `https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume`
-        + `?ccy=${venueSymbol(symbol).base}&period=${period === "1d" ? "1D" : period}`;
-  }
-}
-
-/**
- * Download open-interest history on the grid that matches `timeframe`.
- *
- * A venue that does not expose OI for the symbol yields an empty series (the
- * pane then says "no OI data"); it is never invented.
- */
-export async function downloadOi(
-  exchange: ExchangeId,
-  symbol: string,
-  period: "5m" | "1h" | "1d",
-  signal?: AbortSignal,
-): Promise<OiSeries> {
-  const limit = period === "5m" ? 500 : 100;
-  try {
-    const body = await fetchJson(oiUrl(exchange, symbol, period, limit), signal);
-    return { samples: parseOi(exchange, body), period };
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") throw error;
-    return { samples: [], period };
-  }
-}
-
-function parseOi(exchange: ExchangeId, body: unknown): Array<[number, number]> {
-  const samples: Array<[number, number]> = [];
-  const push = (ts: unknown, value: unknown): void => {
-    const time = number(ts);
-    const interest = number(value);
-    if (time !== null && interest !== null && interest >= 0) samples.push([time, interest]);
-  };
-  if (exchange === "binance") {
-    for (const entry of Array.isArray(body) ? body : []) {
-      const line = entry as { timestamp?: unknown; sumOpenInterestValue?: unknown; sumOpenInterest?: unknown };
-      push(line.timestamp, line.sumOpenInterestValue ?? line.sumOpenInterest);
-    }
-  } else if (exchange === "bybit") {
-    const list = (body as { result?: { list?: unknown } }).result?.list;
-    for (const entry of Array.isArray(list) ? list : []) {
-      const line = entry as { timestamp?: unknown; openInterest?: unknown };
-      push(line.timestamp, line.openInterest);
-    }
-  } else {
-    const data = (body as { data?: unknown }).data;
-    for (const entry of Array.isArray(data) ? data : []) {
-      if (!Array.isArray(entry)) continue;
-      push(entry[0], entry[2]); // [ts, oi, oiValue, volume]
-    }
-  }
-  return samples.sort((a, b) => a[0] - b[0]);
 }

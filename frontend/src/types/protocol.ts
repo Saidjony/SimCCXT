@@ -375,13 +375,10 @@ export type ServerMessage =
       candles: CandleRow[];
       account: AccountSnapshot;
       replay: ReplayState;
-      oi: Array<[number, number]>;
-      oi_period: string;
       fills?: FillLine[];
       request_id?: string;
     }
   | { type: "candle"; to?: number; symbol: string; timeframe: string; exchange?: ExchangeId; candle: CandleRow; is_new: boolean }
-  | { type: "oi_update"; to?: number; samples: Array<[number, number]> }
   | { type: "market_update"; to?: number; symbol: string; last: number; timestamp: number }
   | { type: "account_update"; to?: number; account: AccountSnapshot }
   | { type: "order_update"; to?: number; order: OrderLine; request_id?: string }
@@ -436,7 +433,6 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "series_ack":
     case "snapshot":
     case "candle":
-    case "oi_update":
     case "market_update":
     case "account_update":
     case "order_update":

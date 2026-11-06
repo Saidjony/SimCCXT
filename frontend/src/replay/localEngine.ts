@@ -9,7 +9,7 @@ import type {
 import { getState, store } from "../state/store";
 import type { ClientMessage } from "../types/protocol";
 import { aggregateCandles } from "../market/aggregate";
-import { peekBaseBars, loadBaseBars, loadOi } from "../market/provider";
+import { peekBaseBars, loadBaseBars } from "../market/provider";
 import {
   BASE_TIMEFRAME,
   TIMEFRAME_MS,
@@ -28,8 +28,6 @@ interface LocalSnapshot {
   account: AccountSnapshot;
   replay: ReplayState;
   fills: FillLine[];
-  oi?: Array<[number, number]> | null;
-  oi_period?: string;
   range: { reveal_reset_ms: number; end_ms: number };
   entry_protections?: Record<string, Record<string, unknown>>;
   exit_reasons?: Record<string, string>;
@@ -223,8 +221,6 @@ function applyLocalSnapshot(snapshot: LocalSnapshot): void {
       aggregateCandles(base, timeframe).slice(0, snapshot.replay.fed),
       account,
       snapshot.replay,
-      snapshot.oi ?? [],
-      snapshot.oi_period ?? "",
       snapshot.fills,
     );
   } else {
@@ -460,8 +456,6 @@ export async function initializeLocalEngine(
     loadedRows.set(key, { base });
     store.setSeriesLoading(null);
     store.finishPreload(1, 1, 0);
-    const oi = await loadOiForSymbol(exchange, symbol, timeframe);
-    if (requestGeneration !== generation) return;
     const stepMs = TIMEFRAME_MS[timeframe];
     if (preserveEngine) {
       const previousRange = previous.slice(3);
@@ -488,8 +482,6 @@ export async function initializeLocalEngine(
           engine_id: engineId,
           reveal_reset_ms: revealResetMs,
           range_end_ms: range.end_ms,
-          oi: oi.samples,
-          oi_period: oi.period,
           preserve_clock: preserveClock,
           candles: rows,
         },
@@ -507,8 +499,6 @@ export async function initializeLocalEngine(
         engine_id: engineId,
         reveal_reset_ms: revealResetMs,
         range_end_ms: state.replayWindow.end_ms,
-        oi: oi.samples,
-        oi_period: oi.period,
         candles: rows,
       });
     }
@@ -524,20 +514,6 @@ export async function initializeLocalEngine(
     }
     store.setSeriesLoading(null);
     store.setError(`Не удалось загрузить данные с биржи: ${String(error)}`);
-  }
-}
-
-/** OI on the grid matching the chart's timeframe (empty if the venue has none). */
-async function loadOiForSymbol(
-  exchange: ExchangeId,
-  symbol: string,
-  timeframe: Timeframe,
-): Promise<{ samples: Array<[number, number]>; period: string }> {
-  try {
-    return await loadOi(exchange, symbol, timeframe);
-  } catch {
-    // OI is chart context only: a venue without it must never block replay.
-    return { samples: [], period: "" };
   }
 }
 

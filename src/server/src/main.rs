@@ -76,7 +76,7 @@ mod diary_scenarios;
 //   {"type":"welcome","client_id":7}
 //   {"type":"snapshot","to":7,"symbol":..,"timeframe":..,"exchange":"binance",
 //    "candles":[[ts,o,h,l,c,v]..],
-//    "account":{..},"replay":{..},"oi":[[ts_ms,usdt]..],"oi_period":"5m"}
+//    "account":{..},"replay":{..}}
 //   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
 //   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
 //   {"type":"market_update","to":7,"symbol":..,"last":..,"timestamp":..}
@@ -100,7 +100,7 @@ mod diary_scenarios;
 // PRELOAD (background market data): the watchlist x all timeframes is warmed
 // on a separate thread, so switching a coin/timeframe never waits for a
 // download. Each symbol is resolved across supported venues first; candles
-// and OI are cached against the venue where that symbol is available. It never
+// are cached against the venue where that symbol is available. It never
 // touches a session, its series, its clock or its account, and sends no candles.
 // MARKET_LOOKUP returns current prices and venue labels for the watchlist.
 //
@@ -412,9 +412,6 @@ struct Session {
     exit_reasons: HashMap<String, &'static str>,
     active_protections: Vec<(String, String, String)>,
     diary_meta: serde_json::Value, // client-pushed drawings/criteria to show in the diary
-    oi: Vec<(i64, f64)>,           // open-interest history (ts_ms, USDT value), context only
-    oi_period: String,             // OI grid actually loaded ("5m", "" when none)
-    oi_fed: usize,
     range_start_ms: i64,
     reveal_start_ms: i64,
     range_end_ms: i64,
@@ -798,7 +795,6 @@ fn rewind_to_reveal(s: &mut Session) {
     if let Some(ts) = DateTime::from_timestamp_millis(ts_ms) {
         s.ex.reset(ts);
     }
-    s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ts_ms);
     s.fed = 0;
 }
 
@@ -811,7 +807,6 @@ fn ack_replay(s: &Session, request_id: Option<String>) -> Value {
 fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
     // Only bars <= now: the chart reveals one new bar per tick instead of
     // the whole future at once. Later steps arrive as `candle` deltas.
-    // OI rides along whole (static context, never replayed): [[ts_ms, usdt]].
     let mut rows = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe);
     if rows.len() > SNAPSHOT_CAP {
         rows = rows[rows.len() - SNAPSHOT_CAP..].to_vec();
@@ -824,8 +819,6 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "candles": rows,
         "account": s.ex.account_snapshot(),
         "replay": replay_json(s),
-        "oi": s.oi.clone(),
-        "oi_period": s.oi_period,
         "fills": s.ex.fetch_fills_last(500),
         "request_id": request_id,
     })
@@ -1023,14 +1016,6 @@ fn delta_events(s: &mut Session, force: bool) -> Vec<Value> {
         }));
     }
     s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
-    let oi_end = s.oi.partition_point(|(ts, _)| *ts <= s.ex.now_ms());
-    if oi_end > s.oi_fed {
-        ev.push(json!({
-            "type": "oi_update",
-            "samples": s.oi[s.oi_fed..oi_end],
-        }));
-        s.oi_fed = oi_end;
-    }
     let last = s.ex.live_last(&s.symbol, &s.timeframe)
         .map(|row| row[4])
         .unwrap_or(0.0);
@@ -1089,9 +1074,6 @@ fn new_session(nick: String) -> Session {
         exit_reasons: HashMap::new(),
         active_protections: Vec::new(),
         diary_meta: json!({"drawings": [], "criteria": {}}),
-        oi: Vec::new(),
-        oi_period: String::new(),
-        oi_fed: 0,
         range_start_ms: 0,
         reveal_start_ms: 0,
         range_end_ms: 0,
@@ -1229,7 +1211,6 @@ impl Engine {
         s.range_end_ms = end_ms;
         s.step_ms = step;
         s.fed = 0;
-        s.oi_fed = 0;
         s.fills_seen = s.ex.fills_len();
         s.last_step = std::time::Instant::now();
     }
@@ -1871,7 +1852,6 @@ impl Engine {
                                 Some(ms) => {
                                     if let Some(ts) = DateTime::from_timestamp_millis(ms) {
                                         s.ex.reset(ts);
-                                        s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ms);
                                     }
                                 }
                                 None => rewind_to_reveal(s),
@@ -3800,8 +3780,8 @@ mod tests {
     fn server_holds_no_coin_data() {
         // The server is no longer a market-data provider: a subscribe records
         // the selection and acknowledges it, and the session starts with no
-        // candles, no open interest and no OI grid. The browser downloads 5m
-        // bars from the venue and aggregates 1h/1d itself.
+        // candles. The browser downloads 5m bars from the venue and aggregates
+        // 1h/1d itself.
         let (tx, mut rx) = broadcast::channel::<String>(64);
         let mut eng = Engine::new(tx);
         eng.handle_command(1, subscribe_cmd("BTC/USDT", "5m"));
@@ -3813,7 +3793,6 @@ mod tests {
             s.ex.fetch_ohlcv("BTC/USDT", "5m", None, None).is_empty(),
             "the server must never hold candles for a session"
         );
-        assert!(s.oi.is_empty(), "the server must never hold open interest");
 
         let mut acked = false;
         while let Ok(raw) = rx.try_recv() {

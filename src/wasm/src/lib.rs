@@ -30,8 +30,6 @@ struct Engine {
     reveal_reset_ms: i64,
     range_end_ms: i64,
     candles: Vec<Vec<f64>>,
-    oi: Vec<[f64; 2]>,
-    oi_period: String,
     fills_seen: usize,
     fills_reported: usize,
     candles_reported: usize,
@@ -82,11 +80,6 @@ fn init(message: &Value) -> Result<(), String> {
     let speed = message["speed"].as_f64().unwrap_or(1.0);
     let reveal_reset_ms = message["reveal_reset_ms"].as_i64().unwrap_or(start_ms);
     let range_end_ms = message["range_end_ms"].as_i64().unwrap_or(i64::MAX);
-    let oi = serde_json::from_value(message["oi"].clone()).unwrap_or_default();
-    let oi_period = message["oi_period"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
     let rows: Vec<Vec<f64>> = serde_json::from_value(message["candles"].clone())
         .map_err(|error| format!("invalid candles: {error}"))?;
     let candles = parse_candles(&rows)?;
@@ -157,8 +150,6 @@ fn init(message: &Value) -> Result<(), String> {
             range_end_ms,
             total: rows.len(),
             candles: rows,
-            oi,
-            oi_period,
             fills_seen: 0,
             fills_reported: 0,
             candles_reported: 0,
@@ -333,11 +324,6 @@ fn command(command: &Value) -> Result<(), String> {
                 engine.candles = rows;
                 engine.total = engine.candles.len();
                 engine.candles_reported = 0;
-                engine.oi = serde_json::from_value(command["oi"].clone()).unwrap_or_default();
-                engine.oi_period = command["oi_period"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
             }
             "place_order" => {
                 let symbol = command["symbol"].as_str().unwrap_or(&engine.symbol);
@@ -712,8 +698,6 @@ fn snapshot(include_candles: bool, include_all_fills: bool) -> Result<Value, Str
             "fills": fills,
             "entry_protections": entry_protections,
             "exit_reasons": exit_reasons,
-            "oi": if include_candles { json!(engine.oi) } else { Value::Null },
-            "oi_period": engine.oi_period,
             "range": {
                 "reveal_reset_ms": engine.reveal_reset_ms,
                 "end_ms": engine.range_end_ms
@@ -1034,8 +1018,6 @@ mod tests {
             "market_kind": "linear",
             "reveal_reset_ms": 60_000,
             "range_end_ms": 600_000,
-            "oi": [],
-            "oi_period": "",
             "preserve_clock": true,
             "candles": [[120_000, 2_000.0, 2_000.0, 2_000.0, 2_000.0, 4.0]]
         });
@@ -1092,8 +1074,6 @@ mod tests {
             "market_kind": "linear",
             "reveal_reset_ms": 180_000,
             "range_end_ms": 600_000,
-            "oi": [],
-            "oi_period": "",
             "preserve_clock": false,
             "candles": [
                 [120_000, 200.0, 200.0, 100.0, 200.0, 5.0],
@@ -1172,8 +1152,6 @@ mod tests {
             "market_kind": "linear",
             "reveal_reset_ms": 0,
             "range_end_ms": 600_000,
-            "oi": [],
-            "oi_period": "",
             "preserve_clock": true,
             "candles": [[300_000, 50.0, 55.0, 49.0, 52.0, 4.0]]
         });

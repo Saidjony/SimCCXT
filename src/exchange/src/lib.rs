@@ -14,7 +14,7 @@ use simccxt_core::{
     Balance, Config, OHLCV, OrderStatus, OrderType, Side, Symbol, TimeInForce, Trade,
 };
 use simccxt_event_bus::{Event, EventBus};
-use simccxt_market::{FundingRate, OpenInterest, OrderBook, Ticker};
+use simccxt_market::{FundingRate, OrderBook, Ticker};
 
 /// Additional parameters for `create_order`.
 #[derive(Debug, Clone, Default)]
@@ -71,7 +71,6 @@ pub struct Exchange {
     trades: HashMap<String, Vec<Trade>>,
     tickers: HashMap<String, Ticker>,
     funding_rates: HashMap<String, FundingRate>,
-    open_interest: HashMap<String, OpenInterest>,
     last_price: HashMap<String, f64>,
     /// Closed candles already fed into the broker (symbol, timeframe) at some ts.
     replayed: HashMap<(String, String), Option<DateTime<Utc>>>,
@@ -105,7 +104,6 @@ impl Exchange {
             trades: HashMap::new(),
             tickers: HashMap::new(),
             funding_rates: HashMap::new(),
-            open_interest: HashMap::new(),
             last_price: HashMap::new(),
             replayed: HashMap::new(),
             spot_cost: HashMap::new(),
@@ -162,11 +160,6 @@ impl Exchange {
     /// Set a funding rate for a symbol.
     pub fn set_funding_rate(&mut self, symbol: &str, rate: FundingRate) {
         self.funding_rates.insert(symbol.to_string(), rate);
-    }
-
-    /// Set open interest for a symbol.
-    pub fn set_open_interest(&mut self, symbol: &str, oi: OpenInterest) {
-        self.open_interest.insert(symbol.to_string(), oi);
     }
 
     // ------------------------------------------------------------------
@@ -987,26 +980,6 @@ impl Exchange {
         json!({
             "symbol": symbol,
             "fundingRate": 0.0,
-            "timestamp": self.now_ms(),
-            "datetime": self.now().to_rfc3339(),
-        })
-    }
-
-    /// `fetch_open_interest` — returns a CCXT-style open interest dict.
-    pub fn fetch_open_interest(&self, symbol: &str) -> Value {
-        if let Some(oi) = self.open_interest.get(symbol) {
-            return json!({
-                "symbol": symbol,
-                "openInterestAmount": oi.open_interest,
-                "openInterestValue": oi.open_interest,
-                "timestamp": oi.timestamp.timestamp_millis(),
-                "datetime": oi.timestamp.to_rfc3339(),
-            });
-        }
-        json!({
-            "symbol": symbol,
-            "openInterestAmount": json!(null),
-            "openInterestValue": json!(null),
             "timestamp": self.now_ms(),
             "datetime": self.now().to_rfc3339(),
         })
