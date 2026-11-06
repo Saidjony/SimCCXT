@@ -169,6 +169,16 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
 - Bars at or before the clock are visible; later bars are revealed one at a
   time. 1h/1d panes re-bucket the same revealed 5m bars, so all panels agree.
 - One tick = one 5m bar.
+- **Triggering is timeframe-independent.** Orders are always checked against
+  the revealed 5m path, never against the chart's interval. A 1d bar contains a
+  whole day; feeding it at the day's open would expose the afternoon's low hours
+  before the clock reaches it (the phantom stop-out after a 1h → 1d switch). The
+  coarser chart is aggregated from the same 5m bars only up to the clock, so its
+  newest bar stays partial while the day forms.
+- **Fills are exact.** A market entry fills at the price in the ticket, and a
+  stop / take-profit / trailing-stop fills at its trigger, not at the next gap
+  price. Stop-limit and take-profit-limit fall back to the trigger as their
+  limit when none is given.
 - `reset` puts the clock at the reveal boundary **and pauses**.
 - Switching coin or venue opens the new series at its own boundary, paused.
   Switching only the timeframe keeps the clock.

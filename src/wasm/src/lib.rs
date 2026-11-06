@@ -29,7 +29,15 @@ struct Engine {
     speed: f64,
     reveal_reset_ms: i64,
     range_end_ms: i64,
+    /// The bars the chart draws (aggregated from `base_candles` at `step_ms`).
     candles: Vec<Vec<f64>>,
+    /// The 5m series every timeframe is aggregated from. Orders are always
+    /// triggered against THIS path, never against the chart's timeframe: a 1d
+    /// bar covers a whole day, so feeding it at the day's open would expose
+    /// prices (a stop, a target) that the replay clock had not reached yet.
+    base_candles: Vec<Vec<f64>>,
+    /// Key of the series loaded into the exchange's replay feed.
+    feed_timeframe: String,
     fills_seen: usize,
     fills_reported: usize,
     candles_reported: usize,
@@ -82,7 +90,21 @@ fn init(message: &Value) -> Result<(), String> {
     let range_end_ms = message["range_end_ms"].as_i64().unwrap_or(i64::MAX);
     let rows: Vec<Vec<f64>> = serde_json::from_value(message["candles"].clone())
         .map_err(|error| format!("invalid candles: {error}"))?;
-    let candles = parse_candles(&rows)?;
+    let (base_rows, _base_step_ms, has_base) = base_series(message, &rows);
+    // Draw the requested timeframe from the same base series the orders are
+    // triggered against, so a chart bar never contains prices the replay has
+    // not reached.
+    let display_rows = if has_base {
+        aggregate_rows(&base_rows, step_ms)
+    } else {
+        rows.clone()
+    };
+    let candles = parse_candles(&base_rows)?;
+    let feed_timeframe = if has_base {
+        "base".to_string()
+    } else {
+        timeframe.to_string()
+    };
 
     let symbol_value = Symbol::parse(symbol).map_err(|error| error.to_string())?;
     let kind = match market_kind {
@@ -113,20 +135,21 @@ fn init(message: &Value) -> Result<(), String> {
     let mut exchange = Exchange::new(config);
     exchange.deposit("USDT", 1_000_000.0);
     exchange.add_market(&symbol_value, kind);
-    exchange.load_candles(symbol, timeframe, candles);
+    exchange.load_candles(symbol, &feed_timeframe, candles);
+    exchange.retain_candles(symbol, &feed_timeframe);
     exchange.set_step_ms(step_ms);
     let start_time = Utc
         .timestamp_millis_opt(start_ms)
         .single()
         .ok_or_else(|| "start_ms is out of range".to_string())?;
-    exchange.mark_history_played(&symbol_value, timeframe, start_time);
+    exchange.mark_history_played(&symbol_value, &feed_timeframe, start_time);
     // Seed the reference price from the last bar at or before the reveal
     // boundary. Without it the engine has no price until the first `step`, so
     // a market entry on the freshly opened chart failed with "no reference
     // price ... advance the clock" even though the price was right there on
     // the screen. `apply_price` also seeds the synthetic book level that
     // market orders fill against.
-    if let Some(last) = rows
+    if let Some(last) = base_rows
         .iter()
         .filter(|row| row.first().is_some_and(|ts| *ts <= start_ms as f64))
         .next_back()
@@ -148,8 +171,10 @@ fn init(message: &Value) -> Result<(), String> {
             speed,
             reveal_reset_ms,
             range_end_ms,
-            total: rows.len(),
-            candles: rows,
+            total: display_rows.len(),
+            candles: display_rows,
+            base_candles: base_rows,
+            feed_timeframe,
             fills_seen: 0,
             fills_reported: 0,
             candles_reported: 0,
@@ -179,6 +204,107 @@ fn parse_candles(rows: &[Vec<f64>]) -> Result<Vec<OHLCV>, String> {
             ))
         })
         .collect()
+}
+
+/// Aggregate base (5m) rows into `step_ms` buckets.
+///
+/// Mirrors `frontend/src/market/aggregate.ts` exactly: a bucket is named by its
+/// open time, aligned to an absolute multiple of the step (UTC days for 1d), so
+/// the chart and the engine speak about the same bars.
+fn aggregate_rows(base: &[Vec<f64>], step_ms: u64) -> Vec<Vec<f64>> {
+    if base.is_empty() || step_ms == 0 {
+        return base.to_vec();
+    }
+    let step = step_ms as f64;
+    let mut out: Vec<Vec<f64>> = Vec::with_capacity(base.len());
+    let mut current: Option<Vec<f64>> = None;
+    for row in base {
+        if row.len() < 6 {
+            continue;
+        }
+        let bucket = (row[0] / step).floor() * step;
+        match current.as_mut() {
+            Some(cur) if cur[0] == bucket => {
+                if row[2] > cur[2] {
+                    cur[2] = row[2];
+                }
+                if row[3] < cur[3] {
+                    cur[3] = row[3];
+                }
+                cur[4] = row[4];
+                cur[5] += row[5];
+            }
+            _ => {
+                if let Some(cur) = current.take() {
+                    out.push(cur);
+                }
+                current = Some(vec![bucket, row[1], row[2], row[3], row[4], row[5]]);
+            }
+        }
+    }
+    if let Some(cur) = current {
+        out.push(cur);
+    }
+    out
+}
+
+/// The still-forming bucket at `bucket_ts`, built only from base rows the
+/// replay clock has actually reached. The chart must not show yesterday's
+/// close as today's price (that price has not happened yet).
+fn forming_bucket(
+    base: &[Vec<f64>],
+    step_ms: u64,
+    bucket_ts: f64,
+    visible: usize,
+) -> Option<Vec<f64>> {
+    if step_ms == 0 || visible == 0 {
+        return None;
+    }
+    let visible = visible.min(base.len());
+    let rows = &base[..visible];
+    let start = rows.partition_point(|row| row[0] < bucket_ts);
+    let end = start + rows[start..].partition_point(|row| row[0] < bucket_ts + step_ms as f64);
+    let bucket = &rows[start..end];
+    let first = bucket.first()?;
+    let mut out = vec![bucket_ts, first[1], first[2], first[3], first[4], first[5]];
+    for row in &bucket[1..] {
+        if row[2] > out[2] {
+            out[2] = row[2];
+        }
+        if row[3] < out[3] {
+            out[3] = row[3];
+        }
+        out[4] = row[4];
+        out[5] += row[5];
+    }
+    Some(out)
+}
+
+/// Optional base series supplied by the browser. Old callers (tests, cached
+/// clients) send only `candles`; they keep working by using that series as its
+/// own base.
+fn base_series(message: &Value, display_rows: &[Vec<f64>]) -> (Vec<Vec<f64>>, u64, bool) {
+    if let Some(rows) = message["base_candles"].as_array() {
+        let base: Vec<Vec<f64>> = rows
+            .iter()
+            .filter_map(|row| {
+                let values: Vec<f64> = row
+                    .as_array()?
+                    .iter()
+                    .map(|value| value.as_f64())
+                    .collect::<Option<Vec<f64>>>()?;
+                (values.len() >= 6).then_some(values)
+            })
+            .collect();
+        if !base.is_empty() {
+            let step = message["base_step_ms"]
+                .as_u64()
+                .filter(|step| *step > 0)
+                .unwrap_or(300_000);
+            return (base, step, true);
+        }
+    }
+    (display_rows.to_vec(), message["step_ms"].as_u64().unwrap_or(0), false)
 }
 
 fn command(command: &Value) -> Result<(), String> {
@@ -239,7 +365,7 @@ fn command(command: &Value) -> Result<(), String> {
                 if let Ok(symbol) = Symbol::parse(&engine.symbol) {
                     engine.exchange.mark_history_played(
                         &symbol,
-                        &engine.timeframe,
+                        &engine.feed_timeframe,
                         timestamp,
                     );
                 }
@@ -260,7 +386,18 @@ fn command(command: &Value) -> Result<(), String> {
                     .ok_or_else(|| "step_ms must be greater than zero".to_string())?;
                 let rows: Vec<Vec<f64>> = serde_json::from_value(command["candles"].clone())
                     .map_err(|error| format!("invalid candles: {error}"))?;
-                let candles = parse_candles(&rows)?;
+                let (base_rows, _base_step_ms, has_base) = base_series(command, &rows);
+                let display_rows = if has_base {
+                    aggregate_rows(&base_rows, step_ms)
+                } else {
+                    rows.clone()
+                };
+                let candles = parse_candles(&base_rows)?;
+                let feed_timeframe = if has_base {
+                    "base".to_string()
+                } else {
+                    timeframe.to_string()
+                };
                 let symbol_value = Symbol::parse(symbol).map_err(|error| error.to_string())?;
                 let kind = match command["market_kind"].as_str().unwrap_or("linear") {
                     "spot" => MarketKind::Spot,
@@ -269,12 +406,12 @@ fn command(command: &Value) -> Result<(), String> {
                 };
                 let now_ms = engine.exchange.now_ms();
                 engine.exchange.add_market(&symbol_value, kind);
-                engine.exchange.load_candles(symbol, timeframe, candles);
+                engine.exchange.load_candles(symbol, &feed_timeframe, candles);
                 // This tab replays ONE series. Dropping every previously loaded
                 // coin/interval matters: `feed_due` walks all loaded series, so
                 // otherwise pressing play advanced the old coins in the
                 // background too (their stops/TPs fired off-screen).
-                engine.exchange.retain_candles(symbol, timeframe);
+                engine.exchange.retain_candles(symbol, &feed_timeframe);
                 engine.exchange.set_step_ms(step_ms);
                 let same_window = command["preserve_clock"].as_bool().unwrap_or(false);
                 let reveal_reset_ms = command["reveal_reset_ms"].as_i64().unwrap_or(now_ms);
@@ -288,14 +425,14 @@ fn command(command: &Value) -> Result<(), String> {
                     .timestamp_millis_opt(clock_ms)
                     .single()
                     .ok_or_else(|| "current replay time is out of range".to_string())?;
-                let rows_before_clock = rows
+                let last_before_clock = base_rows
                     .iter()
                     .filter(|row| {
                         row.first()
                             .is_some_and(|timestamp| *timestamp <= clock_ms as f64)
                     })
-                    .collect::<Vec<_>>();
-                if let Some(last) = rows_before_clock.last() {
+                    .next_back();
+                if let Some(last) = last_before_clock {
                     let price = engine
                         .exchange
                         .last_price_for(symbol)
@@ -314,16 +451,18 @@ fn command(command: &Value) -> Result<(), String> {
                 // broker and fire old stops/TPs at months-old prices.
                 engine
                     .exchange
-                    .mark_history_played(&symbol_value, timeframe, current_time);
+                    .mark_history_played(&symbol_value, &feed_timeframe, current_time);
                 engine.symbol = symbol.to_string();
                 engine.timeframe = timeframe.to_string();
                 engine.exchange_name = exchange.to_string();
                 engine.step_ms = step_ms;
                 engine.range_end_ms = command["range_end_ms"].as_i64().unwrap_or(i64::MAX);
                 engine.reveal_reset_ms = reveal_reset_ms;
-                engine.candles = rows;
+                engine.candles = display_rows;
                 engine.total = engine.candles.len();
                 engine.candles_reported = 0;
+                engine.base_candles = base_rows;
+                engine.feed_timeframe = feed_timeframe;
             }
             "place_order" => {
                 let symbol = command["symbol"].as_str().unwrap_or(&engine.symbol);
@@ -357,6 +496,17 @@ fn command(command: &Value) -> Result<(), String> {
                     }
                 }
                 let mut params = CreateOrderParams::new();
+                // A market entry fills at the price the trader actually saw and
+                // sized the risk from, not at a wick of the newest replay bar.
+                // The next tick replaces this synthetic level.
+                if order_type == "market" && !reduce_only {
+                    if let Some(entry) = price.filter(|value| value.is_finite() && *value > 0.0) {
+                        engine
+                            .exchange
+                            .broker_mut()
+                            .update_midpoint(symbol, entry, 1e12);
+                    }
+                }
                 if let Some(value) = command["stop_price"].as_f64() {
                     params = params.stop_price(value);
                 }
@@ -636,24 +786,54 @@ fn snapshot(include_candles: bool, include_all_fills: bool) -> Result<Value, Str
             .as_mut()
             .ok_or_else(|| "engine is not initialized".to_string())?;
         let now_ms = engine.exchange.now_ms();
-        let visible_count = engine
+        let mut visible_count = engine
             .candles
             .partition_point(|row| {
                 row.first()
                     .is_some_and(|timestamp| *timestamp <= now_ms as f64)
             });
+        let visible_base = engine
+            .base_candles
+            .partition_point(|row| {
+                row.first()
+                    .is_some_and(|timestamp| *timestamp <= now_ms as f64)
+            });
         let full_reset = include_candles;
+        // Always re-send the last bar: it is still forming, so its high/low/
+        // close change as the clock moves inside the bucket. Without this a 1d
+        // chart would keep the first partial copy of today's bar forever.
+        let mut partial = None;
+        if visible_count > 0 {
+            let bucket_ts = engine.candles[visible_count - 1][0];
+            partial = forming_bucket(
+                &engine.base_candles,
+                engine.step_ms,
+                bucket_ts,
+                visible_base,
+            );
+            // A bucket can exist in the full aggregation while its first base
+            // bar is still ahead of the clock (a data gap). Do not reveal it.
+            if partial.is_none() {
+                visible_count -= 1;
+            }
+        }
         let candle_start = if full_reset {
             0
         } else {
-            engine.candles_reported.min(visible_count)
+            engine
+                .candles_reported
+                .saturating_sub(1)
+                .min(visible_count)
         };
         engine.candles_reported = visible_count;
-        let candle_rows = if full_reset {
+        let mut candle_rows = if visible_count == 0 {
             Vec::new()
         } else {
             engine.candles[candle_start..visible_count].to_vec()
         };
+        if let (Some(partial), Some(last)) = (partial, candle_rows.last_mut()) {
+            *last = partial;
+        }
         let fill_count = engine.exchange.fill_count();
         let all_fills = include_all_fills || fill_count < engine.fills_reported;
         let fills = if all_fills {
@@ -696,6 +876,10 @@ fn snapshot(include_candles: bool, include_all_fills: bool) -> Result<Value, Str
             "candles_delta": candle_rows,
             "account": engine.exchange.account_snapshot(),
             "fills": fills,
+            "last_price": engine
+                .exchange
+                .last_price_for(&engine.symbol)
+                .unwrap_or(0.0),
             "entry_protections": entry_protections,
             "exit_reasons": exit_reasons,
             "range": {
@@ -1122,6 +1306,135 @@ mod tests {
             "pre-revealed history must never be re-fed after a coin switch"
         );
         assert_eq!(snapshot["account"]["positions"].as_array().unwrap().len(), 1);
+    }
+
+    /// Reproduces the reported bug: a trade opened on 1h, then the chart
+    /// switched to 1d and replayed. The 1d bar covering the current day used to
+    /// be fed at the day's OPEN with its whole OHLC, so a low that the hourly
+    /// chart had not reached yet (the afternoon) stopped the position out
+    /// "before" price got there on 1h. Orders must always be triggered by the
+    /// same base (5m) path, whatever the chart's timeframe.
+    #[test]
+    fn timeframe_switch_cannot_trigger_a_stop_from_a_future_daily_low() {
+        const HOUR: i64 = 3_600_000;
+        const DAY: i64 = 86_400_000;
+        const STEP: i64 = 300_000;
+        let noon = DAY + 12 * HOUR;
+        let stop_hour = 3 * DAY + 20 * HOUR;
+        let end = 4 * DAY + 12 * HOUR;
+
+        let mut base: Vec<Vec<f64>> = Vec::new();
+        let mut ts = noon;
+        while ts <= end {
+            let bar = if ts == stop_hour {
+                // The stop is touched here, in the afternoon of day 3.
+                vec![ts as f64, 100.0, 100.0, 80.0, 82.0, 10.0]
+            } else if ts == 2 * DAY + 6 * HOUR {
+                // A harmless wick on day 2.
+                vec![ts as f64, 100.0, 100.0, 95.0, 100.0, 10.0]
+            } else if ts >= stop_hour {
+                vec![ts as f64, 82.0, 82.0, 82.0, 82.0, 10.0]
+            } else {
+                vec![ts as f64, 100.0, 100.0, 100.0, 100.0, 10.0]
+            };
+            base.push(bar);
+            ts += STEP;
+        }
+
+        let init = json!({
+            "type": "init",
+            "symbol": "ETH/USDT",
+            "timeframe": "1h",
+            "start_ms": noon,
+            "step_ms": HOUR,
+            "market_kind": "linear",
+            "engine_id": "tf-switch",
+            "candles": [],
+            "base_candles": base,
+            "base_step_ms": STEP
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+
+        // Open the long at 100 with a protective stop at 90.
+        let order = json!({
+            "type": "place_order",
+            "symbol": "ETH/USDT",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": 1.0,
+            "price": 100.0,
+            "stop_loss_price": 90.0
+        });
+        let placed: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(placed["ok"], true, "{placed}");
+        assert_eq!(
+            placed["snapshot"]["fills"][0]["price"].as_f64(),
+            Some(100.0),
+            "entry fills at the ticket price"
+        );
+
+        // Same coin, same clock, coarser chart.
+        let switch = json!({
+            "type": "switch_series",
+            "symbol": "ETH/USDT",
+            "exchange": "binance",
+            "timeframe": "1d",
+            "step_ms": DAY,
+            "speed": 1.0,
+            "market_kind": "linear",
+            "reveal_reset_ms": noon,
+            "range_end_ms": end,
+            "preserve_clock": true,
+            "candles": [],
+            "base_candles": base,
+            "base_step_ms": STEP
+        });
+        let switched: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&switch).unwrap())).unwrap();
+        assert_eq!(switched["ok"], true, "{switched}");
+        assert_eq!(switched["snapshot"]["replay"]["now_ms"], noon);
+        // The chart's forming day bar is built only from the 5m bars the clock
+        // has reached — never from the whole day it will eventually contain.
+        let switched_rows = switched["snapshot"]["candles_delta"].as_array().unwrap();
+        let forming = switched_rows.last().unwrap();
+        assert_eq!(forming[3].as_f64(), Some(100.0));
+
+        // Day 2 at noon: the day's low (95) is above the stop.
+        let day2: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        assert_eq!(day2["snapshot"]["replay"]["now_ms"], 2 * DAY + 12 * HOUR + 0);
+        assert!(day2["snapshot"]["fills"].as_array().unwrap().is_empty());
+
+        // Day 3 at noon: the DAILY bar already contains the 20:00 low, but the
+        // clock has not reached the afternoon. The old behaviour stopped here.
+        let day3: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        assert_eq!(day3["snapshot"]["replay"]["now_ms"], 3 * DAY + 12 * HOUR);
+        assert!(
+            day3["snapshot"]["fills"].as_array().unwrap().is_empty(),
+            "the 1d bar must not reveal the afternoon's low before the clock reaches it: {day3}"
+        );
+        let day3_rows = day3["snapshot"]["candles_delta"].as_array().unwrap();
+        let forming = day3_rows.last().unwrap();
+        assert_eq!(forming[0].as_f64(), Some(3.0 * DAY as f64));
+        assert_eq!(
+            forming[3].as_f64(),
+            Some(100.0),
+            "the forming day bar leaked the afternoon low: {forming:?}"
+        );
+        assert_eq!(
+            day3["snapshot"]["account"]["positions"][0]["qty"].as_f64(),
+            Some(1.0)
+        );
+
+        // Day 4 at noon: the clock has passed 20:00 on day 3, so the stop fills
+        // at its level, at the 5m bar that actually touched it.
+        let day4: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        let exit = &day4["snapshot"]["fills"][0];
+        assert_eq!(exit["price"].as_f64(), Some(90.0), "{day4}");
+        assert_eq!(exit["timestamp"].as_i64(), Some(stop_hour), "{day4}");
     }
 
     #[test]

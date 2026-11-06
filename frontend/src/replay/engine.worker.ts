@@ -7,6 +7,9 @@ interface InitMessage {
   market_kind: "spot" | "linear";
   engine_id: string;
   candles: number[][];
+  /** The 5m bars orders are triggered against; `candles` is only the chart. */
+  base_candles?: number[][];
+  base_step_ms?: number;
   exchange: string;
   speed: number;
   reveal_reset_ms: number;
@@ -33,6 +36,8 @@ type EngineCommand =
       range_end_ms: number;
       preserve_clock: boolean;
       candles: number[][];
+      base_candles?: number[][];
+      base_step_ms?: number;
     }
   | {
       type: "place_order";

@@ -926,7 +926,7 @@ impl Broker {
             // Other reduce-only exits still use the current market reference.
             let capped_protection = matches!(
                 c.order_type,
-                OrderType::Stop | OrderType::TakeProfit
+                OrderType::Stop | OrderType::TakeProfit | OrderType::TrailingStop
             ) && c.reduce_only
                 && triggered_market;
             let fill_reference = if triggered_market && (!c.reduce_only || capped_protection) {
@@ -939,6 +939,18 @@ impl Broker {
                 // settles there (same path a resting limit would take).
                 self.update_midpoint(&c.symbol.symbol, reference, 1e12);
             }
+            // A stop-limit/take-profit-limit without an explicit limit price
+            // would turn into a limit order priced at 0 and never fill. The
+            // trigger is the natural default: the trader wanted protection at
+            // that level, not a silently abandoned order.
+            let limit_price = if matches!(
+                c.order_type,
+                OrderType::StopLimit | OrderType::TakeProfitLimit
+            ) {
+                c.price.or(Some(c.trigger_price))
+            } else {
+                c.price
+            };
             let request = BrokerOrderRequest {
                 symbol: c.symbol.clone(),
                 side: c.side,
@@ -948,7 +960,7 @@ impl Broker {
                     other => other,
                 },
                 amount: c.amount,
-                price: c.price,
+                price: limit_price,
                 stop_price: None,
                 tp_price: None,
                 time_in_force: TimeInForce::GTC,
@@ -1246,6 +1258,51 @@ mod tests {
             executed[0]
         );
         assert!(b.portfolio().position("BTC/USDT").is_none());
+    }
+
+    #[test]
+    fn protective_trailing_stop_fills_at_its_trigger_after_a_gap() {
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Buy, 1.0), ts())
+            .unwrap();
+
+        let mut trail = BrokerOrderRequest::market(btc(), Side::Sell, 1.0);
+        trail.order_type = OrderType::TrailingStop;
+        trail.stop_price = Some(90.0);
+        trail.reduce_only = true;
+        b.submit_order(trail, ts()).unwrap();
+
+        let executed = b.on_price_update(&btc(), 80.0, ts());
+        assert_eq!(executed.len(), 1);
+        assert!(
+            (executed[0].average_price - 90.0).abs() < 1e-9,
+            "trailing stop must fill at its level, not the gapped price: {:?}",
+            executed[0]
+        );
+        assert!(b.portfolio().position("BTC/USDT").is_none());
+    }
+
+    #[test]
+    fn stop_limit_without_a_limit_price_uses_its_trigger() {
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+
+        let mut req = BrokerOrderRequest::market(btc(), Side::Buy, 1.0);
+        req.order_type = OrderType::StopLimit;
+        req.stop_price = Some(110.0);
+        // No explicit limit price: it must fall back to the trigger, not 0.
+        b.submit_order(req, ts()).unwrap();
+        b.update_midpoint("BTC/USDT", 120.0, 1e12);
+        b.on_price_update(&btc(), 120.0, ts());
+
+        let open = b.open_orders("BTC/USDT");
+        assert_eq!(open.len(), 1, "the stop-limit must rest, not vanish");
+        assert_eq!(open[0].price, Some(110.0));
     }
 
     #[test]

@@ -28,6 +28,7 @@ interface LocalSnapshot {
   account: AccountSnapshot;
   replay: ReplayState;
   fills: FillLine[];
+  last_price?: number;
   range: { reveal_reset_ms: number; end_ms: number };
   entry_protections?: Record<string, Record<string, unknown>>;
   exit_reasons?: Record<string, string>;
@@ -191,6 +192,11 @@ function persistedProtections(): Record<string, Record<string, unknown>> {
 
 function applyLocalSnapshot(snapshot: LocalSnapshot): void {
   const account = displayAccount(snapshot.account);
+  // The engine aggregates the chart's timeframe from the same base bars that
+  // triggered the orders, so its rows already reflect how far the clock has
+  // actually gone inside the newest bar. Prefer them: recomputing from the
+  // page's full base used to show the whole day's (future) close as "now".
+  const engineRows = snapshot.candles_delta ?? [];
   if (snapshot.full_reset) {
     // A worker restart (reload, or a fresh engine after a failure) has no
     // series of its own: this page's loaded base bars are the full history and
@@ -201,35 +207,42 @@ function applyLocalSnapshot(snapshot: LocalSnapshot): void {
     // and handed to that very worker. Erroring out here used to leave the chart
     // blank ("Локальный реплей не получил свечи для полного обновления") even
     // though the data was already loading.
-    const key = keyFor(snapshot.exchange, snapshot.symbol, snapshot.timeframe);
-    const loaded = loadedRows.get(key);
-    const base = peekBaseBars(snapshot.exchange, snapshot.symbol, 0, Number.MAX_SAFE_INTEGER)
-      ?? (loaded ? loaded.base : null);
-    if (!base || base.length === 0) {
-      if (base === null) {
-        // The series is still loading: its own snapshot will arrive shortly.
+    const timeframe = timeframeOr(snapshot.timeframe, BASE_TIMEFRAME);
+    let rows = engineRows;
+    if (rows.length === 0) {
+      const key = keyFor(snapshot.exchange, snapshot.symbol, snapshot.timeframe);
+      const loaded = loadedRows.get(key);
+      const base = peekBaseBars(snapshot.exchange, snapshot.symbol, 0, Number.MAX_SAFE_INTEGER)
+        ?? (loaded ? loaded.base : null);
+      if (!base || base.length === 0) {
+        if (base === null) {
+          // The series is still loading: its own snapshot will arrive shortly.
+          return;
+        }
+        store.setError("Локальный реплей не получил свечи для полного обновления");
         return;
       }
-      store.setError("Локальный реплей не получил свечи для полного обновления");
-      return;
+      rows = aggregateCandles(base, timeframe).slice(0, snapshot.replay.fed);
     }
-    const timeframe = timeframeOr(snapshot.timeframe, BASE_TIMEFRAME);
     store.applySnapshot(
       snapshot.symbol,
       snapshot.exchange,
       timeframe,
-      aggregateCandles(base, timeframe).slice(0, snapshot.replay.fed),
+      rows,
       account,
       snapshot.replay,
       snapshot.fills,
     );
   } else {
     store.applyLocalUpdate(
-      snapshot.candles_delta ?? [],
+      engineRows,
       account,
       snapshot.replay,
       snapshot.fills,
     );
+  }
+  if (snapshot.last_price !== undefined && Number.isFinite(snapshot.last_price) && snapshot.last_price > 0) {
+    store.applyMarket(snapshot.last_price);
   }
   lastRenderAt = Date.now();
 }
@@ -484,6 +497,8 @@ export async function initializeLocalEngine(
           range_end_ms: range.end_ms,
           preserve_clock: preserveClock,
           candles: rows,
+          base_candles: base,
+          base_step_ms: TIMEFRAME_MS[BASE_TIMEFRAME],
         },
       });
     } else {
@@ -500,6 +515,8 @@ export async function initializeLocalEngine(
         reveal_reset_ms: revealResetMs,
         range_end_ms: state.replayWindow.end_ms,
         candles: rows,
+        base_candles: base,
+        base_step_ms: TIMEFRAME_MS[BASE_TIMEFRAME],
       });
     }
   } catch (error) {
