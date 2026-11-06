@@ -153,10 +153,10 @@ export function Chart(): JSX.Element {
   } | null>(null);
   /** Window listeners of the in-flight drawing drag (drop or unmount). */
   const dragCleanupRef = useRef<(() => void) | null>(null);
-  /** Pan/zoom flags parked while a drawing is being dragged. */
-  const parkedChartOptionsRef = useRef<
-    Partial<ReturnType<IChartApi["options"]>> | null
-  >(null);
+  /** True while a freehand stroke owns the chart (pan/zoom stay parked). */
+  const strokeActiveRef = useRef(false);
+  /** Last pan/zoom lock we applied (avoids reading options on every mousemove). */
+  const interactionsLockedRef = useRef(false);
   /** Mouse-down anchor for manual click detection (pan-safe placement). */
   const [magnet, setMagnet] = useState(false);
   const brushPointsRef = useRef<Array<{ t: number; p: number }>>([]); // freehand stroke points
@@ -223,19 +223,32 @@ export function Chart(): JSX.Element {
     });
   }, [magnet]);
 
-  // Brush: freeze pan/zoom while the tool is armed so the chart stays still
-  // during a freehand stroke. The frozen state follows the TOOL, not mouse
-  // events — it restores the moment the tool is disarmed (Escape, another
-  // tool, or stroke end), so it can never get stuck.
-  useEffect(() => {
+  /**
+   * Pan/zoom are disabled ONLY while something actively owns the pointer:
+   * dragging a drawing or painting a freehand stroke. Every entry/exit path
+   * calls this, and the wrapper also calls it on the next mouse event, so the
+   * chart can never be left with `handleScroll: false` (the "frozen chart"
+   * users hit after a drag/stroke that ended outside the chart).
+   */
+  function syncChartInteractions(verify = false): void {
     const chart = chartRef.current;
     if (!chart) return;
-    if (tool === "brush") {
-      chart.applyOptions({ handleScroll: false, handleScale: false });
-    } else {
-      chart.applyOptions({ handleScroll: true, handleScale: true });
+    const locked = dragRef.current !== null || strokeActiveRef.current;
+    if (!verify && locked === interactionsLockedRef.current) return;
+    if (verify) {
+      const scroll = chart.options().handleScroll;
+      const lockedNow =
+        typeof scroll === "boolean"
+          ? !scroll
+          : scroll.pressedMouseMove === false && scroll.mouseWheel === false;
+      if (lockedNow === locked) {
+        interactionsLockedRef.current = locked;
+        return;
+      }
     }
-  }, [tool]);
+    interactionsLockedRef.current = locked;
+    chart.applyOptions({ handleScroll: !locked, handleScale: !locked });
+  }
 
   // Create the chart once.
   useEffect(() => {
@@ -411,9 +424,8 @@ export function Chart(): JSX.Element {
         // Cancel any in-progress drag/stroke: stuck drag + parked pan/zoom
         // would otherwise leave the chart unresponsive.
         if (dragRef.current) endDrawingDrag();
-        if (brushPointsRef.current.length) {
-          brushPointsRef.current = [];
-        }
+        cancelBrushStroke();
+        syncChartInteractions();
       } else if (!e.repeat && e.key === " ") {
         e.preventDefault();
         sendSim({ type: "replay", action: getState().replay.paused ? "play" : "pause" });
@@ -437,11 +449,26 @@ export function Chart(): JSX.Element {
     // neither — but never leave a stuck drag or parked pan/zoom behind.
     const onBlur = (): void => {
       if (dragRef.current) endDrawingDrag();
-      if (brushPointsRef.current.length) {
-        brushPointsRef.current = [];
-      }
+      cancelBrushStroke();
+      syncChartInteractions();
     };
     window.addEventListener("blur", onBlur);
+
+    // A stroke can end anywhere (outside the chart, outside the window):
+    // finish it from the window so pan/zoom always come back. Idempotent:
+    // the wrapper's mouseup finds the stroke already finished and does nothing.
+    const onStrokePointerUp = (event: PointerEvent): void => {
+      if (event.isPrimary) finishBrushStroke();
+    };
+    const onStrokePointerCancel = (): void => cancelBrushStroke();
+    const onVisibility = (): void => {
+      if (!document.hidden) return;
+      if (dragRef.current) endDrawingDrag();
+      cancelBrushStroke();
+    };
+    window.addEventListener("pointerup", onStrokePointerUp, true);
+    window.addEventListener("pointercancel", onStrokePointerCancel, true);
+    document.addEventListener("visibilitychange", onVisibility);
 
     // Hover readout + ghost-preview mouse tracking (local, no roundtrip).
     // Stays live even during a programmatic sync: only the bus publish is
@@ -492,9 +519,11 @@ export function Chart(): JSX.Element {
       const position = price !== null && timestamp !== null && Number.isFinite(timestamp)
         ? { timestamp, price }
         : null;
-      // Magnet: snap crosshair visually to bar time + OHLC price on price pane
+      // Magnet: snap crosshair visually to bar time + OHLC price on price pane.
+      // The synthetic call never fires another crosshair event (skipEvent), so
+      // it must NOT raise applyingCrosshairRef: doing that used to leave the
+      // flag true forever and silently stop the shared crosshair for good.
       if (magnet && onPricePane && price !== null && timestamp !== null) {
-        applyingCrosshairRef.current = true;
         chart.setCrosshairPosition(price, toTime(timestamp), bars);
       }
       if (applyingCrosshairRef.current) {
@@ -552,6 +581,9 @@ export function Chart(): JSX.Element {
       window.clearTimeout(rulerTimer.current);
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pointerup", onStrokePointerUp, true);
+      window.removeEventListener("pointercancel", onStrokePointerCancel, true);
+      document.removeEventListener("visibilitychange", onVisibility);
       adaptivePriceAxis.dispose();
       refreshPriceAxisRef.current = null;
       crosshairListener();
@@ -789,19 +821,23 @@ export function Chart(): JSX.Element {
       className="chartwrap"
       onMouseDown={(e) => {
         if (e.button !== 0) return;
+        // Repair any stale pan/zoom lock before deciding what this press means.
+        syncChartInteractions(true);
         downRef.current = { x: e.clientX, y: e.clientY, button: e.button };
-        // Freehand brush: start recording points on mouse down.
+        // Freehand brush: start recording points on mouse down. Toolbar
+        // buttons floating over the chart are not a canvas stroke.
         if (toolRef.current === "brush") {
+          if ((e.target as HTMLElement).closest(".drawbar,.chart-tools,.coin-info")) return;
           const pt = pointFromEvent(e);
           if (!pt) return;
+          strokeActiveRef.current = true;
           brushPointsRef.current = (() => {
             const sc = snapClick(pt.t, pt.p);
             return [{ t: sc.t, p: sc.p }];
           })();
+          syncChartInteractions();
           return;
         }
-        // A tool is armed: the click places a drawing, never drags one.
-        if (toolRef.current !== "none") return;
         // A tool is armed: the click places a drawing, never drags one.
         if (toolRef.current !== "none") return;
         const id = engineRef.current?.hoveredId() ?? null;
@@ -812,6 +848,11 @@ export function Chart(): JSX.Element {
         startDrawingDrag(drawing, e.clientX, e.clientY);
       }}
       onMouseMove={(e) => {
+        // Mouse released outside the window: end the drag now instead of
+        // waiting for a pointerup that may never arrive.
+        if (dragRef.current && (e.buttons & 1) === 0) endDrawingDrag();
+        // Self-heal any stale lock (a stroke/drag that ended invisibly).
+        syncChartInteractions();
         if (dragRef.current) moveDrawingDrag(e.clientX, e.clientY);
         if (toolRef.current === "brush" && brushPointsRef.current.length > 0) {
           const pt = pointFromEvent(e);
@@ -830,14 +871,10 @@ export function Chart(): JSX.Element {
         downRef.current = null;
         // Finish a freehand brush stroke FIRST: a stroke always moves > 6px,
         // so it must be saved before the pan/click suppression checks below.
+        // The window-level pointerup may already have finished it (release
+        // outside the chart); finishBrushStroke is idempotent.
         if (toolRef.current === "brush") {
-          const pts = brushPointsRef.current;
-          brushPointsRef.current = [];
-          engineRef.current?.setGhost(null);
-          if (pts.length > 1) {
-            store.addDrawing({ kind: "brush", points: pts, color: "#4a9ec4", title: "ручка" });
-            store.setTool("none");
-          }
+          finishBrushStroke();
           suppressClickRef.current = false;
           return;
         }
@@ -1077,6 +1114,31 @@ export function Chart(): JSX.Element {
     return { t, p };
   }
 
+  // ---- freehand brush: one stroke owns pan/zoom, then gives it back ----
+
+  /** Finish the current stroke: save it, disarm the tool, restore pan/zoom. */
+  function finishBrushStroke(): void {
+    if (!strokeActiveRef.current) return;
+    strokeActiveRef.current = false;
+    const pts = brushPointsRef.current;
+    brushPointsRef.current = [];
+    engineRef.current?.setGhost(null);
+    if (pts.length > 1) {
+      store.addDrawing({ kind: "brush", points: pts, color: "#4a9ec4", title: "ручка" });
+    }
+    store.setTool("none");
+    syncChartInteractions();
+  }
+
+  /** Abort the stroke (Escape / window blur) without saving it. */
+  function cancelBrushStroke(): void {
+    if (!strokeActiveRef.current) return;
+    strokeActiveRef.current = false;
+    brushPointsRef.current = [];
+    engineRef.current?.setGhost(null);
+    syncChartInteractions();
+  }
+
   // ---- placement state machine ----
 
   function placeAt(t: number, price: number): void {
@@ -1233,19 +1295,7 @@ export function Chart(): JSX.Element {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-    parkedChartOptionsRef.current = {
-      handleScroll: chart.options().handleScroll,
-      handleScale: chart.options().handleScale,
-    };
-    chart.applyOptions({ handleScroll: false, handleScale: false });
-  }
-
-  /** Put back the pan/zoom flags the drag parked. */
-  function restoreChartOptions(): void {
-    const parked = parkedChartOptionsRef.current;
-    if (!parked) return;
-    parkedChartOptionsRef.current = null;
-    chartRef.current?.applyOptions(parked);
+    syncChartInteractions();
   }
 
   function moveDrawingDrag(clientX: number, clientY: number): void {
@@ -1308,7 +1358,7 @@ export function Chart(): JSX.Element {
     const drag = dragRef.current;
     dragRef.current = null;
     suppressClickRef.current = false;
-    restoreChartOptions();
+    syncChartInteractions();
     // A moved barrier re-points the replay clock (drag end only, not per move).
     if (drag && drag.moved) {
       const d = getState().drawings.find((x) => x.id === drag.id);
