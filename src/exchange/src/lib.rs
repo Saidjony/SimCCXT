@@ -547,6 +547,12 @@ impl Exchange {
         self.broker.fills_len()
     }
 
+    /// Delete every fill and resting order of `symbol`. Used by the chart's
+    /// trash so a deleted coin leaves no trades behind in later snapshots.
+    pub fn clear_symbol_data(&mut self, symbol: &str) {
+        self.broker.clear_symbol(symbol);
+    }
+
     /// Total account equity: quote free + marked-to-market positions + spot value.
     pub fn equity(&self) -> f64 {
         let mut eq = 0.0;

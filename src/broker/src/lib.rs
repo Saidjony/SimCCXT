@@ -1028,6 +1028,28 @@ impl Broker {
     pub fn fill_at(&self, index: usize) -> Option<&FillLog> {
         self.fill_log.get(index)
     }
+
+    /// Delete every fill and resting order of one symbol (the chart's trash).
+    ///
+    /// The wallet and portfolio are deliberately untouched: capital and PnL are
+    /// global to the replay session, only this coin's history and its pending
+    /// protective orders must disappear. Clearing the fills here is what stops
+    /// a later full snapshot from resurrecting deleted trades in the diary.
+    pub fn clear_symbol(&mut self, symbol: &str) {
+        // Trigger orders live outside the per-symbol engine (and lock nothing).
+        self.conditional
+            .retain(|order| order.symbol.symbol.as_str() != symbol);
+        let open_ids: Vec<String> = self
+            .engines
+            .get(symbol)
+            .map(|engine| engine.open_orders().map(|order| order.id.clone()).collect())
+            .unwrap_or_default();
+        for id in open_ids {
+            let _ = self.cancel_order(symbol, &id);
+        }
+        self.fill_log
+            .retain(|fill| fill.symbol.symbol.as_str() != symbol);
+    }
 }
 
 /// Whether a conditional order is triggered at the given price.
@@ -1482,6 +1504,35 @@ mod tests {
             "a wick must not move a resting limit away from its written price"
         );
         assert_eq!(b.fills(None)[0].price, 90.0);
+    }
+
+    #[test]
+    fn clearing_a_symbol_drops_only_its_fills_and_resting_orders() {
+        let mut b = spot_broker();
+        let eth = Symbol::parse("ETH/USDT").unwrap();
+        b.add_market(&eth, MarketKind::Spot, ts());
+        b.wallet_mut().deposit("ETH", 10.0);
+        // A resting buy on BTC plus one fill on each coin.
+        b.submit_order(BrokerOrderRequest::limit(btc(), Side::Buy, 90.0, 1.0), ts())
+            .unwrap();
+        b.execute_market_at(&btc(), Side::Buy, 1.0, 100.0, ts())
+            .unwrap();
+        b.execute_market_at(&eth, Side::Buy, 1.0, 50.0, ts())
+            .unwrap();
+        assert_eq!(b.fills(None).len(), 2);
+        assert_eq!(b.open_orders("BTC/USDT").len(), 1);
+
+        b.clear_symbol("BTC/USDT");
+
+        assert!(
+            b.fills(Some("BTC/USDT")).is_empty(),
+            "deleted coin keeps no fills"
+        );
+        assert_eq!(b.fills(Some("ETH/USDT")).len(), 1, "other coins survive");
+        assert!(
+            b.open_orders("BTC/USDT").is_empty(),
+            "a deleted coin must not keep orders that could fill later"
+        );
     }
 
     #[test]

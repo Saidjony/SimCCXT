@@ -1128,31 +1128,48 @@ export const store = {
     persistDrawings({ ...state.drawingsBySymbol, [state.symbol]: [] });
   },
   /**
-   * Forget everything this coin accumulated: its drawings, its closed trades
-   * and the stops/targets that came with them. Used by the trash button so the
-   * chart looks like a coin that was just added to the watchlist — the replay
-   * clock and the account balance are global and stay untouched.
+   * Forget everything this coin accumulated: its drawings, results checklist,
+   * closed trades and the stops/targets that came with them. Used by the trash
+   * button so the chart looks like a coin that was just added to the
+   * watchlist — the replay clock and the account balance are global and stay
+   * untouched.
+   *
+   * This is only the browser's copy. The caller must also run
+   * `clearLocalSymbol()` (see `chart/DrawBar.tsx`): the WASM engine and the
+   * server's mirrored ledger keep their own fills, and leaving them behind is
+   * exactly what made deleted trades reappear after a diary refresh.
    */
   resetSymbolData(): void {
     const symbol = state.symbol;
-    const dropped = state.fills.filter((fill) => fill.symbol === symbol);
-    if (!dropped.length && !state.drawings.length) return;
     const fills = state.fills.filter((fill) => fill.symbol !== symbol);
     const protections: Record<string, TradeProtection> = {};
     for (const [key, value] of Object.entries(state.entryProtections)) {
       // Keys are `engine|symbol|orderId|timestamp` (see `protectionKey`).
       if (protectionSymbol(key) !== symbol) protections[key] = value;
     }
+    // Results (setup checklist) are per symbol AND timeframe; drop every
+    // interval so switching the chart does not bring the chips back.
+    const chartCriteria = { ...state.chartCriteria };
+    const prefix = `${symbol}::`;
+    for (const key of Object.keys(chartCriteria)) {
+      if (key.startsWith(prefix)) delete chartCriteria[key];
+    }
+    // Keep `drawingsBySymbol` in step with the chart, otherwise switching away
+    // and back restored the "deleted" drawings from this map.
+    const drawingsBySymbol = { ...state.drawingsBySymbol, [symbol]: [] };
     set({
       drawings: [],
+      drawingsBySymbol,
+      chartCriteria,
       selectedId: null,
       fills,
       entryProtections: protections,
       lastOrder: state.lastOrder?.symbol === symbol ? null : state.lastOrder,
     });
-    persistDrawings({ ...state.drawingsBySymbol, [symbol]: [] });
-    if (dropped.length) persistFillHistory(fills);
+    persistDrawings(drawingsBySymbol);
+    persistFillHistory(fills);
     persistProtections(protections);
+    persistChartCriteria(chartCriteria);
   },
 };
 

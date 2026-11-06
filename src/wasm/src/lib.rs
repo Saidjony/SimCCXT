@@ -311,6 +311,11 @@ fn base_series(message: &Value, display_rows: &[Vec<f64>]) -> (Vec<Vec<f64>>, u6
     (display_rows.to_vec(), message["step_ms"].as_u64().unwrap_or(0), false)
 }
 
+/// The symbol field of a metadata key (`engineId|symbol|orderId|time`).
+fn metadata_symbol(key: &str) -> Option<&str> {
+    key.split('|').nth(1)
+}
+
 fn command(command: &Value) -> Result<(), String> {
     ENGINE.with(|engine| {
         let mut engine = engine.borrow_mut();
@@ -625,6 +630,63 @@ fn command(command: &Value) -> Result<(), String> {
                         let _ = engine.exchange.cancel_order(&order_id, &symbol);
                     }
                 }
+            }
+            "clear_symbol" => {
+                // The chart's trash: forget this coin completely. A coin with an
+                // open lot is flattened first — otherwise the diary would keep
+                // listing it as an open position and the next manual close
+                // would create a lone exit fill with no entry.
+                let symbol = command["symbol"]
+                    .as_str()
+                    .unwrap_or(&engine.symbol)
+                    .to_string();
+                let position = engine.exchange.account_snapshot()["positions"]
+                    .as_array()
+                    .and_then(|positions| {
+                        positions.iter().find(|position| {
+                            position["symbol"] == symbol
+                                && position["qty"].as_f64().unwrap_or(0.0) > 0.0
+                        })
+                    })
+                    .cloned();
+                if let Some(position) = position {
+                    let side = if position["side"] == "short" { "buy" } else { "sell" };
+                    let amount = position["qty"].as_f64().unwrap_or(0.0);
+                    if amount > 0.0 {
+                        let mut params = CreateOrderParams::new();
+                        params.reduce_only = true;
+                        engine
+                            .exchange
+                            .create_order(&symbol, "market", side, amount, None, params)
+                            .map_err(|error| error.to_string())?;
+                        process_fresh_fills(engine)?;
+                    }
+                }
+                // Drop the closed lot's fills from the broker log (so a later
+                // full snapshot cannot resurrect the diary rows) and cancel
+                // every pending/active protection, otherwise a stop armed for
+                // a trade the trader just deleted would fire later.
+                engine.exchange.clear_symbol_data(&symbol);
+                engine
+                    .pending_protections
+                    .retain(|pending| pending.symbol != symbol);
+                engine
+                    .active_protections
+                    .retain(|active| active.symbol != symbol);
+                engine
+                    .entry_protections
+                    .retain(|key, _| metadata_symbol(key) != Some(symbol.as_str()));
+                engine
+                    .exit_reasons
+                    .retain(|key, _| metadata_symbol(key) != Some(symbol.as_str()));
+                // The ledger shrank: move both cursors to its new end so the
+                // next delta starts after the surviving fills and nothing that
+                // was deleted is ever re-sent.
+                engine.fills_seen = engine.exchange.fill_count();
+                engine.fills_reported = engine.fills_seen;
+                engine.reported_entry_protections =
+                    engine.entry_protections.keys().cloned().collect();
+                engine.reported_exit_reasons = engine.exit_reasons.keys().cloned().collect();
             }
             _ => return Err("unsupported engine command".to_string()),
         }
@@ -1225,6 +1287,87 @@ mod tests {
         assert!(
             (realized + 10.0).abs() < 1e-9,
             "a 1.0 position stopped 10 points lower must lose exactly 10, got {realized}"
+        );
+    }
+
+    /// The chart's trash must clear the WASM ledger too: otherwise a later
+    /// full snapshot re-sends the deleted fills and the diary resurrects them.
+    #[test]
+    fn clearing_a_symbol_drops_its_fills_and_protective_levels() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "start_ms": 0,
+            "step_ms": 300_000,
+            "market_kind": "linear",
+            "candles": [
+                [300_000, 100.0, 100.0, 100.0, 100.0, 10.0],
+                [600_000, 100.0, 101.0, 85.0, 95.0, 10.0],
+                [900_000, 95.0, 96.0, 94.0, 95.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        process_message(br#"{"type":"step","steps":1}"#);
+        let order = json!({
+            "type": "place_order",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": 1.0,
+            "price": 100.0,
+            "stop_loss_price": 90.0
+        });
+        let placed: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(placed["snapshot"]["fills"].as_array().unwrap().len(), 1);
+        assert!(
+            !placed["snapshot"]["entry_protections"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "the entry has a planned stop"
+        );
+
+        let cleared: Value = serde_json::from_slice(&process_message(
+            br#"{"type":"clear_symbol","symbol":"BTC/USDT"}"#,
+        ))
+        .unwrap();
+        assert_eq!(cleared["ok"], true, "{cleared}");
+        // A full snapshot must not bring anything back.
+        let full: Value = serde_json::from_slice(&process_message(
+            br#"{"type":"snapshot","include_fills":true}"#,
+        ))
+        .unwrap();
+        assert!(
+            full["snapshot"]["fills"].as_array().unwrap().is_empty(),
+            "cleared fills must stay gone from the ledger: {full}"
+        );
+        assert!(
+            full["snapshot"]["entry_protections"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "the deleted trade's stop must not linger: {full}"
+        );
+        assert!(
+            full["snapshot"]["exit_reasons"].as_object().unwrap().is_empty(),
+            "{full}"
+        );
+        assert!(
+            full["snapshot"]["account"]["positions"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "the deleted coin must not keep an open lot: {full}"
+        );
+
+        // The cancelled protection must not fire on later bars.
+        let later: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        assert!(
+            later["snapshot"]["fills"].as_array().unwrap().is_empty(),
+            "a deleted trade must not be re-closed by its old stop: {later}"
         );
     }
 

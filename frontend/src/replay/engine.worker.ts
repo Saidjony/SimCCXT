@@ -55,6 +55,7 @@ type EngineCommand =
       post_only?: boolean;
     }
   | { type: "close_position"; symbol?: string; quantity?: number }
+  | { type: "clear_symbol"; symbol: string }
   | { type: "cancel_order"; symbol?: string; order_id: string };
 
 interface CommandMessage {

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { store, useSim } from "../state/store";
 import type { Tool } from "../state/store";
+import { clearLocalSymbol } from "../replay/localEngine";
 
 function RayIcon(): JSX.Element {
   return (
@@ -124,6 +125,10 @@ export function DrawBar(): JSX.Element {
     }
     setArmed(false);
     store.resetSymbolData();
+    // The chart's store is only one copy: the WASM engine and the server's
+    // mirrored ledger (the diary) must forget the coin too, or a refresh
+    // brings every deleted trade back.
+    clearLocalSymbol();
   };
 
   return (

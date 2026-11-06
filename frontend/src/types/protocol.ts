@@ -272,6 +272,8 @@ export type ClientMessage =
       account: AccountSnapshot;
       fills: FillLine[];
       replace_fills?: boolean;
+      /** Explicit trash: drop this symbol's trades/protections from the mirror. */
+      clear_symbol?: string;
       /** Engine instance that produced these fills (see `localEngine.engineId`). */
       engine_id?: string;
       entry_protections: Record<string, Record<string, unknown>>;

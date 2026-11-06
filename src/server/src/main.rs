@@ -260,6 +260,12 @@ enum ClientCmd {
         entry_protections: HashMap<String, Value>,
         #[serde(default)]
         exit_reasons: HashMap<String, String>,
+        /// Explicit trash action: drop this symbol's fills, its protective
+        /// levels and its diary rows from the session mirror. Sent by the
+        /// chart's delete button, which must remove a coin even when the
+        /// browser's own ledger no longer remembers the trades.
+        #[serde(default)]
+        clear_symbol: Option<String>,
         symbol: String,
         timeframe: String,
         #[serde(default = "default_exchange")]
@@ -455,6 +461,14 @@ fn local_protection_key(
     entry_time_ms: i64,
 ) -> String {
     format!("{engine_id}|{symbol}|{entry_order_id}|{entry_time_ms}")
+}
+
+/// The symbol field of a protection/exit-reason key.
+///
+/// Both maps use `engine_id|symbol|order_id|time`, so the trash can drop one
+/// coin without touching the trader's other trades.
+fn protection_key_symbol(key: &str) -> Option<&str> {
+    key.split('|').nth(1)
 }
 
 /// Key of a protective exit reason in an `exit_reasons` map.
@@ -1237,6 +1251,7 @@ impl Engine {
                 engine_id,
                 entry_protections,
                 exit_reasons,
+                clear_symbol,
                 symbol,
                 timeframe,
                 exchange,
@@ -1245,6 +1260,21 @@ impl Engine {
                 let s = self.session(to);
                 s.local_account = Some(account);
                 s.local_engine_id = engine_id.clone();
+                // The chart's trash: delete this coin from the mirror even if
+                // the browser already forgot its fills. Fills for every other
+                // coin stay untouched, so a per-symbol clear never wipes the
+                // rest of the trader's diary.
+                let clearing = clear_symbol.as_deref().filter(|value| !value.is_empty());
+                let clears_current = clearing == Some(symbol.as_str());
+                // Incoming batches are filtered too: a flush that was already
+                // queued before the trash click must not re-add the coin.
+                let mut entry_protections = entry_protections;
+                let mut exit_reasons = exit_reasons;
+                if let Some(cleared) = clearing {
+                    entry_protections
+                        .retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                    exit_reasons.retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                }
                 // Stamp every fill with the engine instance that produced it.
                 // A reloaded tab replays from the same bar with order ids back
                 // at 1, so without this the new entry is indistinguishable from
@@ -1256,7 +1286,10 @@ impl Engine {
                         fill
                     })
                     .collect();
-                let ledger_changed;
+                if let Some(cleared) = clearing {
+                    fills.retain(|fill| fill["symbol"].as_str() != Some(cleared));
+                }
+                let mut ledger_changed;
                 if replace_fills {
                     s.local_fills = fills;
                     ledger_changed = true;
@@ -1278,6 +1311,40 @@ impl Engine {
                     s.local_fills.append(&mut fills);
                     ledger_changed = added;
                 }
+                // Remove what the trash asked for from the ledger that was
+                // already mirrored. This is the step that made deleted trades
+                // reappear on a diary refresh: the browser cleared its own
+                // copy, but the server kept reconstructing them from here.
+                let mut cleared_rows = false;
+                if let Some(cleared) = clearing {
+                    let before = s.local_fills.len();
+                    s.local_fills
+                        .retain(|fill| fill["symbol"].as_str() != Some(cleared));
+                    cleared_rows = s.local_fills.len() != before;
+                    s.local_entry_protections
+                        .retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                    s.local_exit_reasons
+                        .retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                    if clears_current {
+                        // The diary serves these verbatim; without clearing
+                        // them a refresh right after the click still drew the
+                        // old annotations and checklist chips.
+                        if let Some(meta) = s.diary_meta.as_object_mut() {
+                            meta.insert("drawings".into(), json!([]));
+                            if let Some(criteria) =
+                                meta.get_mut("criteria").and_then(|value| value.as_object_mut())
+                            {
+                                // Browser keys are `symbol::timeframe`
+                                // (see `chartCriteriaKey`), one per chart.
+                                let prefix = format!("{cleared}::");
+                                criteria.retain(|key, _| !key.starts_with(&prefix));
+                            }
+                        }
+                    }
+                    if cleared_rows {
+                        ledger_changed = true;
+                    }
+                }
                 // Merge, never replace: a page reload starts the browser with
                 // empty maps, and replacing would wipe the levels and exit
                 // verdicts of every trade this session already knows — the
@@ -1287,7 +1354,8 @@ impl Engine {
                 let protections_before = s.local_entry_protections.len();
                 s.local_entry_protections.extend(entry_protections);
                 s.local_exit_reasons.extend(exit_reasons);
-                let protections_changed = s.local_entry_protections.len() != protections_before;
+                let protections_changed = cleared_rows
+                    || s.local_entry_protections.len() != protections_before;
                 // The board's "Сделки" column counts distinct orders. A
                 // server-side engine feeds it from `fresh_fill_events`, but in
                 // the local-engine mode the fills only arrive here — without
@@ -4648,6 +4716,84 @@ mod tests {
         assert_eq!(row["pnl"], -10.0, "PnL survives the reload");
         assert_eq!(row["equity"], 990.0);
         assert_eq!(row["trades"], 2);
+    }
+
+    /// The chart's trash sends `clear_symbol`; the server must drop that coin's
+    /// fills and protective levels from the mirrored ledger, because the diary
+    /// is reconstructed from it and a refresh otherwise shows them again.
+    #[test]
+    fn clearing_a_symbol_removes_only_its_trades_from_the_diary_ledger() {
+        let (tx, _rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        eng.handle_command(1, login_cmd("A"));
+        eng.handle_command(1, challenge_cmd(true, Some(10.0)));
+
+        let btc_plan = local_protection_key("e1", "BTC/USDT", "1", 1);
+        let eth_plan = local_protection_key("e1", "ETH/USDT", "1", 11);
+        let btc_exit = exit_reason_key("e1", "BTC/USDT", "2", 2);
+        let eth_exit = exit_reason_key("e1", "ETH/USDT", "2", 12);
+        let mut protections = serde_json::Map::new();
+        protections.insert(btc_plan.clone(), json!({"stop_price": 90.0}));
+        protections.insert(eth_plan.clone(), json!({"stop_price": 90.0}));
+        let mut reasons = serde_json::Map::new();
+        reasons.insert(btc_exit.clone(), json!("stop"));
+        reasons.insert(eth_exit.clone(), json!("take"));
+        let sync: ClientCmd = serde_json::from_value(json!({
+            "type": "local_sync",
+            "account": {"equity": 1010, "pnl": {"realized": 10, "unrealized": 0}},
+            "fills": [
+                {"id": "1_0", "orderId": "1", "timestamp": 1, "symbol": "BTC/USDT",
+                 "side": "buy", "amount": 1.0, "price": 100.0},
+                {"id": "2_0", "orderId": "2", "timestamp": 2, "symbol": "BTC/USDT",
+                 "side": "sell", "amount": 1.0, "price": 90.0},
+                {"id": "1_0", "orderId": "1", "timestamp": 11, "symbol": "ETH/USDT",
+                 "side": "buy", "amount": 2.0, "price": 100.0},
+                {"id": "2_0", "orderId": "2", "timestamp": 12, "symbol": "ETH/USDT",
+                 "side": "sell", "amount": 2.0, "price": 110.0}
+            ],
+            "replace_fills": true,
+            "engine_id": "e1",
+            "entry_protections": Value::Object(protections),
+            "exit_reasons": Value::Object(reasons),
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": {"start_ms": 0, "reveal_start_ms": 0, "end_ms": 100}
+        }))
+        .expect("sync with two coins");
+        eng.handle_command(1, sync);
+        // BTC -10, ETH +20: the ledger both the diary and the board read.
+        assert_eq!(eng.sessions[&1].local_realized, 10.0);
+
+        let clear: ClientCmd = serde_json::from_value(json!({
+            "type": "local_sync",
+            "account": {"equity": 1010, "pnl": {"realized": 10, "unrealized": 0}},
+            "fills": [],
+            "replace_fills": false,
+            "clear_symbol": "BTC/USDT",
+            "engine_id": "e1",
+            "entry_protections": {},
+            "exit_reasons": {},
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": {"start_ms": 0, "reveal_start_ms": 0, "end_ms": 100}
+        }))
+        .expect("clear sync");
+        eng.handle_command(1, clear);
+
+        let s = &eng.sessions[&1];
+        assert_eq!(s.local_fills.len(), 2, "only BTC disappears");
+        assert!(s.local_fills.iter().all(|fill| fill["symbol"] == "ETH/USDT"));
+        assert_eq!(s.local_realized, 20.0, "PnL follows the surviving ledger");
+        assert!(!s.local_entry_protections.contains_key(&btc_plan));
+        assert!(s.local_entry_protections.contains_key(&eth_plan));
+        assert!(!s.local_exit_reasons.contains_key(&btc_exit));
+        assert!(s.local_exit_reasons.contains_key(&eth_exit));
+
+        let row = &challenge_board_json(&eng.sessions)["board"][0];
+        assert_eq!(row["pnl"], 20.0);
+        assert_eq!(row["trades"], 2, "only the ETH orders remain");
     }
 
     #[test]

@@ -123,6 +123,66 @@ export function requestLocalSync(replaceFills = false): void {
   if (ready) worker?.postMessage({ type: "snapshot", include_fills: true });
 }
 
+/** Symbol field of a fill/protection key (`id|symbol|...`). */
+function keySymbol(key: string): string {
+  return key.split("|")[1] ?? "";
+}
+
+/**
+ * Delete every trace of `symbol` from the running engine and from the server's
+ * mirrored ledger — the source the diary is reconstructed from.
+ *
+ * `store.resetSymbolData()` clears the browser's own copy. Without this the
+ * WASM engine still held the fills and the server still held them in
+ * `local_fills`, so a diary refresh (or the next full sync) brought every
+ * "deleted" trade back.
+ */
+export function clearLocalSymbol(symbol: string = getState().symbol): void {
+  if (!symbol) return;
+  const belongsToSymbol = (key: string): boolean => keySymbol(key) === symbol;
+  // These maps are merged into the server's session, so a cleared trade's stop
+  // or exit verdict has to leave both copies.
+  localEntryProtections = Object.fromEntries(
+    Object.entries(localEntryProtections).filter(([key]) => !belongsToSymbol(key)),
+  );
+  localExitReasons = Object.fromEntries(
+    Object.entries(localExitReasons).filter(([key]) => !belongsToSymbol(key)),
+  );
+  for (const key of Array.from(seenFills)) {
+    if (belongsToSymbol(key)) seenFills.delete(key);
+  }
+  pendingSyncFills = pendingSyncFills.filter((fill) => fill.symbol !== symbol);
+  // Never let a sync queued before the click replace the server's ledger with
+  // the pre-clear fills.
+  pendingSyncSnapshot = undefined;
+  replaceFillsOnNextSync = false;
+  if (syncTimer !== undefined) {
+    clearTimeout(syncTimer);
+    syncTimer = undefined;
+  }
+  pendingClearSymbol = symbol;
+  worker?.postMessage({ type: "command", command: { type: "clear_symbol", symbol } });
+  // Send the explicit clear straight away when the current account is known;
+  // otherwise the engine's answer carries it on the next mirror sync.
+  const state = getState();
+  if (syncLocal && state.account) {
+    syncLocal({
+      type: "local_sync",
+      account: displayAccount(state.account),
+      fills: [],
+      replace_fills: false,
+      clear_symbol: symbol,
+      engine_id: engineId,
+      entry_protections: localEntryProtections,
+      exit_reasons: localExitReasons,
+      symbol: state.symbol,
+      timeframe: state.timeframe,
+      exchange: state.exchange,
+      range: state.replayWindow,
+    });
+  }
+}
+
 let worker: Worker | null = null;
 let workerKey = "";
 /**
@@ -147,6 +207,12 @@ let syncLocal: ((message: ClientMessage) => void) | undefined;
  * engine is the one holding the full history) asks for a replace.
  */
 let replaceFillsOnNextSync = false;
+/**
+ * Coin deleted with the chart's trash. The next mirror sync carries it so the
+ * server drops the rows from its ledger even when the sync merges (the normal
+ * case) instead of replacing.
+ */
+let pendingClearSymbol: string | null = null;
 let pendingSyncSnapshot: LocalSnapshot | undefined;
 let pendingSyncFills: FillLine[] = [];
 let localEntryProtections: Record<string, Record<string, unknown>> = {};
@@ -256,11 +322,13 @@ function flushLocalSync(): void {
   // engine with an empty fill list, and `replace_fills` would then wipe the
   // trader's diary. An empty replace is a no-op anyway, so merge instead.
   const replaceFills = replaceFillsOnNextSync && snapshot.fills.length > 0;
+  const clearSymbol = pendingClearSymbol;
   syncLocal({
     type: "local_sync",
     account: displayAccount(snapshot.account),
     fills: replaceFills ? snapshot.fills.slice().reverse() : pendingSyncFills,
     replace_fills: replaceFills,
+    clear_symbol: clearSymbol ?? undefined,
     engine_id: engineId,
     entry_protections: localEntryProtections,
     exit_reasons: localExitReasons,
@@ -270,6 +338,7 @@ function flushLocalSync(): void {
     range: state.replayWindow,
   });
   replaceFillsOnNextSync = false;
+  pendingClearSymbol = null;
   pendingSyncSnapshot = undefined;
   pendingSyncFills = [];
 }
@@ -284,7 +353,7 @@ function queueLocalSync(snapshot: LocalSnapshot): void {
     seenFills.add(fillKey(fill));
     pendingSyncFills.push(fill);
   }
-  if (replaceFillsOnNextSync || newFills.length > 0) {
+  if (replaceFillsOnNextSync || pendingClearSymbol !== null || newFills.length > 0) {
     if (syncTimer !== undefined) clearTimeout(syncTimer);
     flushLocalSync();
   } else if (syncTimer === undefined) {

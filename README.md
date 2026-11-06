@@ -148,6 +148,10 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   destroys the session.
 - **Only the series on screen is replayed.** Switching coin or timeframe
   unloads the previous series, so off-screen stops cannot fire.
+- **The trash deletes a coin everywhere.** It clears the chart's drawings and
+  results chips, the WASM engine's fills/protections, and the server's mirrored
+  ledger the diary is rebuilt from, so a deleted trade stays gone after a diary
+  refresh. Other coins are untouched.
 - **Account and replay clock are in-memory** and die with the page. The last
   500 fills survive a reload in `localStorage`; that cache does not restore
   the account.
