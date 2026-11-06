@@ -178,6 +178,8 @@ pub struct Broker {
     wallet: Wallet,
     portfolio: Portfolio,
     fees: FeeSchedule,
+    /// Fill limit orders exactly at their written price (browser replay).
+    exact_fills: bool,
     conditional: Vec<ConditionalOrder>,
     next_conditional_id: u64,
     triggered_order_sources: HashMap<String, String>,
@@ -193,6 +195,7 @@ impl Default for Broker {
             wallet: Wallet::new(),
             portfolio: Portfolio::new(),
             fees: FeeSchedule::default(),
+            exact_fills: false,
             conditional: Vec::new(),
             next_conditional_id: 1,
             triggered_order_sources: HashMap::new(),
@@ -213,10 +216,19 @@ impl Broker {
             return;
         }
         self.market_kinds.insert(symbol.symbol.clone(), kind);
-        self.engines.insert(
-            symbol.symbol.clone(),
-            OrderEngine::with_fees(symbol.clone(), timestamp, self.fees),
-        );
+        let mut engine = OrderEngine::with_fees(symbol.clone(), timestamp, self.fees);
+        engine.set_exact_fills(self.exact_fills);
+        self.engines.insert(symbol.symbol.clone(), engine);
+    }
+
+    /// Fill limit orders exactly at their written price. Used by the browser
+    /// replay: a squeeze that wicks through a resting order must not change
+    /// the trade price from the ticket.
+    pub fn set_exact_fills(&mut self, exact: bool) {
+        self.exact_fills = exact;
+        for engine in self.engines.values_mut() {
+            engine.set_exact_fills(exact);
+        }
     }
 
     /// The wallet (immutable access).
@@ -1448,6 +1460,28 @@ mod tests {
         // Fill is logged and the base asset landed in the wallet.
         assert_eq!(b.fills(None).len(), 1);
         assert_eq!(b.wallet().balance("BTC").unwrap().total, 11.0);
+    }
+
+    #[test]
+    fn exact_fills_keep_a_squeezed_limit_at_its_written_price() {
+        let mut b = spot_broker();
+        // The browser replay turns this on: the ticket price is the fill price.
+        b.set_exact_fills(true);
+        let order = b
+            .submit_order(BrokerOrderRequest::limit(btc(), Side::Buy, 90.0, 1.0), ts())
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::New);
+
+        // A 5m squeeze wicks far through the resting 90 (down to 80).
+        b.update_midpoint("BTC/USDT", 80.0, 1e12);
+        let swept = b.sweep_resting(&btc(), 80.0, ts());
+        assert_eq!(swept.len(), 1);
+        let (filled, _) = &swept[0];
+        assert_eq!(
+            filled.average_price, 90.0,
+            "a wick must not move a resting limit away from its written price"
+        );
+        assert_eq!(b.fills(None)[0].price, 90.0);
     }
 
     #[test]

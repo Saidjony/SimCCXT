@@ -175,10 +175,12 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   before the clock reaches it (the phantom stop-out after a 1h → 1d switch). The
   coarser chart is aggregated from the same 5m bars only up to the clock, so its
   newest bar stays partial while the day forms.
-- **Fills are exact.** A market entry fills at the price in the ticket, and a
-  stop / take-profit / trailing-stop fills at its trigger, not at the next gap
-  price. Stop-limit and take-profit-limit fall back to the trigger as their
-  limit when none is given.
+- **Fills are exact.** A market entry fills at the price in the ticket, a
+  resting limit fills at the limit it was written at (a 5m squeeze that wicks
+  through it does not move the fill), and a stop / take-profit / trailing-stop
+  fills at its trigger, not at the next gap price. Stop-limit and
+  take-profit-limit fall back to the trigger as their limit when none is given.
+  Commission and funding are zero, so PnL is exactly `(exit − entry) × qty`.
 - `reset` puts the clock at the reveal boundary **and pauses**.
 - Switching coin or venue opens the new series at its own boundary, paused.
   Switching only the timeframe keeps the clock.

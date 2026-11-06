@@ -124,7 +124,7 @@ fn init(message: &Value) -> Result<(), String> {
         fee_tiers: FeeTiers {
             maker: 0.0,
             taker: 0.0,
-            funding: 0.0001,
+            funding: 0.0,
         },
         time_config: TimeConfig {
             initial_time,
@@ -135,6 +135,10 @@ fn init(message: &Value) -> Result<(), String> {
     let mut exchange = Exchange::new(config);
     exchange.deposit("USDT", 1_000_000.0);
     exchange.add_market(&symbol_value, kind);
+    // A fill must be the price written in the ticket, never the level a 5m
+    // wick happened to spike to. Fees are zero in this config, so the PnL is
+    // exactly (exit - entry) * qty.
+    exchange.broker_mut().set_exact_fills(true);
     exchange.load_candles(symbol, &feed_timeframe, candles);
     exchange.retain_candles(symbol, &feed_timeframe);
     exchange.set_step_ms(step_ms);
@@ -406,6 +410,7 @@ fn command(command: &Value) -> Result<(), String> {
                 };
                 let now_ms = engine.exchange.now_ms();
                 engine.exchange.add_market(&symbol_value, kind);
+                engine.exchange.broker_mut().set_exact_fills(true);
                 engine.exchange.load_candles(symbol, &feed_timeframe, candles);
                 // This tab replays ONE series. Dropping every previously loaded
                 // coin/interval matters: `feed_due` walks all loaded series, so
@@ -1162,6 +1167,65 @@ mod tests {
         );
         let fill = &exit_value["snapshot"]["fills"][0];
         assert_eq!(fill["price"].as_f64(), Some(90.0));
+    }
+
+    /// A 5m squeeze (a bar that wicks far through the levels) must not move
+    /// the fill away from the ticket: entry at the written limit, stop at the
+    /// written stop, and zero fees. The wick only proves the price was reached.
+    #[test]
+    fn a_5m_squeeze_fills_exactly_at_the_written_prices_without_fees() {
+        let init = json!({
+            "type": "init",
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "start_ms": 0,
+            "step_ms": 300_000,
+            "market_kind": "linear",
+            "candles": [
+                [300_000, 100.0, 100.0, 100.0, 100.0, 10.0],
+                // The squeeze: opening 100, wicking to 80, closing back at 105.
+                [600_000, 100.0, 105.0, 80.0, 105.0, 10.0],
+                [900_000, 105.0, 108.0, 104.0, 107.0, 10.0]
+            ]
+        });
+        process_message(&serde_json::to_vec(&init).unwrap());
+        process_message(br#"{"type":"step","steps":1}"#);
+
+        // A limit entry at 100 with a stop at 90 (the ticket's own prices).
+        let order = json!({
+            "type": "place_order",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "order_type": "limit",
+            "quantity": 1.0,
+            "price": 100.0,
+            "stop_loss_price": 90.0,
+            "risk_usdt": 10.0
+        });
+        let placed: Value =
+            serde_json::from_slice(&process_message(&serde_json::to_vec(&order).unwrap())).unwrap();
+        assert_eq!(placed["ok"], true, "{placed}");
+        let entry = &placed["snapshot"]["fills"][0];
+        assert_eq!(entry["price"].as_f64(), Some(100.0), "entry must fill at the ticket price");
+        assert_eq!(entry["fee"].as_f64(), Some(0.0), "no commission");
+
+        // The squeeze bar takes the price below the stop.
+        let squeeze: Value =
+            serde_json::from_slice(&process_message(br#"{"type":"step","steps":1}"#)).unwrap();
+        let exit = &squeeze["snapshot"]["fills"][0];
+        assert_eq!(
+            exit["price"].as_f64(),
+            Some(90.0),
+            "the wick to 80 must not move the stop fill: {squeeze}"
+        );
+        assert_eq!(exit["timestamp"].as_i64(), Some(600_000));
+        let account = &squeeze["snapshot"]["account"];
+        assert_eq!(account["pnl"]["fees"].as_f64(), Some(0.0));
+        let realized = account["pnl"]["realized"].as_f64().unwrap();
+        assert!(
+            (realized + 10.0).abs() < 1e-9,
+            "a 1.0 position stopped 10 points lower must lose exactly 10, got {realized}"
+        );
     }
 
     #[test]
