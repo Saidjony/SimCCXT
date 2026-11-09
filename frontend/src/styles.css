@@ -306,16 +306,23 @@ td, th { padding: 3px 4px; }
 .coin-ohlc { font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 2px; }
 .coin-status { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .chart-tools { position: absolute; bottom: 14px; right: 14px; z-index: 6; display: flex; gap: 6px; }
-/* Drawing toolbar docked top-right inside the chart. */
+/* Drawing toolbar docked vertically on the chart's left edge, TradingView style. */
 .drawbar {
-  position: absolute; top: 12px; right: 82px; z-index: 6;
-  display: flex; flex-direction: row; gap: 4px;
+  position: absolute; top: 50%; left: 12px; z-index: 6;
+  transform: translateY(-50%);
+  display: flex; flex-direction: column; gap: 3px;
+  max-height: calc(100% - 6px); overflow-y: auto;
   background: rgba(11, 14, 19, 0.72); border: 1px solid var(--line);
   border-radius: 10px; padding: 6px;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent;
 }
+.drawbar::-webkit-scrollbar { width: 4px; }
+.drawbar::-webkit-scrollbar-thumb { background: var(--line); border-radius: 2px; }
+.drawbar-sep { height: 1px; background: var(--line); margin: 1px 2px; flex: 0 0 auto; }
 .tool-btn {
   background: transparent; border: 1px solid transparent; color: var(--muted);
-  border-radius: 7px; padding: 5px; cursor: pointer; line-height: 0;
+  border-radius: 7px; padding: 3px; cursor: pointer; line-height: 0;
+  flex: 0 0 auto;
 }
 .tool-btn:hover { background: #2a3342; color: var(--text); }
 .tool-btn.active { background: rgba(74, 158, 196, 0.2); color: var(--accent); border-color: var(--accent); }

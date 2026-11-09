@@ -753,7 +753,22 @@ export function Chart(): JSX.Element {
       }}
     >
       <div ref={containerRef} className="chart" />
-      <DrawBar />
+      <DrawBar
+        magnet={magnet}
+        onToggleMagnet={() => setMagnet(!magnet)}
+        onScreenshot={async () => {
+          try {
+            const canvas = await chartRef.current?.takeScreenshot?.(true, true);
+            if (canvas) {
+              const dataUrl = canvas.toDataURL("image/png");
+              const a = document.createElement("a");
+              a.href = dataUrl;
+              a.download = `simccxt-${Date.now()}.png`;
+              a.click();
+            }
+          } catch {}
+        }}
+      />
       <div className="coin-info">
         <div className="coin-sym">{symbol}</div>
         {hover && (
@@ -783,31 +798,6 @@ export function Chart(): JSX.Element {
           }}
         >
           Follow: {follow ? "ON" : "OFF"}
-        </button>
-        <button
-          className={`btn b-dim ${magnet ? "b-acc" : ""}`}
-          title="Магнит (чёткое чтение цены с курсора)"
-          onClick={() => setMagnet(!magnet)}
-        >
-          🧲 {magnet ? "ON" : "OFF"}
-        </button>
-        <button
-          className="btn b-dim"
-          title="Скриншот (v5.2.1 takeScreenshot)"
-          onClick={async () => {
-            try {
-              const canvas = await chartRef.current?.takeScreenshot?.(true, true);
-              if (canvas) {
-                const dataUrl = canvas.toDataURL("image/png");
-                const a = document.createElement("a");
-                a.href = dataUrl;
-                a.download = `simccxt-${Date.now()}.png`;
-                a.click();
-              }
-            } catch {}
-          }}
-        >
-          📸
         </button>
       </div>
     </div>
