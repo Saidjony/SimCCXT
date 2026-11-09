@@ -1291,9 +1291,16 @@ impl Engine {
                 }
                 let mut ledger_changed;
                 if replace_fills {
-                    s.local_fills = fills;
+                    // Replace only THIS engine's rows. A reopened tab restores
+                    // the fills of earlier engine instances under their own
+                    // ids; wiping the whole mirror here would erase that
+                    // history again on the next resync.
+                    s.local_fills
+                        .retain(|fill| fill["engine_id"].as_str() != Some(engine_id.as_str()));
+                    s.local_fills.extend(fills);
                     ledger_changed = true;
-                } else {                    // Dedupe by the WHOLE fill, not by `id` alone: the id is
+                } else {
+                    // Dedupe by the WHOLE fill, not by `id` alone: the id is
                     // `orderId_fillIndex`, and order ids restart at 1 for every
                     // symbol engine. BTC's fill #1 and ETH's fill #1 share the
                     // bare id, so dropping the second one left the diary with a
@@ -2014,8 +2021,7 @@ impl Engine {
             // Which engine instance produced each trade (parallel to `trades`).
             let mut trade_engine: Vec<String> = Vec::new();
             let mut positions: Vec<diary::OpenPosition> = Vec::new();
-            let group_count = groups.len();
-            for (group_index, (engine, fills)) in groups.into_iter().enumerate() {
+            for (engine, fills) in groups {
                 // The server exchange returns newest-first, while local sync
                 // stores browser fills oldest-first. Normalize both to
                 // chronological order.
@@ -2046,8 +2052,9 @@ impl Engine {
                 }
                 // Only the live engine holds real open positions: an older
                 // page's leftover lot was abandoned when that page closed.
-                if engine == current_engine || (positions.is_empty() && group_index + 1 == group_count)
-                {
+                // Falling back to the last group (usually restored history)
+                // made the diary invent an open position after reopening.
+                if engine == current_engine {
                     positions = group_positions;
                 }
             }

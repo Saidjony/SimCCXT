@@ -153,8 +153,9 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   ledger the diary is rebuilt from, so a deleted trade stays gone after a diary
   refresh. Other coins are untouched.
 - **Account and replay clock are in-memory** and die with the page. The last
-  500 fills survive a reload in `localStorage`; that cache does not restore
-  the account.
+  500 fills survive a reload in `localStorage` and are re-mirrored into a fresh
+  server session, so the diary still lists them after the tab is closed and
+  reopened; that cache does not restore the account.
 
 ## CCXT surface
 

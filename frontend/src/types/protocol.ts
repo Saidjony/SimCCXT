@@ -59,6 +59,13 @@ export interface FillLine {
   timestamp: number;
   datetime: string;
   maker: boolean;
+  /**
+   * Engine instance that produced the fill. The server adds it to every
+   * mirrored fill; the browser persists it with the trade history so a
+   * reload can restore each page's fills under the instance that owns them
+   * (order ids restart at 1, so mixing instances would invent trades).
+   */
+  engine_id?: string;
 }
 
 export interface AccountSnapshot {
@@ -271,6 +278,7 @@ export type ClientMessage =
       type: "local_sync";
       account: AccountSnapshot;
       fills: FillLine[];
+      /** Replace this engine's rows; fills mirrored under other engine ids stay. */
       replace_fills?: boolean;
       /** Explicit trash: drop this symbol's trades/protections from the mirror. */
       clear_symbol?: string;
