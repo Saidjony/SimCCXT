@@ -16,7 +16,6 @@ import type {
   UTCTimestamp,
 } from "lightweight-charts";
 import type { CandleRow, DiaryData, DiaryPosition, DiaryTrade } from "../types/protocol";
-import { formatTs } from "../types/protocol";
 import type { ExchangeId } from "../types/protocol";
 import { apiUrl } from "../websocket/connection";
 import {
@@ -24,6 +23,7 @@ import {
   diaryMarkers,
   diarySymbols,
   fmtChartTime,
+  fmtDuration,
   fmtPnl,
   fmtPrice,
   markersOutsideCandles,
@@ -59,7 +59,7 @@ function fmtExcursion(r: number | null, pct: number | null, sign: "+" | "−"): 
 }
 
 interface SortState {
-  by: "time" | "r" | "pnl";
+  by: "time" | "duration" | "r" | "pnl";
   dir: "asc" | "desc";
 }
 
@@ -95,7 +95,12 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
     const m = sort.dir === "asc" ? 1 : -1;
     if (sort.by === "r") rows.sort((a, b) => m * (a.r - b.r));
     else if (sort.by === "pnl") rows.sort((a, b) => m * (a.pnl - b.pnl));
-    else rows.sort((a, b) => m * (a.entry_time_ms - b.entry_time_ms));
+    else if (sort.by === "duration") {
+      rows.sort(
+        (a, b) =>
+          m * ((a.exit_time_ms - a.entry_time_ms) - (b.exit_time_ms - b.entry_time_ms)),
+      );
+    } else rows.sort((a, b) => m * (a.entry_time_ms - b.entry_time_ms));
     return rows;
   }, [visibleTrades, sort]);
 
@@ -372,11 +377,11 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
               <tr>
                 <th
                   className="sortable"
-                  onClick={() => setSort(toggleSort(sort, "time"))}
+                  title="Сколько времени сделка была открыта (от входа до выхода)"
+                  onClick={() => setSort(toggleSort(sort, "duration"))}
                 >
-                  Вход {sortLabel(sort, "time")}
+                  В сделке {sortLabel(sort, "duration")}
                 </th>
-                <th>Выход</th>
                 <th>Символ</th>
                 <th>Сторона</th>
                 <th className="num">Кол-во</th>
@@ -423,8 +428,7 @@ export function TraderDiary({ nick }: { nick: string }): JSX.Element {
                     className={sel ? "sel" : ""}
                     onClick={() => setSelectedRef(sel ? "" : ref)}
                   >
-                    <td>{formatTs(t.entry_time_ms)}</td>
-                    <td>{formatTs(t.exit_time_ms)}</td>
+                    <td>{fmtDuration(t.entry_time_ms, t.exit_time_ms)}</td>
                     <td>{t.symbol}</td>
                     <td className={t.side === "long" ? "pos" : "neg"}>
                       {t.side === "long" ? "LONG" : "SHORT"}
