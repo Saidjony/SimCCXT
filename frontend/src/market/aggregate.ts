@@ -4,9 +4,9 @@ import { BASE_TIMEFRAME, TIMEFRAME_MS, type Timeframe, factorOf } from "./timefr
 /**
  * Aggregate base (5m) bars into `timeframe` buckets.
  *
- * This is the ONE aggregation the terminal uses: the replay engine, the chart
- * panes and the open-interest pane all go through here, so a 1h bar on the main
- * chart is byte-identical to the 1h bar on a lower pane.
+ * This is the ONE aggregation the terminal uses: the replay engine and every
+ * chart go through here, so a 1h bar on the main chart is byte-identical to
+ * the 1h bar on a mini chart.
  *
  * Buckets align to absolute multiples of the target step (UTC days for 1d),
  * exactly like exchange klines: the bucket's time is its OPEN time.
@@ -68,36 +68,6 @@ export function barsFor(
   fed: number,
 ): CandleRow[] {
   return aggregateCandles(visibleBase(base, fed), timeframe);
-}
-
-/**
- * Aggregate an open-interest series into `timeframe` buckets for the chart.
- *
- * OI samples arrive on a grid the venue has (5m, 15m, 1h, ...), not
- * necessarily ours. For a target of 1h or 1d each bucket takes the LAST sample
- * inside it — the value the market had by the end of that hour/day — and
- * buckets with no sample are skipped, never filled or scaled: an eight-hour gap
- * must stay an eight-hour gap (multiplying samples by bars-per-bucket turns one
- * 5m observation into 288 hours' worth).
- */
-export function aggregateOi(
-  samples: ReadonlyArray<readonly [number, number]>,
-  timeframe: Timeframe,
-): Array<[number, number]> {
-  if (samples.length === 0) return [];
-  const step = TIMEFRAME_MS[timeframe];
-  const out: Array<[number, number]> = [];
-  let bucketStart = Number.NaN;
-  for (const [ts, value] of samples) {
-    const bucket = Math.floor(ts / step) * step;
-    if (bucket === bucketStart) {
-      out[out.length - 1] = [bucket, value];
-    } else {
-      bucketStart = bucket;
-      out.push([bucket, value]);
-    }
-  }
-  return out;
 }
 
 /** How many base bars one chart bar covers (for labels: "1 bar = 12 × 5m"). */

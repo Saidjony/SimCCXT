@@ -26,8 +26,6 @@ ticket with a mandatory stop, a shared challenge board and a post-trade diary.
 - **Chart workspace** — main chart + two independent charts (5m/1h/1d by
   default), draggable split, per-chart timeframe, expand to full screen.
   Lightweight Charts primitives only: no HTML/SVG overlay.
-- **OI and CVD** as native sub-panes of the main chart (one clock, one
-  crosshair, one zoom), revealed with the replay clock.
 - **Volume profile** over the visible range, 64 levels, POC marked.
 - **Drawings** — ray, replay barrier, zone, long/short position, ruler.
 - **Replay** — `Space` play/pause, `→` one bar, `Home` reset, speed hotkeys;
@@ -123,7 +121,7 @@ and `VITE_WS_URL` / `VITE_API_URL` override them.
 ```
 src/core            Symbol, Order, Trade, Position, Balance, ...
 src/clock           controlled time (step/run/seek/pause/reset)
-src/market          order book, ticker, funding, open interest, candles
+src/market          order book, ticker, funding, candles
 src/storage         in-memory / CSV storage
 src/event-bus       synchronous pub/sub (deterministic)
 src/exchange        CCXT facade (fetch_*, create_order, cancel_order)
@@ -150,15 +148,20 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   destroys the session.
 - **Only the series on screen is replayed.** Switching coin or timeframe
   unloads the previous series, so off-screen stops cannot fire.
+- **The trash deletes a coin everywhere.** It clears the chart's drawings and
+  results chips, the WASM engine's fills/protections, and the server's mirrored
+  ledger the diary is rebuilt from, so a deleted trade stays gone after a diary
+  refresh. Other coins are untouched.
 - **Account and replay clock are in-memory** and die with the page. The last
-  500 fills survive a reload in `localStorage`; that cache does not restore
-  the account.
+  500 fills survive a reload in `localStorage` and are re-mirrored into a fresh
+  server session, so the diary still lists them after the tab is closed and
+  reopened; that cache does not restore the account.
 
 ## CCXT surface
 
 - `fetch_ohlcv`, `fetch_ticker`, `fetch_order_book`, `fetch_trades`
 - `fetch_balance`, `fetch_positions`, `fetch_open_orders`
-- `fetch_funding_rate`, `fetch_open_interest`
+- `fetch_funding_rate`
 - `create_order` — market, limit, stop, stop-limit, take-profit,
   take-profit-limit, trailing-stop, post-only, IOC, FOK, reduce-only
 - `cancel_order`
@@ -171,6 +174,18 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
 - Bars at or before the clock are visible; later bars are revealed one at a
   time. 1h/1d panes re-bucket the same revealed 5m bars, so all panels agree.
 - One tick = one 5m bar.
+- **Triggering is timeframe-independent.** Orders are always checked against
+  the revealed 5m path, never against the chart's interval. A 1d bar contains a
+  whole day; feeding it at the day's open would expose the afternoon's low hours
+  before the clock reaches it (the phantom stop-out after a 1h → 1d switch). The
+  coarser chart is aggregated from the same 5m bars only up to the clock, so its
+  newest bar stays partial while the day forms.
+- **Fills are exact.** A market entry fills at the price in the ticket, a
+  resting limit fills at the limit it was written at (a 5m squeeze that wicks
+  through it does not move the fill), and a stop / take-profit / trailing-stop
+  fills at its trigger, not at the next gap price. Stop-limit and
+  take-profit-limit fall back to the trigger as their limit when none is given.
+  Commission and funding are zero, so PnL is exactly `(exit − entry) × qty`.
 - `reset` puts the clock at the reveal boundary **and pauses**.
 - Switching coin or venue opens the new series at its own boundary, paused.
   Switching only the timeframe keeps the clock.
@@ -182,8 +197,6 @@ server (sessions, challenge, diary) ◀── throttled account/fill mirror
   window is never fetched twice; a stale window fetches only trailing bars.
 - The watchlist is warmed in the background one coin at a time to respect the
   venue's per-IP rate limit.
-- Open interest is context only, requested on the chart's grid where the venue
-  exposes it.
 - **Fallback when the venue is unreachable.** Some networks (region/IP blocks,
   corporate proxies, CORS) cannot reach `api.binance.com` from the browser.
   The direct request is always tried first; only if it fails, the page asks its

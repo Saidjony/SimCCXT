@@ -154,6 +154,11 @@ pub struct OrderEngine {
     book: OrderBook,
     open_orders: HashMap<String, Order>,
     fees: FeeSchedule,
+    /// When set, a limit order fills at its own limit price instead of at a
+    /// better book level. The browser replay turns this on so a 5m wick that
+    /// spikes through a resting order cannot change the price the trader
+    /// wrote: the fill is always the ticket's limit.
+    exact_fills: bool,
     next_order_id: u64,
 }
 
@@ -166,6 +171,7 @@ impl OrderEngine {
             book,
             open_orders: HashMap::new(),
             fees: FeeSchedule::default(),
+            exact_fills: false,
             next_order_id: 1,
         }
     }
@@ -175,6 +181,14 @@ impl OrderEngine {
         let mut engine = Self::new(symbol, timestamp);
         engine.fees = fees;
         engine
+    }
+
+    /// Fill limit orders exactly at their limit price (no price improvement
+    /// from a wick that traded through the level). Off by default; the browser
+    /// replay enables it so a fill always matches the price written in the
+    /// ticket.
+    pub fn set_exact_fills(&mut self, exact: bool) {
+        self.exact_fills = exact;
     }
 
     /// The symbol this engine matches.
@@ -444,7 +458,10 @@ impl OrderEngine {
                 continue;
             }
             let fill = remaining.min(level.amount);
-            fills.push((level.price, fill));
+            // Exact mode: the trader gets the price they wrote, even when the
+            // bar traded through it. A 5m wick must not move the fill.
+            let fill_price = if self.exact_fills { limit_price } else { level.price };
+            fills.push((fill_price, fill));
             level.amount -= fill;
             remaining -= fill;
         }

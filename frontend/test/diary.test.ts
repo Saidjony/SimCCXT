@@ -8,6 +8,7 @@ import {
   diaryMarkers,
   diarySymbols,
   fmtChartTime,
+  fmtDuration,
   fmtPnl,
   fmtPrice,
   markersOutsideCandles,
@@ -330,6 +331,24 @@ describe("formatters", () => {
     assert.equal(fmtChartTime(Date.UTC(2026, 0, 1, 0, 0)), "01-01 00:00");
     assert.equal(fmtChartTime(0), "", "unset times get no label");
     assert.equal(fmtChartTime(NaN), "");
+  });
+
+  it("fmtDuration shows how long the trade was open, in two units at most", () => {
+    const t0 = Date.UTC(2026, 8, 5, 12, 0, 0);
+    assert.equal(fmtDuration(t0, t0 + 45_000), "45с");
+    assert.equal(fmtDuration(t0, t0 + 90_000), "1м 30с");
+    assert.equal(fmtDuration(t0, t0 + 5 * 60_000), "5м");
+    assert.equal(fmtDuration(t0, t0 + (2 * 60 + 5) * 60_000), "2ч 5м");
+    assert.equal(fmtDuration(t0, t0 + 3 * 3_600_000), "3ч");
+    assert.equal(fmtDuration(t0, t0 + (2 * 24 + 4) * 3_600_000), "2д 4ч");
+    assert.equal(fmtDuration(t0, t0 + 3 * 24 * 3_600_000), "3д");
+    // Sub-second and rounded-up durations must not read "0с"/"59с".
+    assert.equal(fmtDuration(t0, t0), "<1с");
+    assert.equal(fmtDuration(t0, t0 + 59_700), "1м");
+    // Missing or reversed stamps get no invented duration.
+    assert.equal(fmtDuration(0, t0 + 60_000), "—");
+    assert.equal(fmtDuration(t0 + 60_000, t0), "—");
+    assert.equal(fmtDuration(Number.NaN, t0), "—");
   });
 
   it("fmtPrice keeps 2 decimals for normal prices", () => {

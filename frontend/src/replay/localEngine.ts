@@ -9,7 +9,7 @@ import type {
 import { getState, store } from "../state/store";
 import type { ClientMessage } from "../types/protocol";
 import { aggregateCandles } from "../market/aggregate";
-import { peekBaseBars, loadBaseBars, loadOi } from "../market/provider";
+import { peekBaseBars, loadBaseBars } from "../market/provider";
 import {
   BASE_TIMEFRAME,
   TIMEFRAME_MS,
@@ -17,6 +17,12 @@ import {
   timeframeOr,
   type Timeframe,
 } from "../market/timeframes";
+import {
+  fillIdentity,
+  groupHistory,
+  tagEngineFills,
+  type HistoryGroup,
+} from "./historyRestore";
 
 interface LocalSnapshot {
   type: "snapshot";
@@ -28,8 +34,7 @@ interface LocalSnapshot {
   account: AccountSnapshot;
   replay: ReplayState;
   fills: FillLine[];
-  oi?: Array<[number, number]> | null;
-  oi_period?: string;
+  last_price?: number;
   range: { reveal_reset_ms: number; end_ms: number };
   entry_protections?: Record<string, Record<string, unknown>>;
   exit_reasons?: Record<string, string>;
@@ -124,6 +129,87 @@ export function requestLocalSync(replaceFills = false): void {
   if (ready) worker?.postMessage({ type: "snapshot", include_fills: true });
 }
 
+/**
+ * Re-mirror the trade history this browser persisted into a fresh server
+ * session.
+ *
+ * Closing the tab drops the `sessionStorage` token, so the server starts with
+ * an empty `local_fills` while the Trades table is rebuilt from localStorage.
+ * The WASM engine replays the market but never re-creates old executions, so
+ * without this the diary of a reopened site stays empty. Fills are restored
+ * under the engine instance that produced them; legacy rows without an id go
+ * under one stable id.
+ */
+export function restoreLocalHistory(): void {
+  restoreHistoryOnNextSync = true;
+  // The engine may already be running (server restart, not a page reload) and
+  // hold fills that `pendingSyncFills` considers already seen. Send its whole
+  // snapshot once so a fresh session gets them too.
+  mirrorAllFillsOnNextSync = true;
+  if (ready) worker?.postMessage({ type: "snapshot", include_fills: true });
+}
+
+/** Symbol field of a fill/protection key (`id|symbol|...`). */
+function keySymbol(key: string): string {
+  return key.split("|")[1] ?? "";
+}
+
+/**
+ * Delete every trace of `symbol` from the running engine and from the server's
+ * mirrored ledger — the source the diary is reconstructed from.
+ *
+ * `store.resetSymbolData()` clears the browser's own copy. Without this the
+ * WASM engine still held the fills and the server still held them in
+ * `local_fills`, so a diary refresh (or the next full sync) brought every
+ * "deleted" trade back.
+ */
+export function clearLocalSymbol(symbol: string = getState().symbol): void {
+  if (!symbol) return;
+  const belongsToSymbol = (key: string): boolean => keySymbol(key) === symbol;
+  // These maps are merged into the server's session, so a cleared trade's stop
+  // or exit verdict has to leave both copies.
+  localEntryProtections = Object.fromEntries(
+    Object.entries(localEntryProtections).filter(([key]) => !belongsToSymbol(key)),
+  );
+  localExitReasons = Object.fromEntries(
+    Object.entries(localExitReasons).filter(([key]) => !belongsToSymbol(key)),
+  );
+  persistExitReasons(localExitReasons);
+  for (const key of Array.from(seenFills)) {
+    if (belongsToSymbol(key)) seenFills.delete(key);
+  }
+  pendingSyncFills = pendingSyncFills.filter((fill) => fill.symbol !== symbol);
+  // Never let a sync queued before the click replace the server's ledger with
+  // the pre-clear fills.
+  pendingSyncSnapshot = undefined;
+  replaceFillsOnNextSync = false;
+  if (syncTimer !== undefined) {
+    clearTimeout(syncTimer);
+    syncTimer = undefined;
+  }
+  pendingClearSymbol = symbol;
+  worker?.postMessage({ type: "command", command: { type: "clear_symbol", symbol } });
+  // Send the explicit clear straight away when the current account is known;
+  // otherwise the engine's answer carries it on the next mirror sync.
+  const state = getState();
+  if (syncLocal && state.account) {
+    syncLocal({
+      type: "local_sync",
+      account: displayAccount(state.account),
+      fills: [],
+      replace_fills: false,
+      clear_symbol: symbol,
+      engine_id: engineId,
+      entry_protections: localEntryProtections,
+      exit_reasons: localExitReasons,
+      symbol: state.symbol,
+      timeframe: state.timeframe,
+      exchange: state.exchange,
+      range: state.replayWindow,
+    });
+  }
+}
+
 let worker: Worker | null = null;
 let workerKey = "";
 /**
@@ -148,8 +234,27 @@ let syncLocal: ((message: ClientMessage) => void) | undefined;
  * engine is the one holding the full history) asks for a replace.
  */
 let replaceFillsOnNextSync = false;
+/**
+ * Coin deleted with the chart's trash. The next mirror sync carries it so the
+ * server drops the rows from its ledger even when the sync merges (the normal
+ * case) instead of replacing.
+ */
+let pendingClearSymbol: string | null = null;
 let pendingSyncSnapshot: LocalSnapshot | undefined;
 let pendingSyncFills: FillLine[] = [];
+/**
+ * A fresh server session has no fills of its own, while this browser still has
+ * the history persisted in localStorage. Mirror it once, under the engine ids
+ * that produced it, or reopening the site leaves the diary empty even though
+ * the Trades table is rebuilt from that same localStorage.
+ */
+let restoreHistoryOnNextSync = false;
+/**
+ * Same situation, but for an engine that is already running (server restart):
+ * its fills are not "new", so `pendingSyncFills` would not carry them. Send
+ * the whole snapshot once instead of just the delta.
+ */
+let mirrorAllFillsOnNextSync = false;
 let localEntryProtections: Record<string, Record<string, unknown>> = {};
 let localExitReasons: Record<string, string> = {};
 let syncTimer: ReturnType<typeof setTimeout> | undefined;
@@ -161,10 +266,6 @@ const LOCAL_RENDER_INTERVAL_MS = 33;
 const LARGE_SERIES_RENDER_INTERVAL_MS = 200;
 const LARGE_SERIES_THRESHOLD = 10_000;
 const SERVER_SYNC_INTERVAL_MS = 500;
-
-function fillKey(fill: FillLine): string {
-  return `${fill.id}|${fill.symbol}|${fill.timestamp}|${fill.price}|${fill.amount}`;
-}
 
 function newEngineId(): string {
   const webCrypto = globalThis.crypto;
@@ -191,8 +292,87 @@ function persistedProtections(): Record<string, Record<string, unknown>> {
   return out;
 }
 
+// Exit verdicts ("stop" / "take") live in this module, but the diary is
+// rebuilt after a reload from what the server mirrored. Persisting them next
+// to the fills keeps the "Итог" column correct after reopening the site, not
+// just while this tab is alive.
+const EXIT_REASONS_KEY = "simccxt.trade-exit-reasons.v1";
+const EXIT_REASONS_LIMIT = 500;
+/**
+ * Stable id for fills persisted before the browser started tagging them with
+ * an engine id. It must survive reloads: re-sending the same legacy rows under
+ * a new id on every page load would let the server count them twice.
+ */
+const LEGACY_HISTORY_ENGINE_KEY = "simccxt.trade-history-engine.v1";
+
+function loadStoredExitReasons(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(EXIT_REASONS_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === "string" && value.length > 0) out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistExitReasons(reasons: Record<string, string>): void {
+  try {
+    const ids = Object.keys(reasons);
+    if (ids.length > EXIT_REASONS_LIMIT) {
+      for (const id of ids.slice(0, ids.length - EXIT_REASONS_LIMIT)) delete reasons[id];
+    }
+    window.localStorage.setItem(EXIT_REASONS_KEY, JSON.stringify(reasons));
+  } catch {
+    // Losing an exit label must never break trading.
+  }
+}
+
+function legacyHistoryEngineId(): string {
+  try {
+    const saved = window.localStorage.getItem(LEGACY_HISTORY_ENGINE_KEY);
+    if (saved) return saved;
+  } catch {
+    // private mode: fall through to an in-memory id
+  }
+  const id = `history-${newEngineId()}`;
+  try {
+    window.localStorage.setItem(LEGACY_HISTORY_ENGINE_KEY, id);
+  } catch {
+    // ignore
+  }
+  return id;
+}
+
+/**
+ * The persisted history grouped for re-mirroring into a fresh server session.
+ * The grouping/merging itself lives in `historyRestore.ts` so it stays pure
+ * and unit-tested; this wrapper only supplies the live state and storage.
+ */
+function historyGroups(clearSymbol: string | null): HistoryGroup[] {
+  return groupHistory(
+    getState().fills,
+    seenFills,
+    engineId,
+    legacyHistoryEngineId(),
+    clearSymbol,
+    persistedProtections(),
+    loadStoredExitReasons(),
+  );
+}
+
 function applyLocalSnapshot(snapshot: LocalSnapshot): void {
   const account = displayAccount(snapshot.account);
+  // The engine aggregates the chart's timeframe from the same base bars that
+  // triggered the orders, so its rows already reflect how far the clock has
+  // actually gone inside the newest bar. Prefer them: recomputing from the
+  // page's full base used to show the whole day's (future) close as "now".
+  const engineRows = snapshot.candles_delta ?? [];
   if (snapshot.full_reset) {
     // A worker restart (reload, or a fresh engine after a failure) has no
     // series of its own: this page's loaded base bars are the full history and
@@ -203,37 +383,42 @@ function applyLocalSnapshot(snapshot: LocalSnapshot): void {
     // and handed to that very worker. Erroring out here used to leave the chart
     // blank ("Локальный реплей не получил свечи для полного обновления") even
     // though the data was already loading.
-    const key = keyFor(snapshot.exchange, snapshot.symbol, snapshot.timeframe);
-    const loaded = loadedRows.get(key);
-    const base = peekBaseBars(snapshot.exchange, snapshot.symbol, 0, Number.MAX_SAFE_INTEGER)
-      ?? (loaded ? loaded.base : null);
-    if (!base || base.length === 0) {
-      if (base === null) {
-        // The series is still loading: its own snapshot will arrive shortly.
+    const timeframe = timeframeOr(snapshot.timeframe, BASE_TIMEFRAME);
+    let rows = engineRows;
+    if (rows.length === 0) {
+      const key = keyFor(snapshot.exchange, snapshot.symbol, snapshot.timeframe);
+      const loaded = loadedRows.get(key);
+      const base = peekBaseBars(snapshot.exchange, snapshot.symbol, 0, Number.MAX_SAFE_INTEGER)
+        ?? (loaded ? loaded.base : null);
+      if (!base || base.length === 0) {
+        if (base === null) {
+          // The series is still loading: its own snapshot will arrive shortly.
+          return;
+        }
+        store.setError("Локальный реплей не получил свечи для полного обновления");
         return;
       }
-      store.setError("Локальный реплей не получил свечи для полного обновления");
-      return;
+      rows = aggregateCandles(base, timeframe).slice(0, snapshot.replay.fed);
     }
-    const timeframe = timeframeOr(snapshot.timeframe, BASE_TIMEFRAME);
     store.applySnapshot(
       snapshot.symbol,
       snapshot.exchange,
       timeframe,
-      aggregateCandles(base, timeframe).slice(0, snapshot.replay.fed),
+      rows,
       account,
       snapshot.replay,
-      snapshot.oi ?? [],
-      snapshot.oi_period ?? "",
-      snapshot.fills,
+      tagEngineFills(snapshot.fills, engineId),
     );
   } else {
     store.applyLocalUpdate(
-      snapshot.candles_delta ?? [],
+      engineRows,
       account,
       snapshot.replay,
-      snapshot.fills,
+      tagEngineFills(snapshot.fills, engineId),
     );
+  }
+  if (snapshot.last_price !== undefined && Number.isFinite(snapshot.last_price) && snapshot.last_price > 0) {
+    store.applyMarket(snapshot.last_price);
   }
   lastRenderAt = Date.now();
 }
@@ -247,20 +432,45 @@ function flushLocalSync(): void {
   // engine with an empty fill list, and `replace_fills` would then wipe the
   // trader's diary. An empty replace is a no-op anyway, so merge instead.
   const replaceFills = replaceFillsOnNextSync && snapshot.fills.length > 0;
-  syncLocal({
-    type: "local_sync",
+  const clearSymbol = pendingClearSymbol;
+  const mirrorAll = mirrorAllFillsOnNextSync;
+  const restoreHistory = restoreHistoryOnNextSync;
+  const send = syncLocal;
+  const common = {
+    type: "local_sync" as const,
     account: displayAccount(snapshot.account),
-    fills: replaceFills ? snapshot.fills.slice().reverse() : pendingSyncFills,
-    replace_fills: replaceFills,
-    engine_id: engineId,
-    entry_protections: localEntryProtections,
-    exit_reasons: localExitReasons,
+    clear_symbol: clearSymbol ?? undefined,
     symbol: snapshot.symbol,
     timeframe: snapshot.timeframe,
     exchange: snapshot.exchange,
     range: state.replayWindow,
+  };
+  // Historical groups go first, the live engine last: the server reads the
+  // last engine id as "current" when it decides which open positions to show.
+  if (restoreHistory) {
+    for (const group of historyGroups(clearSymbol)) {
+      send({
+        ...common,
+        fills: group.fills,
+        replace_fills: false,
+        engine_id: group.engineId,
+        entry_protections: group.entryProtections,
+        exit_reasons: group.exitReasons,
+      });
+    }
+  }
+  send({
+    ...common,
+    fills: replaceFills || mirrorAll ? snapshot.fills.slice().reverse() : pendingSyncFills,
+    replace_fills: replaceFills,
+    engine_id: engineId,
+    entry_protections: localEntryProtections,
+    exit_reasons: localExitReasons,
   });
   replaceFillsOnNextSync = false;
+  restoreHistoryOnNextSync = false;
+  mirrorAllFillsOnNextSync = false;
+  pendingClearSymbol = null;
   pendingSyncSnapshot = undefined;
   pendingSyncFills = [];
 }
@@ -269,13 +479,13 @@ function queueLocalSync(snapshot: LocalSnapshot): void {
   if (!syncLocal) return;
   pendingSyncSnapshot = snapshot;
   const newFills = snapshot.fills
-    .filter((fill) => !seenFills.has(fillKey(fill)))
+    .filter((fill) => !seenFills.has(fillIdentity(fill)))
     .reverse();
   for (const fill of newFills) {
-    seenFills.add(fillKey(fill));
+    seenFills.add(fillIdentity(fill));
     pendingSyncFills.push(fill);
   }
-  if (replaceFillsOnNextSync || newFills.length > 0) {
+  if (replaceFillsOnNextSync || pendingClearSymbol !== null || newFills.length > 0) {
     if (syncTimer !== undefined) clearTimeout(syncTimer);
     flushLocalSync();
   } else if (syncTimer === undefined) {
@@ -288,10 +498,14 @@ function setLocalSnapshot(snapshot: LocalSnapshot): void {
     ...localEntryProtections,
     ...snapshot.entry_protections,
   };
+  const incomingExitReasons = snapshot.exit_reasons ?? {};
   localExitReasons = {
     ...localExitReasons,
-    ...snapshot.exit_reasons,
+    ...incomingExitReasons,
   };
+  if (Object.keys(incomingExitReasons).length > 0) {
+    persistExitReasons(localExitReasons);
+  }
   if (snapshot.entry_protections) {
     store.mergeEntryProtections(snapshot.entry_protections);
   }
@@ -378,9 +592,10 @@ export async function initializeLocalEngine(
   send: (message: ClientMessage) => void,
 ): Promise<void> {
   syncLocal = send;
-  // Re-mirror the stop/TP this tab already planned before the reload (see
-  // `persistedProtections`). Engine values still win: they are the live ones.
+  // Re-mirror the stop/TP and exit verdicts this tab already planned before
+  // the reload. Engine values still win: they are the live ones.
   localEntryProtections = { ...persistedProtections(), ...localEntryProtections };
+  localExitReasons = { ...loadStoredExitReasons(), ...localExitReasons };
   if (!isTimeframe(timeframe)) {
     store.setError(`Неизвестный таймфрейм ${timeframe}; доступны 5m, 1h и 1d`);
     return;
@@ -460,8 +675,6 @@ export async function initializeLocalEngine(
     loadedRows.set(key, { base });
     store.setSeriesLoading(null);
     store.finishPreload(1, 1, 0);
-    const oi = await loadOiForSymbol(exchange, symbol, timeframe);
-    if (requestGeneration !== generation) return;
     const stepMs = TIMEFRAME_MS[timeframe];
     if (preserveEngine) {
       const previousRange = previous.slice(3);
@@ -488,10 +701,10 @@ export async function initializeLocalEngine(
           engine_id: engineId,
           reveal_reset_ms: revealResetMs,
           range_end_ms: range.end_ms,
-          oi: oi.samples,
-          oi_period: oi.period,
           preserve_clock: preserveClock,
           candles: rows,
+          base_candles: base,
+          base_step_ms: TIMEFRAME_MS[BASE_TIMEFRAME],
         },
       });
     } else {
@@ -507,9 +720,9 @@ export async function initializeLocalEngine(
         engine_id: engineId,
         reveal_reset_ms: revealResetMs,
         range_end_ms: state.replayWindow.end_ms,
-        oi: oi.samples,
-        oi_period: oi.period,
         candles: rows,
+        base_candles: base,
+        base_step_ms: TIMEFRAME_MS[BASE_TIMEFRAME],
       });
     }
   } catch (error) {
@@ -524,20 +737,6 @@ export async function initializeLocalEngine(
     }
     store.setSeriesLoading(null);
     store.setError(`Не удалось загрузить данные с биржи: ${String(error)}`);
-  }
-}
-
-/** OI on the grid matching the chart's timeframe (empty if the venue has none). */
-async function loadOiForSymbol(
-  exchange: ExchangeId,
-  symbol: string,
-  timeframe: Timeframe,
-): Promise<{ samples: Array<[number, number]>; period: string }> {
-  try {
-    return await loadOi(exchange, symbol, timeframe);
-  } catch {
-    // OI is chart context only: a venue without it must never block replay.
-    return { samples: [], period: "" };
   }
 }
 

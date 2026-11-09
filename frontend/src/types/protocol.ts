@@ -59,6 +59,13 @@ export interface FillLine {
   timestamp: number;
   datetime: string;
   maker: boolean;
+  /**
+   * Engine instance that produced the fill. The server adds it to every
+   * mirrored fill; the browser persists it with the trade history so a
+   * reload can restore each page's fills under the instance that owns them
+   * (order ids restart at 1, so mixing instances would invent trades).
+   */
+  engine_id?: string;
 }
 
 export interface AccountSnapshot {
@@ -271,7 +278,10 @@ export type ClientMessage =
       type: "local_sync";
       account: AccountSnapshot;
       fills: FillLine[];
+      /** Replace this engine's rows; fills mirrored under other engine ids stay. */
       replace_fills?: boolean;
+      /** Explicit trash: drop this symbol's trades/protections from the mirror. */
+      clear_symbol?: string;
       /** Engine instance that produced these fills (see `localEngine.engineId`). */
       engine_id?: string;
       entry_protections: Record<string, Record<string, unknown>>;
@@ -375,13 +385,10 @@ export type ServerMessage =
       candles: CandleRow[];
       account: AccountSnapshot;
       replay: ReplayState;
-      oi: Array<[number, number]>;
-      oi_period: string;
       fills?: FillLine[];
       request_id?: string;
     }
   | { type: "candle"; to?: number; symbol: string; timeframe: string; exchange?: ExchangeId; candle: CandleRow; is_new: boolean }
-  | { type: "oi_update"; to?: number; samples: Array<[number, number]> }
   | { type: "market_update"; to?: number; symbol: string; last: number; timestamp: number }
   | { type: "account_update"; to?: number; account: AccountSnapshot }
   | { type: "order_update"; to?: number; order: OrderLine; request_id?: string }
@@ -436,7 +443,6 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "series_ack":
     case "snapshot":
     case "candle":
-    case "oi_update":
     case "market_update":
     case "account_update":
     case "order_update":

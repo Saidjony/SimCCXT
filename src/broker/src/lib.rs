@@ -178,6 +178,8 @@ pub struct Broker {
     wallet: Wallet,
     portfolio: Portfolio,
     fees: FeeSchedule,
+    /// Fill limit orders exactly at their written price (browser replay).
+    exact_fills: bool,
     conditional: Vec<ConditionalOrder>,
     next_conditional_id: u64,
     triggered_order_sources: HashMap<String, String>,
@@ -193,6 +195,7 @@ impl Default for Broker {
             wallet: Wallet::new(),
             portfolio: Portfolio::new(),
             fees: FeeSchedule::default(),
+            exact_fills: false,
             conditional: Vec::new(),
             next_conditional_id: 1,
             triggered_order_sources: HashMap::new(),
@@ -213,10 +216,19 @@ impl Broker {
             return;
         }
         self.market_kinds.insert(symbol.symbol.clone(), kind);
-        self.engines.insert(
-            symbol.symbol.clone(),
-            OrderEngine::with_fees(symbol.clone(), timestamp, self.fees),
-        );
+        let mut engine = OrderEngine::with_fees(symbol.clone(), timestamp, self.fees);
+        engine.set_exact_fills(self.exact_fills);
+        self.engines.insert(symbol.symbol.clone(), engine);
+    }
+
+    /// Fill limit orders exactly at their written price. Used by the browser
+    /// replay: a squeeze that wicks through a resting order must not change
+    /// the trade price from the ticket.
+    pub fn set_exact_fills(&mut self, exact: bool) {
+        self.exact_fills = exact;
+        for engine in self.engines.values_mut() {
+            engine.set_exact_fills(exact);
+        }
     }
 
     /// The wallet (immutable access).
@@ -926,7 +938,7 @@ impl Broker {
             // Other reduce-only exits still use the current market reference.
             let capped_protection = matches!(
                 c.order_type,
-                OrderType::Stop | OrderType::TakeProfit
+                OrderType::Stop | OrderType::TakeProfit | OrderType::TrailingStop
             ) && c.reduce_only
                 && triggered_market;
             let fill_reference = if triggered_market && (!c.reduce_only || capped_protection) {
@@ -939,6 +951,18 @@ impl Broker {
                 // settles there (same path a resting limit would take).
                 self.update_midpoint(&c.symbol.symbol, reference, 1e12);
             }
+            // A stop-limit/take-profit-limit without an explicit limit price
+            // would turn into a limit order priced at 0 and never fill. The
+            // trigger is the natural default: the trader wanted protection at
+            // that level, not a silently abandoned order.
+            let limit_price = if matches!(
+                c.order_type,
+                OrderType::StopLimit | OrderType::TakeProfitLimit
+            ) {
+                c.price.or(Some(c.trigger_price))
+            } else {
+                c.price
+            };
             let request = BrokerOrderRequest {
                 symbol: c.symbol.clone(),
                 side: c.side,
@@ -948,7 +972,7 @@ impl Broker {
                     other => other,
                 },
                 amount: c.amount,
-                price: c.price,
+                price: limit_price,
                 stop_price: None,
                 tp_price: None,
                 time_in_force: TimeInForce::GTC,
@@ -1003,6 +1027,28 @@ impl Broker {
     /// the new tail of the fill log instead of cloning and serializing all of it.
     pub fn fill_at(&self, index: usize) -> Option<&FillLog> {
         self.fill_log.get(index)
+    }
+
+    /// Delete every fill and resting order of one symbol (the chart's trash).
+    ///
+    /// The wallet and portfolio are deliberately untouched: capital and PnL are
+    /// global to the replay session, only this coin's history and its pending
+    /// protective orders must disappear. Clearing the fills here is what stops
+    /// a later full snapshot from resurrecting deleted trades in the diary.
+    pub fn clear_symbol(&mut self, symbol: &str) {
+        // Trigger orders live outside the per-symbol engine (and lock nothing).
+        self.conditional
+            .retain(|order| order.symbol.symbol.as_str() != symbol);
+        let open_ids: Vec<String> = self
+            .engines
+            .get(symbol)
+            .map(|engine| engine.open_orders().map(|order| order.id.clone()).collect())
+            .unwrap_or_default();
+        for id in open_ids {
+            let _ = self.cancel_order(symbol, &id);
+        }
+        self.fill_log
+            .retain(|fill| fill.symbol.symbol.as_str() != symbol);
     }
 }
 
@@ -1249,6 +1295,51 @@ mod tests {
     }
 
     #[test]
+    fn protective_trailing_stop_fills_at_its_trigger_after_a_gap() {
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+        b.submit_order(BrokerOrderRequest::market(btc(), Side::Buy, 1.0), ts())
+            .unwrap();
+
+        let mut trail = BrokerOrderRequest::market(btc(), Side::Sell, 1.0);
+        trail.order_type = OrderType::TrailingStop;
+        trail.stop_price = Some(90.0);
+        trail.reduce_only = true;
+        b.submit_order(trail, ts()).unwrap();
+
+        let executed = b.on_price_update(&btc(), 80.0, ts());
+        assert_eq!(executed.len(), 1);
+        assert!(
+            (executed[0].average_price - 90.0).abs() < 1e-9,
+            "trailing stop must fill at its level, not the gapped price: {:?}",
+            executed[0]
+        );
+        assert!(b.portfolio().position("BTC/USDT").is_none());
+    }
+
+    #[test]
+    fn stop_limit_without_a_limit_price_uses_its_trigger() {
+        let mut b = Broker::new();
+        b.add_market(&btc(), MarketKind::Linear, ts());
+        b.wallet_mut().deposit("USDT", 100_000.0);
+        b.engine_mut("BTC/USDT").unwrap().update_ask(100.0, 10.0);
+
+        let mut req = BrokerOrderRequest::market(btc(), Side::Buy, 1.0);
+        req.order_type = OrderType::StopLimit;
+        req.stop_price = Some(110.0);
+        // No explicit limit price: it must fall back to the trigger, not 0.
+        b.submit_order(req, ts()).unwrap();
+        b.update_midpoint("BTC/USDT", 120.0, 1e12);
+        b.on_price_update(&btc(), 120.0, ts());
+
+        let open = b.open_orders("BTC/USDT");
+        assert_eq!(open.len(), 1, "the stop-limit must rest, not vanish");
+        assert_eq!(open[0].price, Some(110.0));
+    }
+
+    #[test]
     fn protective_take_profit_fills_at_its_trigger_to_cap_replay_gain() {
         let mut b = Broker::new();
         b.add_market(&btc(), MarketKind::Linear, ts());
@@ -1391,6 +1482,57 @@ mod tests {
         // Fill is logged and the base asset landed in the wallet.
         assert_eq!(b.fills(None).len(), 1);
         assert_eq!(b.wallet().balance("BTC").unwrap().total, 11.0);
+    }
+
+    #[test]
+    fn exact_fills_keep_a_squeezed_limit_at_its_written_price() {
+        let mut b = spot_broker();
+        // The browser replay turns this on: the ticket price is the fill price.
+        b.set_exact_fills(true);
+        let order = b
+            .submit_order(BrokerOrderRequest::limit(btc(), Side::Buy, 90.0, 1.0), ts())
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::New);
+
+        // A 5m squeeze wicks far through the resting 90 (down to 80).
+        b.update_midpoint("BTC/USDT", 80.0, 1e12);
+        let swept = b.sweep_resting(&btc(), 80.0, ts());
+        assert_eq!(swept.len(), 1);
+        let (filled, _) = &swept[0];
+        assert_eq!(
+            filled.average_price, 90.0,
+            "a wick must not move a resting limit away from its written price"
+        );
+        assert_eq!(b.fills(None)[0].price, 90.0);
+    }
+
+    #[test]
+    fn clearing_a_symbol_drops_only_its_fills_and_resting_orders() {
+        let mut b = spot_broker();
+        let eth = Symbol::parse("ETH/USDT").unwrap();
+        b.add_market(&eth, MarketKind::Spot, ts());
+        b.wallet_mut().deposit("ETH", 10.0);
+        // A resting buy on BTC plus one fill on each coin.
+        b.submit_order(BrokerOrderRequest::limit(btc(), Side::Buy, 90.0, 1.0), ts())
+            .unwrap();
+        b.execute_market_at(&btc(), Side::Buy, 1.0, 100.0, ts())
+            .unwrap();
+        b.execute_market_at(&eth, Side::Buy, 1.0, 50.0, ts())
+            .unwrap();
+        assert_eq!(b.fills(None).len(), 2);
+        assert_eq!(b.open_orders("BTC/USDT").len(), 1);
+
+        b.clear_symbol("BTC/USDT");
+
+        assert!(
+            b.fills(Some("BTC/USDT")).is_empty(),
+            "deleted coin keeps no fills"
+        );
+        assert_eq!(b.fills(Some("ETH/USDT")).len(), 1, "other coins survive");
+        assert!(
+            b.open_orders("BTC/USDT").is_empty(),
+            "a deleted coin must not keep orders that could fill later"
+        );
     }
 
     #[test]

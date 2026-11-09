@@ -4,11 +4,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   aggregateCandles,
-  aggregateOi,
   barsFor,
   visibleBase,
 } from "../src/market/aggregate.ts";
-import { oiUrl } from "../src/market/exchanges.ts";
 import {
   BASE_TIMEFRAME,
   TIMEFRAMES,
@@ -126,43 +124,5 @@ describe("barsFor / visibleBase", () => {
     const rows = bars(0, 12);
     assert.equal(visibleBase(rows, 999).length, 12);
     assert.equal(barsFor(rows, "1h", 999).length, 1);
-  });
-});
-
-describe("aggregateOi", () => {
-  it("takes the last sample of each bucket", () => {
-    const samples: Array<[number, number]> = [
-      [0, 1],
-      [5 * 60_000, 2],
-      [3_600_000, 3],
-      [3_605_000, 4],
-    ];
-    assert.deepEqual(aggregateOi(samples, "1h"), [
-      [0, 2],
-      [3_600_000, 4],
-    ]);
-  });
-
-  it("never fills an empty bucket (a 5m sample must not become a whole day)", () => {
-    const samples: Array<[number, number]> = [[0, 7], [4 * 86_400_000, 9]];
-    const out = aggregateOi(samples, "1d");
-    assert.deepEqual(out, [
-      [0, 7],
-      [4 * 86_400_000, 9],
-    ]);
-  });
-
-  it("keeps fine samples untouched below the target grid and handles empty input", () => {
-    const samples: Array<[number, number]> = [[0, 1], [300_000, 2]];
-    assert.deepEqual(aggregateOi(samples, "1d"), [[0, 2]]);
-    assert.deepEqual(aggregateOi([], "1h"), []);
-  });
-});
-
-describe("oiUrl", () => {
-  it("maps the unified symbol to each venue's swap endpoint", () => {
-    assert.match(oiUrl("binance", "BTC/USDT", "5m", 500), /fapi\.binance\.com\/futures\/data\/openInterestHist\?symbol=BTCUSDT&period=5m/);
-    assert.match(oiUrl("bybit", "ETH/USDT", "1h", 100), /bybit\.com\/v5\/market\/open-interest\?category=linear&symbol=ETHUSDT&intervalTime=1h/);
-    assert.match(oiUrl("okx", "SOL/USDT", "1d", 100), /okx\.com\/api\/v5\/rubik\/stat\/contracts\/open-interest-volume\?ccy=SOL&period=1D/);
   });
 });

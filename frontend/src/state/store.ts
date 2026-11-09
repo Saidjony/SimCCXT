@@ -442,14 +442,12 @@ function persistProtections(protections: Record<string, TradeProtection>): void 
 }
 
 // ---------------------------------------------------------------------------
-// UI preferences: OI pane visibility + collapsed cards. Pure UI, per browser.
+// UI preferences: collapsed cards. Pure UI, per browser.
 // ---------------------------------------------------------------------------
 
 const UI_KEY = "simccxt.ui.v1";
 
 interface UiPrefs {
-  oiVisible: boolean;
-  cvdVisible: boolean;
   collapsedMarket: boolean;
   collapsedCriteria: boolean;
   /** Risk terminal inputs: reloading the page must not reset sizing. */
@@ -459,8 +457,6 @@ interface UiPrefs {
 
 function loadUi(): UiPrefs {
   const dflt: UiPrefs = {
-    oiVisible: true,
-    cvdVisible: true,
     collapsedMarket: false,
     collapsedCriteria: false,
     initialCapitalUsdt: 1000,
@@ -471,8 +467,6 @@ function loadUi(): UiPrefs {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<UiPrefs>;
       return {
-        oiVisible: parsed.oiVisible !== false,
-        cvdVisible: parsed.cvdVisible !== false,
         collapsedMarket: parsed.collapsedMarket === true,
         collapsedCriteria: parsed.collapsedCriteria === true,
         initialCapitalUsdt:
@@ -501,8 +495,6 @@ function persistUi(p: UiPrefs): void {
 
 function currentUi(): UiPrefs {
   return {
-    oiVisible: state.oiVisible,
-    cvdVisible: state.cvdVisible,
     initialCapitalUsdt: state.initialCapitalUsdt,
     fixedRiskUsdt: state.fixedRiskUsdt,
     collapsedMarket: state.collapsedMarket,
@@ -573,14 +565,6 @@ export interface SimState {
   inChallenge: boolean;
   /** Last challenge board broadcast by the server (no `to`: for everyone). */
   board: ChallengeEntry[];
-  /** Open-interest history from the snapshot (static context, [[ts, usdt]]). */
-  oi: Array<[number, number]>;
-  /** OI grid actually loaded ("5m", "" when none). */
-  oiPeriod: string;
-  /** Show the OI pane under the chart (TradingView-style, toggleable). */
-  oiVisible: boolean;
-  /** Show the CVD line in the bottom pane (cumulative volume delta). */
-  cvdVisible: boolean;
   /** Collapsed right-panel cards (persisted UI preference). */
   collapsedMarket: boolean;
   collapsedCriteria: boolean;
@@ -666,10 +650,6 @@ let state: SimState = {
   serverNick: "",
   inChallenge: loadUser().inChallenge,
   board: [],
-  oi: [],
-  oiPeriod: "",
-  oiVisible: initialUi.oiVisible,
-  cvdVisible: initialUi.cvdVisible,
   collapsedMarket: initialUi.collapsedMarket,
   collapsedCriteria: initialUi.collapsedCriteria,
   lastMsgAt: 0,
@@ -791,8 +771,6 @@ export const store = {
     candles: CandleRow[],
     account: AccountSnapshot,
     replay: ReplayState,
-    oi: Array<[number, number]>,
-    oiPeriod: string,
     fills: FillLine[] = [],
   ): void {
     const selectedExchange = EXCHANGE_IDS.includes(exchange) ? exchange : state.exchange;
@@ -817,8 +795,6 @@ export const store = {
       lastPrice: candles.length ? candles[candles.length - 1][4] : 0,
       account,
       replay,
-      oi,
-      oiPeriod,
       fills: mergedFills,
       error: null,
       drawings,
@@ -892,14 +868,6 @@ export const store = {
       candlesVersion: state.candlesVersion + 1,
       lastPrice: candle[4],
     });
-  },
-  applyOi(samples: Array<[number, number]>): void {
-    if (!samples.length) return;
-    const byTime = new Map(state.oi);
-    for (const [time, value] of samples) {
-      if (Number.isFinite(time) && Number.isFinite(value)) byTime.set(time, value);
-    }
-    set({ oi: [...byTime.entries()].sort((a, b) => a[0] - b[0]) });
   },
   applyMarket(last: number): void {
     set({ lastPrice: last });
@@ -1071,16 +1039,6 @@ export const store = {
   applyBoard(board: ChallengeEntry[]): void {
     set({ board });
   },
-  setOiVisible(v: boolean): void {
-    if (state.oiVisible === v) return;
-    set({ oiVisible: v });
-    persistUi({ ...currentUi(), oiVisible: v });
-  },
-  setCvdVisible(v: boolean): void {
-    if (state.cvdVisible === v) return;
-    set({ cvdVisible: v });
-    persistUi({ ...currentUi(), cvdVisible: v });
-  },
   setCollapsedMarket(v: boolean): void {
     if (state.collapsedMarket === v) return;
     set({ collapsedMarket: v });
@@ -1170,31 +1128,48 @@ export const store = {
     persistDrawings({ ...state.drawingsBySymbol, [state.symbol]: [] });
   },
   /**
-   * Forget everything this coin accumulated: its drawings, its closed trades
-   * and the stops/targets that came with them. Used by the trash button so the
-   * chart looks like a coin that was just added to the watchlist — the replay
-   * clock and the account balance are global and stay untouched.
+   * Forget everything this coin accumulated: its drawings, results checklist,
+   * closed trades and the stops/targets that came with them. Used by the trash
+   * button so the chart looks like a coin that was just added to the
+   * watchlist — the replay clock and the account balance are global and stay
+   * untouched.
+   *
+   * This is only the browser's copy. The caller must also run
+   * `clearLocalSymbol()` (see `chart/DrawBar.tsx`): the WASM engine and the
+   * server's mirrored ledger keep their own fills, and leaving them behind is
+   * exactly what made deleted trades reappear after a diary refresh.
    */
   resetSymbolData(): void {
     const symbol = state.symbol;
-    const dropped = state.fills.filter((fill) => fill.symbol === symbol);
-    if (!dropped.length && !state.drawings.length) return;
     const fills = state.fills.filter((fill) => fill.symbol !== symbol);
     const protections: Record<string, TradeProtection> = {};
     for (const [key, value] of Object.entries(state.entryProtections)) {
       // Keys are `engine|symbol|orderId|timestamp` (see `protectionKey`).
       if (protectionSymbol(key) !== symbol) protections[key] = value;
     }
+    // Results (setup checklist) are per symbol AND timeframe; drop every
+    // interval so switching the chart does not bring the chips back.
+    const chartCriteria = { ...state.chartCriteria };
+    const prefix = `${symbol}::`;
+    for (const key of Object.keys(chartCriteria)) {
+      if (key.startsWith(prefix)) delete chartCriteria[key];
+    }
+    // Keep `drawingsBySymbol` in step with the chart, otherwise switching away
+    // and back restored the "deleted" drawings from this map.
+    const drawingsBySymbol = { ...state.drawingsBySymbol, [symbol]: [] };
     set({
       drawings: [],
+      drawingsBySymbol,
+      chartCriteria,
       selectedId: null,
       fills,
       entryProtections: protections,
       lastOrder: state.lastOrder?.symbol === symbol ? null : state.lastOrder,
     });
-    persistDrawings({ ...state.drawingsBySymbol, [symbol]: [] });
-    if (dropped.length) persistFillHistory(fills);
+    persistDrawings(drawingsBySymbol);
+    persistFillHistory(fills);
     persistProtections(protections);
+    persistChartCriteria(chartCriteria);
   },
 };
 

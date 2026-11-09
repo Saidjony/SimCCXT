@@ -4,7 +4,6 @@ import {
   ColorType,
   CrosshairMode,
   HistogramSeries,
-  LineSeries,
   LineStyle,
   createChart,
   createSeriesMarkers,
@@ -26,7 +25,6 @@ import { criterionLabel } from "../trade/criteria";
 import { SPEED_DOWN_CODES, SPEED_UP_CODES, nextSpeed } from "../replay/speed";
 import {
   fillChronology,
-  formatCompactUsdt,
   formatPriceValue,
   invertTime,
   nearestCandleTime,
@@ -43,7 +41,6 @@ import { followLatest } from "./rangeSync";
 import { watchAdaptivePriceAxis } from "./adaptivePriceAxis";
 import { DrawingEngine } from "./primitives/engine";
 import type { GhostShape } from "./primitives/ghost";
-import { PaneLabelPrimitive } from "./primitives/paneLabel";
 import { setMagnetMode } from "./primitives/core";
 function toTime(ms: number): UTCTimestamp {
   return Math.floor(ms / 1000) as UTCTimestamp;
@@ -59,14 +56,6 @@ function lastAtOrBefore<T>(rows: T[], target: number, getTimestamp: (row: T) => 
   }
   return lo - 1;
 }
-
-/** Indicator pane palette: the legend chip and the line speak one colour. */
-const OI_COLOR = "#e0af68";
-const CVD_COLOR = "#4a9ec4";
-
-/** The indicator block starts at 120px (the old pane height), 72px minimum. */
-const INDICATOR_PANE_PX = 120;
-const INDICATOR_PANE_MIN = 72;
 
 function timeToMs(t: Time): number | null {
   if (typeof t === "number") return t * 1000;
@@ -115,9 +104,7 @@ const TOOL_HINTS: Record<Exclude<Tool, "none">, string> = {
  * Drawings, execution lines and the volume profile are lightweight-charts
  * primitives (see ./primitives): they are painted by the chart itself, so
  * there is no overlay DOM to keep in sync — pan, zoom and screenshot can never
- * drift them off the bars. OI and CVD are panes of the SAME chart (addPane),
- * so they share the time axis, the crosshair and every zoom for free. This
- * component only owns state and intent.
+ * drift them off the bars. This component only owns state and intent.
  */
 export function Chart(): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -130,13 +117,6 @@ export function Chart(): JSX.Element {
   const barsRef = useRef<ISeriesApi<"Bar"> | null>(null);
   const refreshPriceAxisRef = useRef<(() => void) | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  /** OI / CVD ride in their own panes of THIS chart: one clock, one axis. */
-  const oiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const cvdSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const oiLabelRef = useRef<PaneLabelPrimitive | null>(null);
-  const cvdLabelRef = useRef<PaneLabelPrimitive | null>(null);
-  /** Pane factors we applied last: any change means the user dragged a separator. */
-  const specFactorsRef = useRef<number[] | null>(null);
   /** Cursor we put on the chart root for a hovered barrier (see the crosshair handler). */
   const cursorOverrideRef = useRef<{ element: HTMLElement; previous: string } | null>(null);
   const pendingRef = useRef<Pt[]>([]);
@@ -153,10 +133,10 @@ export function Chart(): JSX.Element {
   } | null>(null);
   /** Window listeners of the in-flight drawing drag (drop or unmount). */
   const dragCleanupRef = useRef<(() => void) | null>(null);
-  /** Pan/zoom flags parked while a drawing is being dragged. */
-  const parkedChartOptionsRef = useRef<
-    Partial<ReturnType<IChartApi["options"]>> | null
-  >(null);
+  /** True while a freehand stroke owns the chart (pan/zoom stay parked). */
+  const strokeActiveRef = useRef(false);
+  /** Last pan/zoom lock we applied (avoids reading options on every mousemove). */
+  const interactionsLockedRef = useRef(false);
   /** Mouse-down anchor for manual click detection (pan-safe placement). */
   const [magnet, setMagnet] = useState(false);
   const brushPointsRef = useRef<Array<{ t: number; p: number }>>([]); // freehand stroke points
@@ -165,11 +145,6 @@ export function Chart(): JSX.Element {
   const suppressClickRef = useRef(false);
   const versionRef = useRef(0);
   const chartCandleCountRef = useRef(0);
-  const cvdValuesRef = useRef<number[]>([]);
-  /** Incremental CVD state: length + running sum of the rendered line. */
-  const cvdRef = useRef({ len: 0, sum: 0, lastTime: 0, lastDelta: 0, first: 0 });
-  /** OI forward-fill signature: skip full rebuilds when nothing moved. */
-  const oiSigRef = useRef("");
   /** Bars already painted (rAF may batch several WS candles into one render). */
   const renderedRef = useRef({ len: 0, first: 0 });
   const [follow, setFollow] = useState(true);
@@ -199,19 +174,10 @@ export function Chart(): JSX.Element {
   const selectedId = useSim((s) => s.selectedId);
   const positionSizeUsdt = useSim((s) => s.positionSizeUsdt);
   const criteria = useSim((s) => s.chartCriteria[chartCriteriaKey(s.symbol, s.timeframe)] ?? []);
-  const oiVisible = useSim((s) => s.oiVisible);
-  const cvdVisible = useSim((s) => s.cvdVisible);
-  const oiPeriod = useSim((s) => s.oiPeriod);
-  const oiData = useSim((s) => s.oi);
-  const replayNow = useSim((s) => s.replay.now_ms);
   /** Changes only when a NEW bar appears (the forming bar keeps its time). */
   const candleLen = useSim((s) => s.candles.length);
   const toolRef = useRef(tool);
   toolRef.current = tool;
-  const marketData = getState();
-  const oiLabel = marketData.oi.length === 0
-    ? "OI · нет данных"
-    : "OI · " + (oiPeriod || "история");
 
   // Magnet: switch the crosshair itself between free and magnet snapping
   // (lightweight-charts does the bar/time snap natively), plus our flag for
@@ -223,19 +189,32 @@ export function Chart(): JSX.Element {
     });
   }, [magnet]);
 
-  // Brush: freeze pan/zoom while the tool is armed so the chart stays still
-  // during a freehand stroke. The frozen state follows the TOOL, not mouse
-  // events — it restores the moment the tool is disarmed (Escape, another
-  // tool, or stroke end), so it can never get stuck.
-  useEffect(() => {
+  /**
+   * Pan/zoom are disabled ONLY while something actively owns the pointer:
+   * dragging a drawing or painting a freehand stroke. Every entry/exit path
+   * calls this, and the wrapper also calls it on the next mouse event, so the
+   * chart can never be left with `handleScroll: false` (the "frozen chart"
+   * users hit after a drag/stroke that ended outside the chart).
+   */
+  function syncChartInteractions(verify = false): void {
     const chart = chartRef.current;
     if (!chart) return;
-    if (tool === "brush") {
-      chart.applyOptions({ handleScroll: false, handleScale: false });
-    } else {
-      chart.applyOptions({ handleScroll: true, handleScale: true });
+    const locked = dragRef.current !== null || strokeActiveRef.current;
+    if (!verify && locked === interactionsLockedRef.current) return;
+    if (verify) {
+      const scroll = chart.options().handleScroll;
+      const lockedNow =
+        typeof scroll === "boolean"
+          ? !scroll
+          : scroll.pressedMouseMove === false && scroll.mouseWheel === false;
+      if (lockedNow === locked) {
+        interactionsLockedRef.current = locked;
+        return;
+      }
     }
-  }, [tool]);
+    interactionsLockedRef.current = locked;
+    chart.applyOptions({ handleScroll: !locked, handleScale: !locked });
+  }
 
   // Create the chart once.
   useEffect(() => {
@@ -248,13 +227,6 @@ export function Chart(): JSX.Element {
         background: { type: ColorType.Solid, color: "#0b0e13" },
         textColor: "#c9d1d9",
         fontSize: 12,
-        // Native pane separators: one 1px rule between the price pane and the
-        // indicator panes, draggable (row-resize) exactly like TradingView's.
-        panes: {
-          enableResize: true,
-          separatorColor: "#222c3b",
-          separatorHoverColor: "rgba(74, 158, 196, 0.35)",
-        },
       },
       grid: {
         vertLines: { color: "#1b2330" },
@@ -264,11 +236,9 @@ export function Chart(): JSX.Element {
         mode: CrosshairMode.Normal,
         vertLine: { style: LineStyle.Dashed },
       },
-      // One right-axis width for EVERY pane (the layout takes the widest
-      // label across panes, floored by minimumWidth): identical gutters from
-      // birth, so the same timestamp always lands on the same x in the price,
-      // OI and CVD panes — with no read-measure-apply race as data arrives.
-      // No left gutter: every pane stretches to the left edge.
+      // One right-axis width for the chart (the layout takes the widest label,
+      // floored by minimumWidth), so the price scale never jumps while data
+      // arrives. No left gutter: the chart stretches to the left edge.
       rightPriceScale: { borderColor: "#222c3b", minimumWidth: 96 },
       leftPriceScale: { visible: false },
       timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
@@ -276,12 +246,11 @@ export function Chart(): JSX.Element {
     const onSharedCrosshair: Parameters<typeof subscribeCrosshair>[0] = ({ position }) => {
       if (!position) {
         lastAppliedRef.current = null;
-        chart.clearCrosshairPosition(); // one call hides every pane's cursor
+        chart.clearCrosshairPosition(); // one call hides the cursor
         return;
       }
-      // ONE shared time cursor for every pane: snap to the main candle grid
-      // so the price, OI and CVD panes all draw their vertical line at the
-      // same x (previously OI used its own 5m-grid time — hence the spread).
+      // ONE shared time cursor: snap to the main candle grid so the
+      // crosshair always lands on a real bar.
       const sharedTimestamp = nearestCandleTime(candleTimesRef.current, position.timestamp);
       if (sharedTimestamp === null) {
         lastAppliedRef.current = null;
@@ -300,25 +269,10 @@ export function Chart(): JSX.Element {
       } else {
         chart.clearCrosshairPosition();
       }
-      // Indicator panes: setCrosshairPosition is per pane, so OI and CVD get
-      // their own horizontal level while the price pane keeps the cursor's.
-      const oiSeries = oiSeriesRef.current;
-      if (oiSeries) {
-        const oiRows = getState().oi;
-        const oiIndex = lastAtOrBefore(oiRows, sharedTimestamp, (row) => row[0]);
-        if (oiIndex >= 0) chart.setCrosshairPosition(oiRows[oiIndex][1], time, oiSeries);
-      }
-      const cvdSeries = cvdSeriesRef.current;
-      if (cvdSeries) {
-        const cvdValue = cvdValuesRef.current[candleIndex];
-        if (candleIndex >= 0 && cvdValue !== undefined) {
-          chart.setCrosshairPosition(cvdValue, time, cvdSeries);
-        }
-      }
       window.requestAnimationFrame(() => {
         applyingCrosshairRef.current = false;
-        // Flush the hover coalesced during the sync (otherwise the panes
-        // freeze one step behind the cursor when it stops moving).
+        // Flush the hover coalesced during the sync (otherwise the crosshair
+        // freezes one step behind the cursor when it stops moving).
         const pending = pendingPublishRef.current;
         pendingPublishRef.current = null;
         const pendingTs = pending?.position?.timestamp ?? null;
@@ -376,9 +330,6 @@ export function Chart(): JSX.Element {
 
     const ro = new ResizeObserver(() => {
       chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-      // The chart relayouts on its own frame; apply the indicator-pane spec
-      // right after it (a no-op once the user has dragged a separator).
-      window.requestAnimationFrame(() => applyIndicatorSpec());
     });
     ro.observe(el);
 
@@ -411,9 +362,8 @@ export function Chart(): JSX.Element {
         // Cancel any in-progress drag/stroke: stuck drag + parked pan/zoom
         // would otherwise leave the chart unresponsive.
         if (dragRef.current) endDrawingDrag();
-        if (brushPointsRef.current.length) {
-          brushPointsRef.current = [];
-        }
+        cancelBrushStroke();
+        syncChartInteractions();
       } else if (!e.repeat && e.key === " ") {
         e.preventDefault();
         sendSim({ type: "replay", action: getState().replay.paused ? "play" : "pause" });
@@ -437,11 +387,26 @@ export function Chart(): JSX.Element {
     // neither — but never leave a stuck drag or parked pan/zoom behind.
     const onBlur = (): void => {
       if (dragRef.current) endDrawingDrag();
-      if (brushPointsRef.current.length) {
-        brushPointsRef.current = [];
-      }
+      cancelBrushStroke();
+      syncChartInteractions();
     };
     window.addEventListener("blur", onBlur);
+
+    // A stroke can end anywhere (outside the chart, outside the window):
+    // finish it from the window so pan/zoom always come back. Idempotent:
+    // the wrapper's mouseup finds the stroke already finished and does nothing.
+    const onStrokePointerUp = (event: PointerEvent): void => {
+      if (event.isPrimary) finishBrushStroke();
+    };
+    const onStrokePointerCancel = (): void => cancelBrushStroke();
+    const onVisibility = (): void => {
+      if (!document.hidden) return;
+      if (dragRef.current) endDrawingDrag();
+      cancelBrushStroke();
+    };
+    window.addEventListener("pointerup", onStrokePointerUp, true);
+    window.addEventListener("pointercancel", onStrokePointerCancel, true);
+    document.addEventListener("visibilitychange", onVisibility);
 
     // Hover readout + ghost-preview mouse tracking (local, no roundtrip).
     // Stays live even during a programmatic sync: only the bus publish is
@@ -462,7 +427,7 @@ export function Chart(): JSX.Element {
         setHover(null);
       }
       // `point` is local to the pane under the cursor: only the price pane can
-      // turn a y into a price, the indicator panes would extrapolate nonsense.
+      // turn a y into a price.
       const onPricePane = param.paneIndex === undefined || param.paneIndex === 0;
       let price = param.point && onPricePane ? bars.coordinateToPrice(param.point.y) : null;
       let timestamp = param.time === undefined ? null : timeToMs(param.time);
@@ -492,9 +457,11 @@ export function Chart(): JSX.Element {
       const position = price !== null && timestamp !== null && Number.isFinite(timestamp)
         ? { timestamp, price }
         : null;
-      // Magnet: snap crosshair visually to bar time + OHLC price on price pane
+      // Magnet: snap crosshair visually to bar time + OHLC price on price pane.
+      // The synthetic call never fires another crosshair event (skipEvent), so
+      // it must NOT raise applyingCrosshairRef: doing that used to leave the
+      // flag true forever and silently stop the shared crosshair for good.
       if (magnet && onPricePane && price !== null && timestamp !== null) {
-        applyingCrosshairRef.current = true;
         chart.setCrosshairPosition(price, toTime(timestamp), bars);
       }
       if (applyingCrosshairRef.current) {
@@ -552,6 +519,9 @@ export function Chart(): JSX.Element {
       window.clearTimeout(rulerTimer.current);
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pointerup", onStrokePointerUp, true);
+      window.removeEventListener("pointercancel", onStrokePointerCancel, true);
+      document.removeEventListener("visibilitychange", onVisibility);
       adaptivePriceAxis.dispose();
       refreshPriceAxisRef.current = null;
       crosshairListener();
@@ -566,11 +536,6 @@ export function Chart(): JSX.Element {
       chartRef.current = null;
       barsRef.current = null;
       volumeRef.current = null;
-      oiSeriesRef.current = null;
-      cvdSeriesRef.current = null;
-      oiLabelRef.current = null;
-      cvdLabelRef.current = null;
-      specFactorsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -645,9 +610,6 @@ export function Chart(): JSX.Element {
     store.consumedReset();
     if (full) chart.priceScale("right").applyOptions({ autoScale: true });
     followLatest(followRef.current, () => chart.timeScale().scrollToRealTime());
-    if (cvdSeriesRef.current) {
-      updateCvd(cvdSeriesRef.current, s.candles, cvdRef.current, cvdValuesRef.current, full);
-    }
   }, [version]);
 
   // Account fills as chart markers (rendered from Rust data, UI-only).
@@ -700,108 +662,28 @@ export function Chart(): JSX.Element {
     }
   }, [fills, symbol, candleLen]);
 
-  // OI / CVD live in panes of the main chart: one clock, one crosshair, one
-  // zoom, no second chart to keep in step. The panes are rebuilt together so
-  // their order is always price → OI → CVD.
-  useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart) return;
-    const created: ISeriesApi<"Line">[] = [];
-    const state0 = getState();
-
-    if (oiVisible) {
-      const line = chart.addPane().addSeries(LineSeries, {
-        color: OI_COLOR,
-        lineWidth: 2,
-        priceLineVisible: false,
-        crosshairMarkerVisible: true,
-        priceFormat: { type: "custom", minMove: 0.01, formatter: formatCompactUsdt },
-      });
-      const label = new PaneLabelPrimitive(oiLabel, OI_COLOR);
-      line.attachPrimitive(label);
-      oiSeriesRef.current = line;
-      oiLabelRef.current = label;
-      oiSigRef.current = "";
-      created.push(line);
-      pushOi(line, state0.oi, candleTimesRef.current);
-    }
-
-    if (cvdVisible) {
-      const line = chart.addPane().addSeries(LineSeries, {
-        color: CVD_COLOR,
-        lineWidth: 1,
-        priceLineVisible: false,
-        crosshairMarkerVisible: true,
-      });
-      const label = new PaneLabelPrimitive("CVD", CVD_COLOR);
-      line.attachPrimitive(label);
-      cvdSeriesRef.current = line;
-      cvdLabelRef.current = label;
-      created.push(line);
-      cvdRef.current = { len: 0, sum: 0, lastTime: 0, lastDelta: 0, first: 0 };
-      cvdValuesRef.current = [];
-      updateCvd(line, state0.candles, cvdRef.current, cvdValuesRef.current, true);
-    }
-
-    applyIndicatorSpec();
-
-    return () => {
-      oiLabelRef.current = null;
-      cvdLabelRef.current = null;
-      oiSeriesRef.current = null;
-      cvdSeriesRef.current = null;
-      if (!chartRef.current) return; // the whole chart is going away with us
-      // Removing the last series takes the pane with it (library behaviour),
-      // so the visible panes can simply be created again by the next run.
-      for (const series of created) {
-        try {
-          chart.removeSeries(series);
-        } catch {
-          /* the chart was torn down under us */
-        }
-      }
-      applyIndicatorSpec();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [oiVisible, cvdVisible]);
-
-  // OI is revealed with the replay clock. The line is forward-filled onto the
-  // candle grid, so it only needs rebuilding when a sample becomes visible or
-  // a new candle appears — not on every replay_state message.
-  useEffect(() => {
-    const line = oiSeriesRef.current;
-    if (!line) return;
-    const visible = countAtOrBefore(oiData, replayNow);
-    const times = candleTimesRef.current;
-    const sig = `${oiData.length}|${visible}|${times.length}|${times[0] ?? 0}|${times[times.length - 1] ?? 0}`;
-    if (sig === oiSigRef.current) return;
-    oiSigRef.current = sig;
-    pushOi(line, oiData.slice(0, visible), times);
-  }, [oiData, replayNow, version]);
-
-  // The OI legend shows which grid is loaded (and when there is none).
-  useEffect(() => {
-    oiLabelRef.current?.setText(oiLabel);
-  }, [oiLabel]);
-
   return (
     <div
       className="chartwrap"
       onMouseDown={(e) => {
         if (e.button !== 0) return;
+        // Repair any stale pan/zoom lock before deciding what this press means.
+        syncChartInteractions(true);
         downRef.current = { x: e.clientX, y: e.clientY, button: e.button };
-        // Freehand brush: start recording points on mouse down.
+        // Freehand brush: start recording points on mouse down. Toolbar
+        // buttons floating over the chart are not a canvas stroke.
         if (toolRef.current === "brush") {
+          if ((e.target as HTMLElement).closest(".drawbar,.chart-tools,.coin-info")) return;
           const pt = pointFromEvent(e);
           if (!pt) return;
+          strokeActiveRef.current = true;
           brushPointsRef.current = (() => {
             const sc = snapClick(pt.t, pt.p);
             return [{ t: sc.t, p: sc.p }];
           })();
+          syncChartInteractions();
           return;
         }
-        // A tool is armed: the click places a drawing, never drags one.
-        if (toolRef.current !== "none") return;
         // A tool is armed: the click places a drawing, never drags one.
         if (toolRef.current !== "none") return;
         const id = engineRef.current?.hoveredId() ?? null;
@@ -812,6 +694,11 @@ export function Chart(): JSX.Element {
         startDrawingDrag(drawing, e.clientX, e.clientY);
       }}
       onMouseMove={(e) => {
+        // Mouse released outside the window: end the drag now instead of
+        // waiting for a pointerup that may never arrive.
+        if (dragRef.current && (e.buttons & 1) === 0) endDrawingDrag();
+        // Self-heal any stale lock (a stroke/drag that ended invisibly).
+        syncChartInteractions();
         if (dragRef.current) moveDrawingDrag(e.clientX, e.clientY);
         if (toolRef.current === "brush" && brushPointsRef.current.length > 0) {
           const pt = pointFromEvent(e);
@@ -830,14 +717,10 @@ export function Chart(): JSX.Element {
         downRef.current = null;
         // Finish a freehand brush stroke FIRST: a stroke always moves > 6px,
         // so it must be saved before the pan/click suppression checks below.
+        // The window-level pointerup may already have finished it (release
+        // outside the chart); finishBrushStroke is idempotent.
         if (toolRef.current === "brush") {
-          const pts = brushPointsRef.current;
-          brushPointsRef.current = [];
-          engineRef.current?.setGhost(null);
-          if (pts.length > 1) {
-            store.addDrawing({ kind: "brush", points: pts, color: "#4a9ec4", title: "ручка" });
-            store.setTool("none");
-          }
+          finishBrushStroke();
           suppressClickRef.current = false;
           return;
         }
@@ -889,20 +772,6 @@ export function Chart(): JSX.Element {
         {tool !== "none" && <div className="coin-status">{TOOL_HINTS[tool]}</div>}
       </div>
       <div className="chart-tools">
-        <button
-          className={oiVisible ? "btn b-acc" : "btn b-dim"}
-          onClick={() => store.setOiVisible(!oiVisible)}
-          title="Открытый интерес — панель под графиком"
-        >
-          OI
-        </button>
-        <button
-          className={cvdVisible ? "btn b-acc" : "btn b-dim"}
-          onClick={() => store.setCvdVisible(!cvdVisible)}
-          title="Cumulative volume delta — линия в нижней панели"
-        >
-          CVD
-        </button>
         <button
           className={follow ? "btn b-acc" : "btn b-dim"}
           onClick={() => {
@@ -1001,50 +870,14 @@ export function Chart(): JSX.Element {
   }
 
   /**
-   * Pane-local y -> price, but only inside the price pane: an indicator pane
-   * below it would turn the very same y into an unrelated, extrapolated price.
+   * Pane-local y -> price, but only inside the price pane: extrapolating below
+   * it would turn the same y into an unrelated price.
    */
   function yToPrice(y: number): number | null {
     const chart = chartRef.current;
     if (!chart || y >= chart.paneSize(0).height) return null;
     const v = barsRef.current?.coordinateToPrice(y);
     return typeof v === "number" ? v : null;
-  }
-
-  /**
-   * Indicator panes start at the old pane height (120px, split evenly) and
-   * the price pane keeps the rest. Re-applied on every chart resize — but only
-   * while the stretch factors are still ours: as soon as the user drags a
-   * native pane separator, their layout wins for the rest of the session.
-   */
-  function applyIndicatorSpec(): void {
-    const chart = chartRef.current;
-    if (!chart) return;
-    const panes = chart.panes();
-    if (panes.length < 2) {
-      specFactorsRef.current = null;
-      return;
-    }
-    const heights = panes.map((pane) => pane.getHeight());
-    const total = heights.reduce((sum, height) => sum + height, 0);
-    if (total <= 0 || heights.some((height) => height <= 0)) {
-      // A pane created this frame has no height yet: the chart lays out on
-      // its own frame, so ask again right after it.
-      if (total > 0) window.requestAnimationFrame(applyIndicatorSpec);
-      return;
-    }
-    const applied = specFactorsRef.current;
-    if (applied !== null) {
-      const sameSet = applied.length === panes.length;
-      const ours = sameSet && applied.every((f, i) => f === panes[i].getStretchFactor());
-      if (!ours && sameSet) return; // separator dragged by hand: keep it
-    }
-    const indicators = panes.length - 1;
-    const wanted = Math.max(INDICATOR_PANE_MIN, Math.min(INDICATOR_PANE_PX, total * 0.45));
-    const each = wanted / indicators;
-    const factors = panes.map((_, i) => (i === 0 ? Math.max(total - wanted, 60) : each));
-    panes.forEach((pane, i) => pane.setStretchFactor(factors[i]));
-    specFactorsRef.current = factors;
   }
 
   /**
@@ -1075,6 +908,31 @@ export function Chart(): JSX.Element {
     const p = yToPrice(e.clientY - rect.top);
     if (t === null || p === null) return null;
     return { t, p };
+  }
+
+  // ---- freehand brush: one stroke owns pan/zoom, then gives it back ----
+
+  /** Finish the current stroke: save it, disarm the tool, restore pan/zoom. */
+  function finishBrushStroke(): void {
+    if (!strokeActiveRef.current) return;
+    strokeActiveRef.current = false;
+    const pts = brushPointsRef.current;
+    brushPointsRef.current = [];
+    engineRef.current?.setGhost(null);
+    if (pts.length > 1) {
+      store.addDrawing({ kind: "brush", points: pts, color: "#4a9ec4", title: "ручка" });
+    }
+    store.setTool("none");
+    syncChartInteractions();
+  }
+
+  /** Abort the stroke (Escape / window blur) without saving it. */
+  function cancelBrushStroke(): void {
+    if (!strokeActiveRef.current) return;
+    strokeActiveRef.current = false;
+    brushPointsRef.current = [];
+    engineRef.current?.setGhost(null);
+    syncChartInteractions();
   }
 
   // ---- placement state machine ----
@@ -1233,19 +1091,7 @@ export function Chart(): JSX.Element {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-    parkedChartOptionsRef.current = {
-      handleScroll: chart.options().handleScroll,
-      handleScale: chart.options().handleScale,
-    };
-    chart.applyOptions({ handleScroll: false, handleScale: false });
-  }
-
-  /** Put back the pan/zoom flags the drag parked. */
-  function restoreChartOptions(): void {
-    const parked = parkedChartOptionsRef.current;
-    if (!parked) return;
-    parkedChartOptionsRef.current = null;
-    chartRef.current?.applyOptions(parked);
+    syncChartInteractions();
   }
 
   function moveDrawingDrag(clientX: number, clientY: number): void {
@@ -1308,7 +1154,7 @@ export function Chart(): JSX.Element {
     const drag = dragRef.current;
     dragRef.current = null;
     suppressClickRef.current = false;
-    restoreChartOptions();
+    syncChartInteractions();
     // A moved barrier re-points the replay clock (drag end only, not per move).
     if (drag && drag.moved) {
       const d = getState().drawings.find((x) => x.id === drag.id);
@@ -1331,135 +1177,6 @@ function ghostShape(tool: Tool, pending: Pt[], mouse: Pt): GhostShape | null {
     return { kind: "position", entry, sl: pending[1], tp: mouse };
   }
   return null;
-}
-
-function pushOi(
-  line: ISeriesApi<"Line">,
-  samples: Array<[number, number]>,
-  candleTimes: number[],
-): void {
-  // Forward-fill OI onto the candle grid: the OI chart then owns exactly the
-  // main chart's time points, so setCrosshairPosition(sharedTime) lands on an
-  // exact index in every pane (the lib SNAPS programmatic crosshairs to the
-  // nearest series point — a sparse OI grid would shift the line by up to
-  // half an OI step). Pre-first-sample candles hold the first value flat.
-  const clean = samples
-    .filter(([time, value]) => Number.isFinite(time) && Number.isFinite(value))
-    .sort((a, b) => a[0] - b[0]);
-  if (!clean.length || !candleTimes.length) {
-    line.setData([]);
-    return;
-  }
-  const data: { time: UTCTimestamp; value: number }[] = [];
-  let k = 0;
-  let last = clean[0][1];
-  for (const t of candleTimes) {
-    while (k < clean.length && clean[k][0] <= t) {
-      last = clean[k][1];
-      k += 1;
-    }
-    data.push({ time: toTime(t), value: last });
-  }
-  line.setData(data);
-}
-
-/** Signed volume of one bar (the CVD increment). */
-function barDelta(r: CandleRow): number {
-  return r[4] >= r[1] ? r[5] : -r[5];
-}
-
-/** Number of OI samples at or before `target` (binary search). */
-function countAtOrBefore(samples: Array<[number, number]>, target: number): number {
-  let lo = 0;
-  let hi = samples.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (samples[mid][0] <= target) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-function pushCvd(line: ISeriesApi<"Line">, rows: CandleRow[], cvd: number[]): void {
-  line.setData(rows.map((r, i) => ({ time: toTime(r[0]), value: cvd[i] })));
-}
-
-/**
- * Incremental CVD: a full rebuild on reset, otherwise only the forming bar's
- * value changes or the new tail bars are appended. Recomputing all 10k points
- * and calling setData on every tick made the chart the hottest render path.
- */
-function updateCvd(
-  line: ISeriesApi<"Line">,
-  rows: CandleRow[],
-  cache: { len: number; sum: number; lastTime: number; lastDelta: number; first: number },
-  values: number[],
-  full: boolean,
-): void {
-  if (rows.length === 0) {
-    line.setData([]);
-    values.length = 0;
-    cache.len = 0;
-    cache.sum = 0;
-    cache.lastTime = 0;
-    cache.lastDelta = 0;
-    cache.first = 0;
-    return;
-  }
-  const n = rows.length;
-  const last = rows[n - 1];
-  const reset =
-    full || n < cache.len || cache.len === 0 || rows[0][0] !== cache.first;
-  if (reset) {
-    let sum = 0;
-    const data = new Array<{ time: UTCTimestamp; value: number }>(n);
-    values.length = n;
-    for (let i = 0; i < n; i += 1) {
-      sum += barDelta(rows[i]);
-      values[i] = sum;
-      data[i] = { time: toTime(rows[i][0]), value: sum };
-    }
-    line.setData(data);
-    cache.len = n;
-    cache.sum = sum;
-    cache.lastTime = last[0];
-    cache.lastDelta = barDelta(last);
-    cache.first = rows[0][0];
-    return;
-  }
-  if (n === cache.len) {
-    if (last[0] !== cache.lastTime) {
-      // Same length but a different last bar: a reset slipped past `full`.
-      updateCvd(line, rows, cache, values, true);
-      return;
-    }
-    const delta = barDelta(last);
-    if (delta !== cache.lastDelta) {
-      cache.sum += delta - cache.lastDelta;
-      cache.lastDelta = delta;
-      values[n - 1] = cache.sum;
-      line.update({ time: toTime(last[0]), value: cache.sum });
-    }
-    return;
-  }
-  // Append: the previously forming bar is final now, so absorb its change
-  // before adding the new tail (one rAF may batch two WS candles).
-  const prev = rows[cache.len - 1];
-  const prevDelta = barDelta(prev);
-  if (prevDelta !== cache.lastDelta) {
-    cache.sum += prevDelta - cache.lastDelta;
-    values[cache.len - 1] = cache.sum;
-    line.update({ time: toTime(prev[0]), value: cache.sum });
-    cache.lastDelta = prevDelta;
-  }
-  for (let i = cache.len; i < n; i += 1) {
-    cache.sum += barDelta(rows[i]);
-    values[i] = cache.sum;
-    line.update({ time: toTime(rows[i][0]), value: cache.sum });
-  }
-  cache.len = n;
-  cache.lastTime = last[0];
-  cache.lastDelta = barDelta(last);
 }
 
 function pushBars(

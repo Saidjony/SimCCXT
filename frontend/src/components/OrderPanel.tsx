@@ -62,6 +62,8 @@ export function OrderPanel(): JSX.Element {
     };
     if (kind === "market") {
       entry = lastPrice > 0 ? lastPrice : null;
+      // Pin the fill to the price shown in the ticket: no slippage at entry.
+      if (entry !== null) msg.price = entry;
     } else if (kind === "limit") {
       const p = num(price);
       if (p === null) return;

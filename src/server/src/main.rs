@@ -76,7 +76,7 @@ mod diary_scenarios;
 //   {"type":"welcome","client_id":7}
 //   {"type":"snapshot","to":7,"symbol":..,"timeframe":..,"exchange":"binance",
 //    "candles":[[ts,o,h,l,c,v]..],
-//    "account":{..},"replay":{..},"oi":[[ts_ms,usdt]..],"oi_period":"5m"}
+//    "account":{..},"replay":{..}}
 //   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
 //   {"type":"candle","to":7,"symbol":..,"timeframe":..,"candle":[..],"is_new":true}
 //   {"type":"market_update","to":7,"symbol":..,"last":..,"timestamp":..}
@@ -100,7 +100,7 @@ mod diary_scenarios;
 // PRELOAD (background market data): the watchlist x all timeframes is warmed
 // on a separate thread, so switching a coin/timeframe never waits for a
 // download. Each symbol is resolved across supported venues first; candles
-// and OI are cached against the venue where that symbol is available. It never
+// are cached against the venue where that symbol is available. It never
 // touches a session, its series, its clock or its account, and sends no candles.
 // MARKET_LOOKUP returns current prices and venue labels for the watchlist.
 //
@@ -260,6 +260,12 @@ enum ClientCmd {
         entry_protections: HashMap<String, Value>,
         #[serde(default)]
         exit_reasons: HashMap<String, String>,
+        /// Explicit trash action: drop this symbol's fills, its protective
+        /// levels and its diary rows from the session mirror. Sent by the
+        /// chart's delete button, which must remove a coin even when the
+        /// browser's own ledger no longer remembers the trades.
+        #[serde(default)]
+        clear_symbol: Option<String>,
         symbol: String,
         timeframe: String,
         #[serde(default = "default_exchange")]
@@ -412,9 +418,6 @@ struct Session {
     exit_reasons: HashMap<String, &'static str>,
     active_protections: Vec<(String, String, String)>,
     diary_meta: serde_json::Value, // client-pushed drawings/criteria to show in the diary
-    oi: Vec<(i64, f64)>,           // open-interest history (ts_ms, USDT value), context only
-    oi_period: String,             // OI grid actually loaded ("5m", "" when none)
-    oi_fed: usize,
     range_start_ms: i64,
     reveal_start_ms: i64,
     range_end_ms: i64,
@@ -458,6 +461,14 @@ fn local_protection_key(
     entry_time_ms: i64,
 ) -> String {
     format!("{engine_id}|{symbol}|{entry_order_id}|{entry_time_ms}")
+}
+
+/// The symbol field of a protection/exit-reason key.
+///
+/// Both maps use `engine_id|symbol|order_id|time`, so the trash can drop one
+/// coin without touching the trader's other trades.
+fn protection_key_symbol(key: &str) -> Option<&str> {
+    key.split('|').nth(1)
 }
 
 /// Key of a protective exit reason in an `exit_reasons` map.
@@ -798,7 +809,6 @@ fn rewind_to_reveal(s: &mut Session) {
     if let Some(ts) = DateTime::from_timestamp_millis(ts_ms) {
         s.ex.reset(ts);
     }
-    s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ts_ms);
     s.fed = 0;
 }
 
@@ -811,7 +821,6 @@ fn ack_replay(s: &Session, request_id: Option<String>) -> Value {
 fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
     // Only bars <= now: the chart reveals one new bar per tick instead of
     // the whole future at once. Later steps arrive as `candle` deltas.
-    // OI rides along whole (static context, never replayed): [[ts_ms, usdt]].
     let mut rows = s.ex.fetch_ohlcv_live(&s.symbol, &s.timeframe);
     if rows.len() > SNAPSHOT_CAP {
         rows = rows[rows.len() - SNAPSHOT_CAP..].to_vec();
@@ -824,8 +833,6 @@ fn snapshot_json(s: &Session, request_id: Option<String>) -> Value {
         "candles": rows,
         "account": s.ex.account_snapshot(),
         "replay": replay_json(s),
-        "oi": s.oi.clone(),
-        "oi_period": s.oi_period,
         "fills": s.ex.fetch_fills_last(500),
         "request_id": request_id,
     })
@@ -1023,14 +1030,6 @@ fn delta_events(s: &mut Session, force: bool) -> Vec<Value> {
         }));
     }
     s.fed = s.ex.live_len(&s.symbol, &s.timeframe);
-    let oi_end = s.oi.partition_point(|(ts, _)| *ts <= s.ex.now_ms());
-    if oi_end > s.oi_fed {
-        ev.push(json!({
-            "type": "oi_update",
-            "samples": s.oi[s.oi_fed..oi_end],
-        }));
-        s.oi_fed = oi_end;
-    }
     let last = s.ex.live_last(&s.symbol, &s.timeframe)
         .map(|row| row[4])
         .unwrap_or(0.0);
@@ -1089,9 +1088,6 @@ fn new_session(nick: String) -> Session {
         exit_reasons: HashMap::new(),
         active_protections: Vec::new(),
         diary_meta: json!({"drawings": [], "criteria": {}}),
-        oi: Vec::new(),
-        oi_period: String::new(),
-        oi_fed: 0,
         range_start_ms: 0,
         reveal_start_ms: 0,
         range_end_ms: 0,
@@ -1229,7 +1225,6 @@ impl Engine {
         s.range_end_ms = end_ms;
         s.step_ms = step;
         s.fed = 0;
-        s.oi_fed = 0;
         s.fills_seen = s.ex.fills_len();
         s.last_step = std::time::Instant::now();
     }
@@ -1256,6 +1251,7 @@ impl Engine {
                 engine_id,
                 entry_protections,
                 exit_reasons,
+                clear_symbol,
                 symbol,
                 timeframe,
                 exchange,
@@ -1264,6 +1260,21 @@ impl Engine {
                 let s = self.session(to);
                 s.local_account = Some(account);
                 s.local_engine_id = engine_id.clone();
+                // The chart's trash: delete this coin from the mirror even if
+                // the browser already forgot its fills. Fills for every other
+                // coin stay untouched, so a per-symbol clear never wipes the
+                // rest of the trader's diary.
+                let clearing = clear_symbol.as_deref().filter(|value| !value.is_empty());
+                let clears_current = clearing == Some(symbol.as_str());
+                // Incoming batches are filtered too: a flush that was already
+                // queued before the trash click must not re-add the coin.
+                let mut entry_protections = entry_protections;
+                let mut exit_reasons = exit_reasons;
+                if let Some(cleared) = clearing {
+                    entry_protections
+                        .retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                    exit_reasons.retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                }
                 // Stamp every fill with the engine instance that produced it.
                 // A reloaded tab replays from the same bar with order ids back
                 // at 1, so without this the new entry is indistinguishable from
@@ -1275,11 +1286,21 @@ impl Engine {
                         fill
                     })
                     .collect();
-                let ledger_changed;
+                if let Some(cleared) = clearing {
+                    fills.retain(|fill| fill["symbol"].as_str() != Some(cleared));
+                }
+                let mut ledger_changed;
                 if replace_fills {
-                    s.local_fills = fills;
+                    // Replace only THIS engine's rows. A reopened tab restores
+                    // the fills of earlier engine instances under their own
+                    // ids; wiping the whole mirror here would erase that
+                    // history again on the next resync.
+                    s.local_fills
+                        .retain(|fill| fill["engine_id"].as_str() != Some(engine_id.as_str()));
+                    s.local_fills.extend(fills);
                     ledger_changed = true;
-                } else {                    // Dedupe by the WHOLE fill, not by `id` alone: the id is
+                } else {
+                    // Dedupe by the WHOLE fill, not by `id` alone: the id is
                     // `orderId_fillIndex`, and order ids restart at 1 for every
                     // symbol engine. BTC's fill #1 and ETH's fill #1 share the
                     // bare id, so dropping the second one left the diary with a
@@ -1297,6 +1318,40 @@ impl Engine {
                     s.local_fills.append(&mut fills);
                     ledger_changed = added;
                 }
+                // Remove what the trash asked for from the ledger that was
+                // already mirrored. This is the step that made deleted trades
+                // reappear on a diary refresh: the browser cleared its own
+                // copy, but the server kept reconstructing them from here.
+                let mut cleared_rows = false;
+                if let Some(cleared) = clearing {
+                    let before = s.local_fills.len();
+                    s.local_fills
+                        .retain(|fill| fill["symbol"].as_str() != Some(cleared));
+                    cleared_rows = s.local_fills.len() != before;
+                    s.local_entry_protections
+                        .retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                    s.local_exit_reasons
+                        .retain(|key, _| protection_key_symbol(key) != Some(cleared));
+                    if clears_current {
+                        // The diary serves these verbatim; without clearing
+                        // them a refresh right after the click still drew the
+                        // old annotations and checklist chips.
+                        if let Some(meta) = s.diary_meta.as_object_mut() {
+                            meta.insert("drawings".into(), json!([]));
+                            if let Some(criteria) =
+                                meta.get_mut("criteria").and_then(|value| value.as_object_mut())
+                            {
+                                // Browser keys are `symbol::timeframe`
+                                // (see `chartCriteriaKey`), one per chart.
+                                let prefix = format!("{cleared}::");
+                                criteria.retain(|key, _| !key.starts_with(&prefix));
+                            }
+                        }
+                    }
+                    if cleared_rows {
+                        ledger_changed = true;
+                    }
+                }
                 // Merge, never replace: a page reload starts the browser with
                 // empty maps, and replacing would wipe the levels and exit
                 // verdicts of every trade this session already knows — the
@@ -1306,7 +1361,8 @@ impl Engine {
                 let protections_before = s.local_entry_protections.len();
                 s.local_entry_protections.extend(entry_protections);
                 s.local_exit_reasons.extend(exit_reasons);
-                let protections_changed = s.local_entry_protections.len() != protections_before;
+                let protections_changed = cleared_rows
+                    || s.local_entry_protections.len() != protections_before;
                 // The board's "Сделки" column counts distinct orders. A
                 // server-side engine feeds it from `fresh_fill_events`, but in
                 // the local-engine mode the fills only arrive here — without
@@ -1871,7 +1927,6 @@ impl Engine {
                                 Some(ms) => {
                                     if let Some(ts) = DateTime::from_timestamp_millis(ms) {
                                         s.ex.reset(ts);
-                                        s.oi_fed = s.oi.partition_point(|(oi_ts, _)| *oi_ts <= ms);
                                     }
                                 }
                                 None => rewind_to_reveal(s),
@@ -1966,8 +2021,7 @@ impl Engine {
             // Which engine instance produced each trade (parallel to `trades`).
             let mut trade_engine: Vec<String> = Vec::new();
             let mut positions: Vec<diary::OpenPosition> = Vec::new();
-            let group_count = groups.len();
-            for (group_index, (engine, fills)) in groups.into_iter().enumerate() {
+            for (engine, fills) in groups {
                 // The server exchange returns newest-first, while local sync
                 // stores browser fills oldest-first. Normalize both to
                 // chronological order.
@@ -1998,8 +2052,9 @@ impl Engine {
                 }
                 // Only the live engine holds real open positions: an older
                 // page's leftover lot was abandoned when that page closed.
-                if engine == current_engine || (positions.is_empty() && group_index + 1 == group_count)
-                {
+                // Falling back to the last group (usually restored history)
+                // made the diary invent an open position after reopening.
+                if engine == current_engine {
                     positions = group_positions;
                 }
             }
@@ -3800,8 +3855,8 @@ mod tests {
     fn server_holds_no_coin_data() {
         // The server is no longer a market-data provider: a subscribe records
         // the selection and acknowledges it, and the session starts with no
-        // candles, no open interest and no OI grid. The browser downloads 5m
-        // bars from the venue and aggregates 1h/1d itself.
+        // candles. The browser downloads 5m bars from the venue and aggregates
+        // 1h/1d itself.
         let (tx, mut rx) = broadcast::channel::<String>(64);
         let mut eng = Engine::new(tx);
         eng.handle_command(1, subscribe_cmd("BTC/USDT", "5m"));
@@ -3813,7 +3868,6 @@ mod tests {
             s.ex.fetch_ohlcv("BTC/USDT", "5m", None, None).is_empty(),
             "the server must never hold candles for a session"
         );
-        assert!(s.oi.is_empty(), "the server must never hold open interest");
 
         let mut acked = false;
         while let Ok(raw) = rx.try_recv() {
@@ -4669,6 +4723,84 @@ mod tests {
         assert_eq!(row["pnl"], -10.0, "PnL survives the reload");
         assert_eq!(row["equity"], 990.0);
         assert_eq!(row["trades"], 2);
+    }
+
+    /// The chart's trash sends `clear_symbol`; the server must drop that coin's
+    /// fills and protective levels from the mirrored ledger, because the diary
+    /// is reconstructed from it and a refresh otherwise shows them again.
+    #[test]
+    fn clearing_a_symbol_removes_only_its_trades_from_the_diary_ledger() {
+        let (tx, _rx) = broadcast::channel::<String>(64);
+        let mut eng = Engine::new(tx);
+        eng.handle_command(1, login_cmd("A"));
+        eng.handle_command(1, challenge_cmd(true, Some(10.0)));
+
+        let btc_plan = local_protection_key("e1", "BTC/USDT", "1", 1);
+        let eth_plan = local_protection_key("e1", "ETH/USDT", "1", 11);
+        let btc_exit = exit_reason_key("e1", "BTC/USDT", "2", 2);
+        let eth_exit = exit_reason_key("e1", "ETH/USDT", "2", 12);
+        let mut protections = serde_json::Map::new();
+        protections.insert(btc_plan.clone(), json!({"stop_price": 90.0}));
+        protections.insert(eth_plan.clone(), json!({"stop_price": 90.0}));
+        let mut reasons = serde_json::Map::new();
+        reasons.insert(btc_exit.clone(), json!("stop"));
+        reasons.insert(eth_exit.clone(), json!("take"));
+        let sync: ClientCmd = serde_json::from_value(json!({
+            "type": "local_sync",
+            "account": {"equity": 1010, "pnl": {"realized": 10, "unrealized": 0}},
+            "fills": [
+                {"id": "1_0", "orderId": "1", "timestamp": 1, "symbol": "BTC/USDT",
+                 "side": "buy", "amount": 1.0, "price": 100.0},
+                {"id": "2_0", "orderId": "2", "timestamp": 2, "symbol": "BTC/USDT",
+                 "side": "sell", "amount": 1.0, "price": 90.0},
+                {"id": "1_0", "orderId": "1", "timestamp": 11, "symbol": "ETH/USDT",
+                 "side": "buy", "amount": 2.0, "price": 100.0},
+                {"id": "2_0", "orderId": "2", "timestamp": 12, "symbol": "ETH/USDT",
+                 "side": "sell", "amount": 2.0, "price": 110.0}
+            ],
+            "replace_fills": true,
+            "engine_id": "e1",
+            "entry_protections": Value::Object(protections),
+            "exit_reasons": Value::Object(reasons),
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": {"start_ms": 0, "reveal_start_ms": 0, "end_ms": 100}
+        }))
+        .expect("sync with two coins");
+        eng.handle_command(1, sync);
+        // BTC -10, ETH +20: the ledger both the diary and the board read.
+        assert_eq!(eng.sessions[&1].local_realized, 10.0);
+
+        let clear: ClientCmd = serde_json::from_value(json!({
+            "type": "local_sync",
+            "account": {"equity": 1010, "pnl": {"realized": 10, "unrealized": 0}},
+            "fills": [],
+            "replace_fills": false,
+            "clear_symbol": "BTC/USDT",
+            "engine_id": "e1",
+            "entry_protections": {},
+            "exit_reasons": {},
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": {"start_ms": 0, "reveal_start_ms": 0, "end_ms": 100}
+        }))
+        .expect("clear sync");
+        eng.handle_command(1, clear);
+
+        let s = &eng.sessions[&1];
+        assert_eq!(s.local_fills.len(), 2, "only BTC disappears");
+        assert!(s.local_fills.iter().all(|fill| fill["symbol"] == "ETH/USDT"));
+        assert_eq!(s.local_realized, 20.0, "PnL follows the surviving ledger");
+        assert!(!s.local_entry_protections.contains_key(&btc_plan));
+        assert!(s.local_entry_protections.contains_key(&eth_plan));
+        assert!(!s.local_exit_reasons.contains_key(&btc_exit));
+        assert!(s.local_exit_reasons.contains_key(&eth_exit));
+
+        let row = &challenge_board_json(&eng.sessions)["board"][0];
+        assert_eq!(row["pnl"], 20.0);
+        assert_eq!(row["trades"], 2, "only the ETH orders remain");
     }
 
     #[test]

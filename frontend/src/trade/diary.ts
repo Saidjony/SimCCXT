@@ -53,6 +53,34 @@ export function fmtChartTime(ms: number): string {
   );
 }
 
+/**
+ * How long a trade was held, in trader-readable units: "45с", "12м 30с",
+ * "3ч 05м", "2д 4ч". At most two units are shown; a zero remainder is
+ * dropped ("5м", not "5м 0с"). Never negative — a broken/absent stamp reads
+ * "—" instead of a made-up duration.
+ */
+export function fmtDuration(entryMs: number, exitMs: number): string {
+  if (
+    !Number.isFinite(entryMs) ||
+    !Number.isFinite(exitMs) ||
+    entryMs <= 0 ||
+    exitMs < entryMs
+  ) {
+    return "—";
+  }
+  // Round to whole seconds first, so 59.7 s reads "1м" rather than "59с".
+  const total = Math.round((exitMs - entryMs) / 1000);
+  if (total < 1) return "<1с";
+  const d = Math.floor(total / 86_400);
+  const h = Math.floor((total % 86_400) / 3_600);
+  const m = Math.floor((total % 3_600) / 60);
+  const s = total % 60;
+  if (d > 0) return h > 0 ? `${d}д ${h}ч` : `${d}д`;
+  if (h > 0) return m > 0 ? `${h}ч ${m}м` : `${h}ч`;
+  if (m > 0) return s > 0 ? `${m}м ${s}с` : `${m}м`;
+  return `${s}с`;
+}
+
 /** Signed money with thousands separators (empty for non-finite). */
 export function fmtPnl(n: number): string {
   if (!Number.isFinite(n)) return "—";

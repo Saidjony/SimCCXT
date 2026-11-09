@@ -608,7 +608,7 @@ fn diary_carries_the_context_the_chart_needs() {
         json!({
             "type": "diary_meta",
             "drawings": [{"kind": "hline", "price": 81234.5}],
-            "criteria": {"trend": ["ma200", "ema50"], "oi": []}
+            "criteria": {"trend": ["ma200", "ema50"], "hvol": []}
         }),
     );
 
@@ -627,7 +627,7 @@ fn diary_carries_the_context_the_chart_needs() {
     assert_eq!(d["drawings"][0]["kind"], "hline");
     assert_eq!(d["drawings"][0]["price"], json!(81234.5));
     assert_eq!(d["criteria"]["trend"], json!(["ma200", "ema50"]));
-    assert_eq!(d["criteria"]["oi"], json!([]));
+    assert_eq!(d["criteria"]["hvol"], json!([]));
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +902,38 @@ fn local_sync(eng: &mut Engine, client_id: u64, engine_id: &str, fills: Value, r
     );
 }
 
+/// Like `local_sync`, but asks the server to replace the live engine's own
+/// rows (what a reconnect/resync sends).
+fn local_sync_replace(
+    eng: &mut Engine,
+    client_id: u64,
+    engine_id: &str,
+    fills: Value,
+    realized: f64,
+) {
+    send(
+        eng,
+        client_id,
+        json!({
+            "type": "local_sync",
+            "account": {
+                "equity": CAPITAL + realized,
+                "pnl": { "realized": realized, "unrealized": 0.0, "fees": 0.0 },
+                "positions": []
+            },
+            "fills": fills,
+            "replace_fills": true,
+            "engine_id": engine_id,
+            "entry_protections": {},
+            "exit_reasons": {},
+            "symbol": SYM,
+            "timeframe": "5m",
+            "exchange": "binance",
+            "range": { "start_ms": 0, "reveal_start_ms": 0, "end_ms": 0 }
+        }),
+    );
+}
+
 /// A page reload builds a NEW browser engine, and order ids start over at 1.
 /// The reloaded tab replays from the same bar, so its entry fill is identical
 /// to the old page's entry (same id, time, price, amount) while its exit is a
@@ -946,4 +978,70 @@ fn a_reload_does_not_pair_fills_across_engine_instances() {
     let exits: Vec<f64> = trades.iter().map(|t| num(t, "exit_price")).collect();
     assert_eq!(exits, vec![110.0, 105.0], "each exit belongs to its own entry");
     assert_eq!(num(&trades[1], "pnl"), 5.0);
+}
+
+/// Reopening the site after the server forgot the session restores the fills
+/// persisted in the browser under their old engine ids. A later resync of the
+/// new engine sends `replace_fills`, and it must replace only that engine's
+/// rows — erasing the restored history would blank the diary again.
+#[test]
+fn a_resync_of_the_new_engine_keeps_the_restored_history() {
+    let (mut eng, _rx) = engine();
+    open_trader(&mut eng, 1, "5m", NICK, RISK);
+
+    // The reopened page re-mirrors page 1's persisted trade.
+    local_sync(
+        &mut eng,
+        1,
+        "page-1",
+        json!([
+            {"id":"1_0","symbol":SYM,"timestamp":1_000,"price":100.0,"amount":1.0,"orderId":"1","side":"buy","fee":0.0},
+            {"id":"2_0","symbol":SYM,"timestamp":2_000,"price":110.0,"amount":1.0,"orderId":"2","side":"sell","fee":0.0}
+        ]),
+        10.0,
+    );
+    // The new engine trades and then resyncs with only its own fills.
+    let page_2 = json!([
+        {"id":"1_0","symbol":SYM,"timestamp":3_000,"price":120.0,"amount":1.0,"orderId":"1","side":"buy","fee":0.0},
+        {"id":"2_0","symbol":SYM,"timestamp":4_000,"price":125.0,"amount":1.0,"orderId":"2","side":"sell","fee":0.0}
+    ]);
+    local_sync(&mut eng, 1, "page-2", page_2.clone(), 5.0);
+    local_sync_replace(&mut eng, 1, "page-2", page_2, 5.0);
+
+    let d = diary(&eng, NICK);
+    let trades = array(&d, "trades");
+    assert_eq!(trades.len(), 2, "both page loads survive the resync: {d}");
+    assert_eq!(
+        trades.iter().map(|t| num(t, "pnl")).collect::<Vec<_>>(),
+        vec![10.0, 5.0],
+    );
+    assert_eq!(num(&d["stats"], "total_trades"), 2.0);
+}
+
+/// An old page's unfinished entry is abandoned, not a live position of the
+/// reopened page. Restored history must not make the diary show a phantom
+/// position when the new engine is flat.
+#[test]
+fn restored_history_does_not_invent_an_open_position() {
+    let (mut eng, _rx) = engine();
+    open_trader(&mut eng, 1, "5m", NICK, RISK);
+
+    local_sync(
+        &mut eng,
+        1,
+        "old-page",
+        json!([
+            {"id":"1_0","symbol":SYM,"timestamp":1_000,"price":100.0,"amount":1.0,"orderId":"1","side":"buy","fee":0.0}
+        ]),
+        0.0,
+    );
+    // The reopened page is flat and says so.
+    local_sync(&mut eng, 1, "new-page", json!([]), 0.0);
+
+    let d = diary(&eng, NICK);
+    assert!(
+        array(&d, "positions").is_empty(),
+        "the old page's lot was abandoned: {d}"
+    );
+    assert!(array(&d, "trades").is_empty());
 }

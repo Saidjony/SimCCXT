@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import type { ServerMessage } from "../types/protocol";
 import { getConnection, sendSim, subscribeSim } from "./connection";
 import { getState, store } from "../state/store";
-import { isLocalEngineActive, requestLocalSync } from "../replay/localEngine";
+import { isLocalEngineActive, requestLocalSync, restoreLocalHistory } from "../replay/localEngine";
 
 export { nextRequestId, sendSim } from "./connection";
 
@@ -20,9 +20,10 @@ function initSession(): void {
   });
   subscribeSim(getState().symbol, getState().timeframe, getState().exchange);
   // A fresh session (first visit, server restart, expired parked session) has
-  // no fills of its own, while this tab's engine still owns the whole history.
-  // Re-mirror it, otherwise the diary of a live trader goes blank mid-session.
-  requestLocalSync(true);
+  // no fills of its own, while this browser still has the whole history in
+  // localStorage. Re-mirror it, otherwise reopening the site leaves the diary
+  // empty even though the Trades table is still populated.
+  restoreLocalHistory();
 }
 
 function route(m: ServerMessage): void {
@@ -83,11 +84,10 @@ function route(m: ServerMessage): void {
       // board). No data rides along: the bars are local.
       break;
     // Market data and account state belong to this tab's local engine. The
-    // server no longer streams candles, OI, ticks, replay state or order
+    // server no longer streams candles, ticks, replay state or order
     // updates: accepting them would overwrite local bars with whatever the
     // server happened to have (or nothing at all).
     case "candle":
-    case "oi_update":
     case "market_update":
       break;
     case "account_update":

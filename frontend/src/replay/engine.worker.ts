@@ -7,12 +7,13 @@ interface InitMessage {
   market_kind: "spot" | "linear";
   engine_id: string;
   candles: number[][];
+  /** The 5m bars orders are triggered against; `candles` is only the chart. */
+  base_candles?: number[][];
+  base_step_ms?: number;
   exchange: string;
   speed: number;
   reveal_reset_ms: number;
   range_end_ms: number;
-  oi: Array<[number, number]>;
-  oi_period: string;
 }
 
 type EngineCommand =
@@ -33,10 +34,10 @@ type EngineCommand =
       engine_id: string;
       reveal_reset_ms: number;
       range_end_ms: number;
-      oi: Array<[number, number]>;
-      oi_period: string;
       preserve_clock: boolean;
       candles: number[][];
+      base_candles?: number[][];
+      base_step_ms?: number;
     }
   | {
       type: "place_order";
@@ -54,6 +55,7 @@ type EngineCommand =
       post_only?: boolean;
     }
   | { type: "close_position"; symbol?: string; quantity?: number }
+  | { type: "clear_symbol"; symbol: string }
   | { type: "cancel_order"; symbol?: string; order_id: string };
 
 interface CommandMessage {

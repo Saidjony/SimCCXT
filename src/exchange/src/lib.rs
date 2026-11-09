@@ -14,7 +14,7 @@ use simccxt_core::{
     Balance, Config, OHLCV, OrderStatus, OrderType, Side, Symbol, TimeInForce, Trade,
 };
 use simccxt_event_bus::{Event, EventBus};
-use simccxt_market::{FundingRate, OpenInterest, OrderBook, Ticker};
+use simccxt_market::{FundingRate, OrderBook, Ticker};
 
 /// Additional parameters for `create_order`.
 #[derive(Debug, Clone, Default)]
@@ -71,7 +71,6 @@ pub struct Exchange {
     trades: HashMap<String, Vec<Trade>>,
     tickers: HashMap<String, Ticker>,
     funding_rates: HashMap<String, FundingRate>,
-    open_interest: HashMap<String, OpenInterest>,
     last_price: HashMap<String, f64>,
     /// Closed candles already fed into the broker (symbol, timeframe) at some ts.
     replayed: HashMap<(String, String), Option<DateTime<Utc>>>,
@@ -105,7 +104,6 @@ impl Exchange {
             trades: HashMap::new(),
             tickers: HashMap::new(),
             funding_rates: HashMap::new(),
-            open_interest: HashMap::new(),
             last_price: HashMap::new(),
             replayed: HashMap::new(),
             spot_cost: HashMap::new(),
@@ -162,11 +160,6 @@ impl Exchange {
     /// Set a funding rate for a symbol.
     pub fn set_funding_rate(&mut self, symbol: &str, rate: FundingRate) {
         self.funding_rates.insert(symbol.to_string(), rate);
-    }
-
-    /// Set open interest for a symbol.
-    pub fn set_open_interest(&mut self, symbol: &str, oi: OpenInterest) {
-        self.open_interest.insert(symbol.to_string(), oi);
     }
 
     // ------------------------------------------------------------------
@@ -317,32 +310,35 @@ impl Exchange {
         }
     }
 
-    /// Whether a candle for (symbol, timeframe) has not yet been fed into the
-    /// broker. Used to avoid re-processing bars on repeated step() calls.
-    fn needs_feed(&self, symbol: &str, timeframe: &str, ts: DateTime<Utc>) -> bool {
-        let key = (symbol.to_string(), timeframe.to_string());
-        let last = self.replayed.get(&key);
-        last.map(|l| l.map(|replay_ts| replay_ts < ts).unwrap_or(true)).unwrap_or(true)
-    }
-
     /// Process every candle at or before `now` that hasn't been fed yet, for
     /// all symbols. Returns the number of bars processed.
     pub fn feed_due(&mut self, now: DateTime<Utc>) -> usize {
         let mut fed = 0;
-        for ((symbol, timeframe), candles) in self.candles.clone() {
-            for c in candles {
+        // Moving each series out of the map avoids cloning the whole history on
+        // every tick. The base series can hold tens of thousands of 5m bars, so
+        // cloning it per tick would make a long replay quadratic.
+        let keys: Vec<(String, String)> = self.candles.keys().cloned().collect();
+        for key in keys {
+            let Some(candles) = self.candles.remove(&key) else {
+                continue;
+            };
+            let sym = Symbol::parse(&key.0).unwrap();
+            // Resume at the first bar after the replay cursor instead of
+            // walking the whole history on every tick (the base series alone
+            // holds tens of thousands of 5m bars).
+            let last = self.replayed.get(&key).copied().flatten();
+            let start = last
+                .map(|mark| candles.partition_point(|c| c.timestamp <= mark))
+                .unwrap_or(0);
+            for c in &candles[start..] {
                 if c.timestamp > now {
                     break;
                 }
-                let marked = self.needs_feed(&symbol, &timeframe, c.timestamp);
-                if !marked {
-                    continue;
-                }
-                let sym = Symbol::parse(&symbol).unwrap();
-                self.apply_candle(&sym, &c);
-                self.replayed.insert((symbol.clone(), timeframe.clone()), Some(c.timestamp));
+                self.apply_candle(&sym, c);
+                self.replayed.insert(key.clone(), Some(c.timestamp));
                 fed += 1;
             }
+            self.candles.insert(key, candles);
         }
         fed
     }
@@ -549,6 +545,12 @@ impl Exchange {
     /// the CCXT-shaped rows returned by `fetch_fills`.
     pub fn fill_count(&self) -> usize {
         self.broker.fills_len()
+    }
+
+    /// Delete every fill and resting order of `symbol`. Used by the chart's
+    /// trash so a deleted coin leaves no trades behind in later snapshots.
+    pub fn clear_symbol_data(&mut self, symbol: &str) {
+        self.broker.clear_symbol(symbol);
     }
 
     /// Total account equity: quote free + marked-to-market positions + spot value.
@@ -987,26 +989,6 @@ impl Exchange {
         json!({
             "symbol": symbol,
             "fundingRate": 0.0,
-            "timestamp": self.now_ms(),
-            "datetime": self.now().to_rfc3339(),
-        })
-    }
-
-    /// `fetch_open_interest` — returns a CCXT-style open interest dict.
-    pub fn fetch_open_interest(&self, symbol: &str) -> Value {
-        if let Some(oi) = self.open_interest.get(symbol) {
-            return json!({
-                "symbol": symbol,
-                "openInterestAmount": oi.open_interest,
-                "openInterestValue": oi.open_interest,
-                "timestamp": oi.timestamp.timestamp_millis(),
-                "datetime": oi.timestamp.to_rfc3339(),
-            });
-        }
-        json!({
-            "symbol": symbol,
-            "openInterestAmount": json!(null),
-            "openInterestValue": json!(null),
             "timestamp": self.now_ms(),
             "datetime": self.now().to_rfc3339(),
         })
