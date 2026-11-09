@@ -90,6 +90,24 @@ function TrashIcon(): JSX.Element {
   );
 }
 
+function MagnetIcon(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M6 4v8a6 6 0 0 0 12 0V4" />
+      <path d="M6 4h4v6H6zM14 4h4v6h-4z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function CameraIcon(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M4 7h3l2-2h6l2 2h3v12H4z" />
+      <circle cx="12" cy="13" r="3.5" />
+    </svg>
+  );
+}
+
 const TOOLS: { id: Exclude<Tool, "none">; title: string; Icon: () => JSX.Element }[] = [
   { id: "ray", title: "Луч-уровень (1 клик)", Icon: RayIcon },
   { id: "vline", title: "Барьер реплея (1 клик): бары справа скроются, play покажет по одному", Icon: VLineIcon },
@@ -101,8 +119,17 @@ const TOOLS: { id: Exclude<Tool, "none">; title: string; Icon: () => JSX.Element
   { id: "brush", title: "Ручка — свободный мазок (зажать и рисовать)", Icon: BrushIcon },
 ];
 
-/** Drawing toolbar docked top-right inside the chart. Icon-only buttons. */
-export function DrawBar(): JSX.Element {
+interface DrawBarProps {
+  magnet: boolean;
+  onToggleMagnet: () => void;
+  onScreenshot: () => void;
+}
+
+/**
+ * Drawing toolbar docked vertically on the chart's left edge, TradingView
+ * style. Icon-only buttons: the drawing tools, then magnet and screenshot.
+ */
+export function DrawBar({ magnet, onToggleMagnet, onScreenshot }: DrawBarProps): JSX.Element {
   const tool = useSim((s) => s.tool);
   /** Trash is armed by the first click and fires on the second. */
   const [armed, setArmed] = useState(false);
@@ -151,6 +178,23 @@ export function DrawBar(): JSX.Element {
         onClick={wipe}
       >
         <TrashIcon />
+      </button>
+      <div className="drawbar-sep" />
+      <button
+        className={"tool-btn" + (magnet ? " active" : "")}
+        title={magnet
+          ? "Магнит включён: курсор прилипает к цене бара. Нажмите, чтобы выключить"
+          : "Магнит выключен: свободное движение курсора. Нажмите, чтобы включить"}
+        onClick={onToggleMagnet}
+      >
+        <MagnetIcon />
+      </button>
+      <button
+        className="tool-btn"
+        title="Скриншот графика (PNG)"
+        onClick={onScreenshot}
+      >
+        <CameraIcon />
       </button>
     </div>
   );
