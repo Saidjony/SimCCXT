@@ -241,7 +241,17 @@ export function Chart(): JSX.Element {
       // arrives. No left gutter: the chart stretches to the left edge.
       rightPriceScale: { borderColor: "#222c3b", minimumWidth: 96 },
       leftPriceScale: { visible: false },
-      timeScale: { borderColor: "#222c3b", timeVisible: true, secondsVisible: false },
+      timeScale: {
+        borderColor: "#222c3b",
+        timeVisible: true,
+        secondsVisible: false,
+        // Long replay windows can hold tens of thousands of 5m bars. When they
+        // are zoomed out to less than a pixel per bar, conflate them instead
+        // of drawing every one: pan/zoom stays smooth and the picture is
+        // visually identical at that scale. Lazy (no precompute) so loading a
+        // fresh window does not pay the extra upfront cost.
+        enableConflation: true,
+      },
     });
     const onSharedCrosshair: Parameters<typeof subscribeCrosshair>[0] = ({ position }) => {
       if (!position) {
